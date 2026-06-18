@@ -17,6 +17,9 @@ export const CSRF_EXEMPT_PATHS = [
   '/api/auth/session',
   '/api/csrf-token',
   '/api/events/active',
+
+  // Machine-to-machine jobs authenticate with CRON_SECRET bearer tokens.
+  '/api/cron',
   
   // Admin analytics/tracking - already protected by session auth
   '/api/admin/track-view',
@@ -25,6 +28,8 @@ export const CSRF_EXEMPT_PATHS = [
   '/api/request',
   '/api/verify',
   '/api/verify/confirm',
+  '/api/offboard/verify',
+  '/api/offboard/verify/confirm',
   '/api/profile/verify-email/confirm',
   '/api/auth/request-password-reset',
   '/api/auth/reset-password',
@@ -47,5 +52,6 @@ export const CSRF_PROTECTED_METHODS = ['POST', 'PUT', 'DELETE', 'PATCH'] as cons
  * Check if an HTTP method requires CSRF validation.
  */
 export function requiresCsrfValidation(method: string): boolean {
-  return CSRF_PROTECTED_METHODS.includes(method.toUpperCase() as any);
+  const normalizedMethod = method.toUpperCase();
+  return CSRF_PROTECTED_METHODS.some(protectedMethod => protectedMethod === normalizedMethod);
 }

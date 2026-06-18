@@ -290,6 +290,8 @@ export async function sendAccountActivationEmail(
   });
 
   const activationUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/account/activate?token=${activationToken}`;
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
   const expiryDate = expiresAt.toLocaleDateString('en-US', {
     weekday: 'long',
     year: 'numeric',
@@ -301,7 +303,7 @@ export async function sendAccountActivationEmail(
   });
 
   const mailOptions = {
-    from: getRequiredEnv('EMAIL_FROM'),
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
     to: email,
     subject: 'Set Up Your Account Password - Cal Poly Pomona Student SOC',
     html: `
@@ -393,9 +395,11 @@ export async function sendAccountActivationSuccessEmail(
   });
 
   const loginUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/login`;
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
 
   const mailOptions = {
-    from: getRequiredEnv('EMAIL_FROM'),
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
     to: email,
     subject: 'Password Set Successfully - Cal Poly Pomona Student SOC',
     html: `
@@ -560,8 +564,6 @@ export async function sendCredentialsEmail(
   const { getEmailConfig } = await import('./email-config');
   const emailConfig = await getEmailConfig();
 
-  const loginUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/login`;
-
   const mailOptions = {
     from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
     to: email,
@@ -668,36 +670,50 @@ export async function sendRejectionEmail(
 
 export async function sendPasswordResetEmail(
   email: string,
-  resetToken: string
+  resetToken: string,
+  options: { initiatedByAdmin?: boolean } = {}
 ) {
   appLogger.info('sendPasswordResetEmail called', {
     to: email,
-    hasToken: !!resetToken
+    hasToken: !!resetToken,
+    initiatedByAdmin: Boolean(options.initiatedByAdmin),
   });
 
   const { getEmailConfig } = await import('./email-config');
   const emailConfig = await getEmailConfig();
 
   const resetUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/reset-password?token=${resetToken}`;
+  const subject = options.initiatedByAdmin
+    ? 'Administrator Password Reset Link - Cal Poly Pomona Student SOC'
+    : 'Password Reset Request - Cal Poly Pomona Student SOC';
+  const heading = options.initiatedByAdmin
+    ? 'Administrator Password Reset Link'
+    : 'Password Reset Request';
+  const intro = options.initiatedByAdmin
+    ? 'A Student SOC administrator has issued a one-time link for you to reset your Active Directory account password.'
+    : 'You have requested to reset your Active Directory account password.';
+  const notice = options.initiatedByAdmin
+    ? 'If you were not expecting this administrator-issued reset link, contact Student SOC support before using it. Your password will remain unchanged unless you complete the reset form.'
+    : 'If you did not request a password reset, please ignore this email. Your password will remain unchanged.';
 
   const mailOptions = {
     from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
     to: email,
-    subject: 'Password Reset Request - Cal Poly Pomona Student SOC',
+    subject,
     html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <h2>Password Reset Request</h2>
-        <p>You have requested to reset your Active Directory account password.</p>
-        <p>Click the link below to reset your password:</p>
+        <h2>${heading}</h2>
+        <p>${intro}</p>
+        <p>Click the one-time link below to reset your password:</p>
         <a href="${resetUrl}" style="display: inline-block; padding: 12px 24px; background-color: #059669; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
           Reset Password
         </a>
         <p>Or copy and paste this link into your browser:</p>
         <p style="word-break: break-all; color: #666;">${resetUrl}</p>
-        <p><strong>This link will expire in 1 hour.</strong></p>
+        <p><strong>This one-time link will expire in 1 hour.</strong></p>
         <div style="background-color: #fff3cd; padding: 16px; border-left: 4px solid #ffc107; border-radius: 4px; margin: 16px 0;">
           <p style="margin: 0; color: #856404;">
-            <strong>⚠️ Security Notice:</strong> If you did not request a password reset, please ignore this email. Your password will remain unchanged.
+            <strong>Security Notice:</strong> ${notice}
           </p>
         </div>
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
@@ -1432,4 +1448,375 @@ export async function sendTicketStatusChangeToUser(params: {
     console.error('[Email] ❌ Failed to send ticket status change:', error);
     // Don't throw - we don't want status update to fail if email fails
   }
+}
+
+export async function sendOffboardInitialEmail(params: {
+  email: string;
+  name: string;
+  adUsername: string;
+  vpnUsername?: string | null;
+  verificationToken: string;
+  deadline: Date;
+}) {
+  const { email, name, adUsername, vpnUsername, verificationToken, deadline } = params;
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+  const verificationUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/api/offboard/verify?token=${verificationToken}`;
+  const deadlineText = deadline.toLocaleString('en-US', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  });
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: 'Action Required: Confirm Continued Account Access',
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;">
+        <h2>Confirm Continued Access</h2>
+        <p>Hello ${escapeHtml(name)},</p>
+        <p>We are reviewing active Student SOC accounts. Please confirm that you still need access for the account below and update your AD password as part of the confirmation.</p>
+        <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">AD Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(adUsername)}</td>
+          </tr>
+          ${vpnUsername ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">VPN Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(vpnUsername)}</td>
+          </tr>
+          ` : ''}
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Deadline</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(deadlineText)}</td>
+          </tr>
+        </table>
+        <p>If you do not confirm and successfully update your password by the deadline, your AD account and any linked VPN access may be disabled.</p>
+        <a href="${verificationUrl}" style="display: inline-block; padding: 12px 24px; background-color: #059669; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
+          Confirm Continued Access
+        </a>
+        <p>Or copy and paste this link into your browser:</p>
+        <p style="word-break: break-all; color: #666;">${verificationUrl}</p>
+        <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
+        <p style="color: #666; font-size: 12px;">
+          This link opens a confirmation page first. Your access is only confirmed after you enter your current AD password, choose a new AD password, and Active Directory accepts the change.
+        </p>
+      </div>
+    `,
+  };
+
+  const info = await transporter.sendMail(mailOptions);
+  if (info.rejected && info.rejected.length > 0) {
+    throw new Error(`Email rejected by server for recipients: ${info.rejected.join(', ')}`);
+  }
+  return info;
+}
+
+export async function sendOffboardReminderEmail(params: {
+  email: string;
+  name: string;
+  adUsername: string;
+  vpnUsername?: string | null;
+  verificationToken: string;
+  deadline: Date;
+  reminderDay: 3 | 6;
+}) {
+  const { email, name, adUsername, vpnUsername, verificationToken, deadline, reminderDay } = params;
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+  const verificationUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/api/offboard/verify?token=${verificationToken}`;
+  const deadlineText = deadline.toLocaleString('en-US', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  });
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: `Reminder: Confirm Continued Account Access by ${deadline.toLocaleDateString('en-US')}`,
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;">
+        <h2>Access Confirmation Reminder</h2>
+        <p>Hello ${escapeHtml(name)},</p>
+        <p>This is your day ${reminderDay} reminder to confirm that you still need Student SOC account access and update your AD password.</p>
+        <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">AD Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(adUsername)}</td>
+          </tr>
+          ${vpnUsername ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">VPN Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(vpnUsername)}</td>
+          </tr>
+          ` : ''}
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Deadline</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(deadlineText)}</td>
+          </tr>
+        </table>
+        <p>Accounts that are not confirmed with a successful AD password update by the deadline are automatically queued for disable/revoke actions.</p>
+        <a href="${verificationUrl}" style="display: inline-block; padding: 12px 24px; background-color: #059669; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
+          Confirm Continued Access
+        </a>
+        <p>Or copy and paste this link into your browser:</p>
+        <p style="word-break: break-all; color: #666;">${verificationUrl}</p>
+      </div>
+    `,
+  };
+
+  const info = await transporter.sendMail(mailOptions);
+  if (info.rejected && info.rejected.length > 0) {
+    throw new Error(`Email rejected by server for recipients: ${info.rejected.join(', ')}`);
+  }
+  return info;
+}
+
+async function sendOffboardExtensionNotification(params: {
+  email: string;
+  name: string;
+  adUsername: string;
+  vpnUsername?: string | null;
+  verificationToken: string;
+  deadline: Date;
+  previousDeadline?: Date | null;
+  note?: string | null;
+  reminder: boolean;
+}) {
+  const {
+    email,
+    name,
+    adUsername,
+    vpnUsername,
+    verificationToken,
+    deadline,
+    previousDeadline,
+    note,
+    reminder,
+  } = params;
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+  const verificationUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/api/offboard/verify?token=${verificationToken}`;
+  const formatDeadline = (value: Date) => value.toLocaleString('en-US', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  });
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: reminder
+      ? `Reminder: Extended Account Confirmation Deadline ${deadline.toLocaleDateString('en-US')}`
+      : 'Your Account Confirmation Deadline Has Been Extended',
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;">
+        <h2>${reminder ? 'Extended Deadline Reminder' : 'Account Confirmation Deadline Extended'}</h2>
+        <p>Hello ${escapeHtml(name)},</p>
+        <p>
+          ${reminder
+            ? 'This is a reminder that your extended deadline to confirm continued Student SOC account access is approaching.'
+            : 'An administrator extended the deadline for you to confirm continued Student SOC account access.'}
+        </p>
+        <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">AD Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(adUsername)}</td>
+          </tr>
+          ${vpnUsername ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">VPN Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(vpnUsername)}</td>
+          </tr>
+          ` : ''}
+          ${previousDeadline && !reminder ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Previous Deadline</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatDeadline(previousDeadline))}</td>
+          </tr>
+          ` : ''}
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">New Deadline</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatDeadline(deadline))}</td>
+          </tr>
+        </table>
+        ${note && !reminder ? `<p><strong>Administrator note:</strong> ${escapeHtml(note)}</p>` : ''}
+        <p>You must confirm continued access and successfully update your AD password before the new deadline.</p>
+        <a href="${verificationUrl}" style="display: inline-block; padding: 12px 24px; background-color: #059669; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
+          Confirm Continued Access
+        </a>
+        <p>Or copy and paste this link into your browser:</p>
+        <p style="word-break: break-all; color: #666;">${verificationUrl}</p>
+      </div>
+    `,
+  };
+
+  const info = await transporter.sendMail(mailOptions);
+  if (info.rejected && info.rejected.length > 0) {
+    throw new Error(`Email rejected by server for recipients: ${info.rejected.join(', ')}`);
+  }
+  return info;
+}
+
+export async function sendOffboardExtensionEmail(params: {
+  email: string;
+  name: string;
+  adUsername: string;
+  vpnUsername?: string | null;
+  verificationToken: string;
+  deadline: Date;
+  previousDeadline?: Date | null;
+  note?: string | null;
+}) {
+  return sendOffboardExtensionNotification({ ...params, reminder: false });
+}
+
+export async function sendOffboardExtensionReminderEmail(params: {
+  email: string;
+  name: string;
+  adUsername: string;
+  vpnUsername?: string | null;
+  verificationToken: string;
+  deadline: Date;
+}) {
+  return sendOffboardExtensionNotification({ ...params, reminder: true });
+}
+
+export async function sendMassEmail(params: {
+  to: string;
+  subject: string;
+  html: string;
+  text: string;
+}) {
+  const { to, subject, html, text } = params;
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to,
+    subject,
+    html,
+    text,
+    headers: {
+      'X-UAR-Portal': 'Cal Poly SOC UAR Portal',
+    },
+  };
+
+  const info = await transporter.sendMail(mailOptions);
+  if (info.rejected && info.rejected.length > 0) {
+    throw new Error(`Email rejected by server for recipients: ${info.rejected.join(', ')}`);
+  }
+  return info;
+}
+
+export async function sendPasswordExpirationReminderEmail(
+  email: string,
+  params: {
+    username: string;
+    displayName: string;
+    status: 'expiring_soon' | 'expired' | 'must_change' | string;
+    passwordExpiresAt: string | null;
+    daysRemaining: number | null;
+    daysOverdue: number | null;
+  }
+) {
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+  const appUrl = getRequiredEnv('NEXT_PUBLIC_APP_URL');
+  const loginUrl = `${appUrl}/login`;
+  const forgotPasswordUrl = `${appUrl}/forgot-password`;
+  const isExpired = params.status === 'expired' || params.status === 'must_change';
+  const expiryDate = params.passwordExpiresAt
+    ? new Date(params.passwordExpiresAt).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    })
+    : null;
+  const urgencyText = isExpired
+    ? 'Your Active Directory password is expired or requires a change before sign-in can continue.'
+    : `Your Active Directory password will expire in ${params.daysRemaining ?? 'a few'} day${params.daysRemaining === 1 ? '' : 's'}.`;
+  const subject = isExpired
+    ? 'Action Required: Your SDC Account Password Must Be Changed'
+    : `Reminder: Your SDC Account Password Expires Soon`;
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;">
+      <h2>${isExpired ? 'Password Change Required' : 'Password Expiration Reminder'}</h2>
+      <p>Hello ${escapeHtml(params.displayName || params.username)},</p>
+      <p>${escapeHtml(urgencyText)}</p>
+      <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+        <tr>
+          <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">AD Username</td>
+          <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(params.username)}</td>
+        </tr>
+        <tr>
+          <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Status</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(params.status.replace(/_/g, ' '))}</td>
+        </tr>
+        ${expiryDate ? `
+        <tr>
+          <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Password Expires</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(expiryDate)}</td>
+        </tr>
+        ` : ''}
+      </table>
+      <p>
+        Go to the portal sign-in page and sign in with your current password. If Active Directory requires a change,
+        the portal will show the password update form before completing sign-in.
+      </p>
+      <a href="${loginUrl}" style="display: inline-block; padding: 12px 24px; background-color: #111827; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
+        Sign In and Update Password
+      </a>
+      <p style="margin-top: 16px;">
+        If you do not know your current password, use the forgot password flow instead:
+        <a href="${forgotPasswordUrl}" style="color: #2563eb; font-weight: bold;">${forgotPasswordUrl}</a>
+      </p>
+      <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
+      <p style="color: #666; font-size: 12px;">
+        This message was sent by the Student SOC User Access Request portal. Never share your password with anyone.
+      </p>
+    </div>
+  `;
+
+  const text = [
+    `Hello ${params.displayName || params.username},`,
+    '',
+    urgencyText,
+    `AD Username: ${params.username}`,
+    expiryDate ? `Password Expires: ${expiryDate}` : '',
+    '',
+    `Sign in and update your password: ${loginUrl}`,
+    `If you do not know your current password, use forgot password: ${forgotPasswordUrl}`,
+  ].filter(Boolean).join('\n');
+
+  const info = await transporter.sendMail({
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject,
+    html,
+    text,
+  });
+
+  if (info.rejected && info.rejected.length > 0) {
+    throw new Error(`Email rejected by server for recipients: ${info.rejected.join(', ')}`);
+  }
+
+  return info;
 }

@@ -1,116 +1,148 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { getIpAddress, logAuditAction } from '@/lib/audit-log';
 import { searchLDAPUser } from '@/lib/ldap';
-import { logAuditAction } from '@/lib/audit-log';
+import { INPUT_LIMITS, isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit, validateStringLength } from '@/lib/validation';
+
+interface MatchRequestBody {
+  recordId?: unknown;
+  adUsername?: unknown;
+  matchNotes?: unknown;
+}
+
+interface MatchStatusBody {
+  recordId?: unknown;
+  matchStatus?: unknown;
+  matchNotes?: unknown;
+}
+
+function getAttribute(
+  user: { attributes: Array<{ type: string; values: string[] }> },
+  attributeName: string
+): string | null {
+  const attribute = user.attributes.find((attr) => attr.type.toLowerCase() === attributeName.toLowerCase());
+  return attribute?.values?.[0] || null;
+}
+
+function normalizeNotes(value: unknown): { notes?: string | null; error?: string } {
+  if (value === undefined || value === null) {
+    return { notes: null };
+  }
+
+  if (typeof value !== 'string') {
+    return { error: 'Match notes must be text' };
+  }
+
+  const notes = value.trim();
+  const validation = validateStringLength(notes, 'Match notes', INPUT_LIMITS.COMMENT);
+  if (!validation.valid) {
+    return { error: validation.error };
+  }
+
+  return { notes: notes || null };
+}
+
+async function refreshMatchedCount(importId: string, tx: Prisma.TransactionClient) {
+  const matchedRecords = await tx.vPNImportRecord.count({
+    where: {
+      importId,
+      matchStatus: 'matched',
+    },
+  });
+
+  await tx.vPNImport.update({
+    where: { id: importId },
+    data: { matchedRecords },
+  });
+
+  return matchedRecords;
+}
 
 export async function POST(request: NextRequest) {
-  const startTime = Date.now();
-  let vpnUsername: string | undefined;
-  let adminUsername = 'unknown';
-  
   try {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
-    if (admin) {
-      adminUsername = admin.username;
-    }
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const body = await request.json();
-    const { recordId, adUsername, matchNotes } = body;
+    const body = await parseJsonWithLimit<MatchRequestBody>(request, MAX_REQUEST_BODY_SIZE.SMALL);
+    const recordId = typeof body.recordId === 'string' ? body.recordId.trim() : '';
+    const adUsername = typeof body.adUsername === 'string' ? body.adUsername.trim() : '';
+    const notesResult = normalizeNotes(body.matchNotes);
 
     if (!recordId || !adUsername) {
-      return NextResponse.json({ error: 'Invalid request data' }, { status: 400 });
+      return NextResponse.json({ error: 'Record ID and AD username are required' }, { status: 400 });
     }
 
-    // Look up AD account to get details
-    let adDisplayName = null;
-    let adEmail = null;
-    let adDepartment = null;
-    let ldapLookupSuccess = false;
-    
-    try {
-      const adDetails = await searchLDAPUser(adUsername);
-      if (adDetails && adDetails.attributes) {
-        ldapLookupSuccess = true;
-        // Extract attributes from LDAP response
-        for (const attr of adDetails.attributes) {
-          if (attr.type === 'cn' && attr.values.length > 0) {
-            adDisplayName = attr.values[0];
-          } else if (attr.type === 'mail' && attr.values.length > 0) {
-            adEmail = attr.values[0];
-          } else if (attr.type === 'department' && attr.values.length > 0) {
-            adDepartment = attr.values[0];
-          }
-        }
+    if (notesResult.error) {
+      return NextResponse.json({ error: notesResult.error }, { status: 400 });
+    }
+
+    const adUser = await searchLDAPUser(adUsername);
+    if (!adUser) {
+      return NextResponse.json({ error: 'AD account not found' }, { status: 404 });
+    }
+
+    const normalizedAdUsername = getAttribute(adUser, 'sAMAccountName') || adUsername;
+    const adDisplayName = getAttribute(adUser, 'displayName') || getAttribute(adUser, 'cn');
+    const adEmail = getAttribute(adUser, 'mail');
+    const adDepartment = getAttribute(adUser, 'department');
+
+    const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const importRecord = await tx.vPNImportRecord.findUnique({
+        where: { id: recordId },
+        include: { import: true },
+      });
+
+      if (!importRecord) {
+        throw new Error('IMPORT_RECORD_NOT_FOUND');
       }
-    } catch (error) {
-      console.error('LDAP lookup error:', error);
-    }
 
-    // Use transaction for atomic update
-    const result = await prisma.$transaction(async (tx: any) => {
-      // Update the import record with AD match
-      const updated = await tx.vPNImportRecord.update({
+      if (importRecord.vpnAccountCreated) {
+        throw new Error('IMPORT_RECORD_ALREADY_PROCESSED');
+      }
+
+      const updatedRecord = await tx.vPNImportRecord.update({
         where: { id: recordId },
         data: {
           matchStatus: 'matched',
-          adUsername,
+          adUsername: normalizedAdUsername,
           adDisplayName,
           adEmail,
           adDepartment,
           matchedBy: admin.username,
           matchedAt: new Date(),
-          matchNotes: matchNotes || null,
-        },
-        select: {
-          id: true,
-          vpnUsername: true,
-          importId: true,
-          adUsername: true,
-          matchStatus: true,
+          matchNotes: notesResult.notes ?? null,
         },
       });
 
-      vpnUsername = updated.vpnUsername;
+      const matchedRecords = await refreshMatchedCount(importRecord.importId, tx);
 
-      // Update the import's matched count
-      const matchedCount = await tx.vPNImportRecord.count({
-        where: {
-          importId: updated.importId,
-          matchStatus: 'matched',
-        },
-      });
-
-      await tx.vPNImport.update({
-        where: { id: updated.importId },
-        data: { matchedRecords: matchedCount },
-      });
-
-      return updated;
+      return {
+        importId: importRecord.importId,
+        vpnUsername: importRecord.vpnUsername,
+        matchedRecords,
+        record: updatedRecord,
+      };
+    }, {
+      isolationLevel: 'Serializable',
+      timeout: 10000,
     });
 
-    const duration = Date.now() - startTime;
-
-    // Log successful match
     await logAuditAction({
       category: 'vpn',
-      action: 'vpn_user_matched',
+      action: 'import_record_matched',
       username: admin.username,
       targetType: 'VPNImportRecord',
       targetId: recordId,
       details: {
+        importId: result.importId,
         vpnUsername: result.vpnUsername,
-        adUsername,
-        adDisplayName,
-        adEmail,
-        ldapLookupSuccess,
-        matchNotes,
-        duration: `${duration}ms`,
+        adUsername: normalizedAdUsername,
       },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
+      ipAddress: getIpAddress(request) || 'unknown',
       success: true,
     });
 
@@ -119,130 +151,120 @@ export async function POST(request: NextRequest) {
       data: result,
     });
   } catch (error) {
-    const duration = Date.now() - startTime;
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    
-    console.error('AD match error:', {
-      error: errorMessage,
-      stack: error instanceof Error ? error.stack : undefined,
-      vpnUsername,
-      duration: `${duration}ms`,
-    });
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
 
-    // Log failed match attempt (let audit log failures bubble to prevent untracked admin actions)
-    await logAuditAction({
-      category: 'vpn',
-      action: 'vpn_user_match_failed',
-      username: adminUsername,
-      targetType: 'VPNImportRecord',
-      targetId: 'N/A',
-      details: {
-        error: errorMessage,
-        vpnUsername,
-        duration: `${duration}ms`,
-      },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
-      success: false,
-      errorMessage,
-    });
+    if (error instanceof Error && error.message === 'IMPORT_RECORD_NOT_FOUND') {
+      return NextResponse.json({ error: 'Import record not found' }, { status: 404 });
+    }
 
-    return NextResponse.json(
-      { 
-        error: 'Failed to match AD account',
-      },
-      { status: 500 }
-    );
+    if (error instanceof Error && error.message === 'IMPORT_RECORD_ALREADY_PROCESSED') {
+      return NextResponse.json({ error: 'Import record has already been processed' }, { status: 409 });
+    }
+
+    console.error('VPN import match error:', error);
+    return NextResponse.json({ error: 'Failed to match VPN import record' }, { status: 500 });
   }
 }
 
-// Update match status without AD username (for marking as no_match or conflict)
 export async function PATCH(request: NextRequest) {
-  const startTime = Date.now();
-  let adminUsername = 'unknown';
-
   try {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
-    if (admin) {
-      adminUsername = admin.username;
-    }
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }    const body = await request.json();
-    const { recordId, matchStatus, matchNotes } = body;
-
-    if (!recordId || !matchStatus) {
-      return NextResponse.json({ error: 'Invalid request data' }, { status: 400 });
     }
 
-    const updated = await prisma.vPNImportRecord.update({
-      where: { id: recordId },
-      data: {
-        matchStatus,
-        matchNotes: matchNotes || null,
-        matchedBy: admin.username,
-        matchedAt: new Date(),
-      },
-      select: {
-        id: true,
-        vpnUsername: true,
-        matchStatus: true,
-      },
+    const body = await parseJsonWithLimit<MatchStatusBody>(request, MAX_REQUEST_BODY_SIZE.SMALL);
+    const recordId = typeof body.recordId === 'string' ? body.recordId.trim() : '';
+    const matchStatus = typeof body.matchStatus === 'string' ? body.matchStatus.trim() : '';
+    const notesResult = normalizeNotes(body.matchNotes);
+
+    if (!recordId) {
+      return NextResponse.json({ error: 'Record ID is required' }, { status: 400 });
+    }
+
+    if (!['unmatched', 'no_match', 'conflict'].includes(matchStatus)) {
+      return NextResponse.json({ error: 'Invalid match status' }, { status: 400 });
+    }
+
+    if (notesResult.error) {
+      return NextResponse.json({ error: notesResult.error }, { status: 400 });
+    }
+
+    const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const importRecord = await tx.vPNImportRecord.findUnique({
+        where: { id: recordId },
+      });
+
+      if (!importRecord) {
+        throw new Error('IMPORT_RECORD_NOT_FOUND');
+      }
+
+      if (importRecord.vpnAccountCreated) {
+        throw new Error('IMPORT_RECORD_ALREADY_PROCESSED');
+      }
+
+      const updatedRecord = await tx.vPNImportRecord.update({
+        where: { id: recordId },
+        data: {
+          matchStatus,
+          adUsername: null,
+          adDisplayName: null,
+          adEmail: null,
+          adDepartment: null,
+          matchedBy: matchStatus === 'unmatched' ? null : admin.username,
+          matchedAt: matchStatus === 'unmatched' ? null : new Date(),
+          matchNotes: notesResult.notes ?? null,
+        },
+      });
+
+      const matchedRecords = await refreshMatchedCount(importRecord.importId, tx);
+
+      return {
+        importId: importRecord.importId,
+        vpnUsername: importRecord.vpnUsername,
+        matchedRecords,
+        record: updatedRecord,
+      };
+    }, {
+      isolationLevel: 'Serializable',
+      timeout: 10000,
     });
 
-    const duration = Date.now() - startTime;
-
-    // Log status update
     await logAuditAction({
       category: 'vpn',
-      action: 'vpn_match_status_updated',
+      action: 'import_record_match_status_updated',
       username: admin.username,
       targetType: 'VPNImportRecord',
       targetId: recordId,
       details: {
-        vpnUsername: updated.vpnUsername,
+        importId: result.importId,
+        vpnUsername: result.vpnUsername,
         matchStatus,
-        matchNotes,
-        duration: `${duration}ms`,
       },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
+      ipAddress: getIpAddress(request) || 'unknown',
       success: true,
     });
 
     return NextResponse.json({
       success: true,
-      data: updated,
+      data: result,
     });
   } catch (error) {
-    const duration = Date.now() - startTime;
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    
-    console.error('Update match status error:', {
-      error: errorMessage,
-      stack: error instanceof Error ? error.stack : undefined,
-      duration: `${duration}ms`,
-    });
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
 
-    // Log failed status update (allow failures to bubble to avoid losing audit coverage)
-    await logAuditAction({
-      category: 'vpn',
-      action: 'vpn_match_status_update_failed',
-      username: adminUsername,
-      targetType: 'VPNImportRecord',
-      targetId: 'N/A',
-      details: {
-        error: errorMessage,
-        duration: `${duration}ms`,
-      },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
-      success: false,
-      errorMessage,
-    });
+    if (error instanceof Error && error.message === 'IMPORT_RECORD_NOT_FOUND') {
+      return NextResponse.json({ error: 'Import record not found' }, { status: 404 });
+    }
 
-    return NextResponse.json(
-      { 
-        error: 'Failed to update match status',
-      },
-      { status: 500 }
-    );
+    if (error instanceof Error && error.message === 'IMPORT_RECORD_ALREADY_PROCESSED') {
+      return NextResponse.json({ error: 'Import record has already been processed' }, { status: 409 });
+    }
+
+    console.error('VPN import match status update error:', error);
+    return NextResponse.json({ error: 'Failed to update VPN import match status' }, { status: 500 });
   }
 }

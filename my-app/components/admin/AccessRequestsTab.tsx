@@ -54,10 +54,10 @@ interface AccessRequest {
 }
 
 interface AccessRequestsTabProps {
-  requests: AccessRequest[];
+  requests?: AccessRequest[];
 }
 
-type StatusFilter = 'all' | 'pending_verification' | 'pending_student_directors' | 'pending_faculty' | 'approved' | 'rejected';
+type StatusFilter = 'all' | 'pending_verification' | 'pending_student_directors' | 'pending_faculty' | 'approved' | 'rejected' | 'offboarded';
 type TypeFilter = 'all' | 'internal' | 'external';
 type VerificationFilter = 'all' | 'verified' | 'unverified';
 
@@ -74,7 +74,7 @@ export default function AccessRequestsTab({ requests }: AccessRequestsTabProps) 
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
   const [resendingId, setResendingId] = useState<string | null>(null);
 
-  const [localRequests, setLocalRequests] = useState<AccessRequest[]>(requests);
+  const [localRequests, setLocalRequests] = useState<AccessRequest[]>(requests ?? []);
   const { toast, showToast, hideToast } = useToast();
 
   // Polling for live updates
@@ -101,7 +101,9 @@ export default function AccessRequestsTab({ requests }: AccessRequestsTabProps) 
 
   // Update local state when prop changes (initial load or parent update)
   useEffect(() => {
-    setLocalRequests(requests);
+    if (requests !== undefined) {
+      setLocalRequests(requests);
+    }
   }, [requests]);
 
   // Extract unique events from requests
@@ -241,6 +243,7 @@ export default function AccessRequestsTab({ requests }: AccessRequestsTabProps) 
       pending_faculty: 'bg-yellow-100 text-yellow-800',
       approved: 'bg-green-100 text-green-800',
       rejected: 'bg-red-100 text-red-800',
+      offboarded: 'bg-slate-100 text-slate-800',
     };
     
     const labels = {
@@ -249,6 +252,7 @@ export default function AccessRequestsTab({ requests }: AccessRequestsTabProps) 
       pending_faculty: 'Pending Faculty',
       approved: 'Approved',
       rejected: 'Rejected',
+      offboarded: 'Offboarded',
     };
     
     return (
@@ -438,6 +442,7 @@ export default function AccessRequestsTab({ requests }: AccessRequestsTabProps) 
                   <SelectItem value="pending_faculty">Pending Faculty</SelectItem>
                   <SelectItem value="approved">Approved</SelectItem>
                   <SelectItem value="rejected">Rejected</SelectItem>
+                  <SelectItem value="offboarded">Offboarded</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -758,7 +763,7 @@ export default function AccessRequestsTab({ requests }: AccessRequestsTabProps) 
                   setCurrentPage(1);
                 }}
               >
-                <SelectTrigger className="w-[80px] h-8">
+                <SelectTrigger className="w-20 h-8">
                   <SelectValue placeholder={pageSize.toString()} />
                 </SelectTrigger>
                 <SelectContent>

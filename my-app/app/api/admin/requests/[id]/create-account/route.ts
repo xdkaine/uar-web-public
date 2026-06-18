@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import {
-  searchLDAPUser,
+  searchLDAPUserForProvisioning,
   createLDAPUser,
   setLDAPUserPassword,
   setLDAPUserExpiration,
@@ -12,12 +13,14 @@ import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { decryptPassword } from '@/lib/encryption';
 
-import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent, sanitizeDatabaseText } from '@/lib/audit-log';
 import { extractBronconame } from '@/lib/validation';
+import { findReusableOffboardedRequest } from '@/lib/offboard-reenrollment';
 
 const PROVISIONING_STATE_IN_PROGRESS = 'in_progress';
 const PROVISIONING_STATE_SUCCEEDED = 'succeeded';
 const PROVISIONING_STATE_FAILED = 'failed';
+const PROVISIONING_LOCK_STALE_AFTER_MS = 15 * 60 * 1000;
 
 class HttpError extends Error {
   status: number;
@@ -71,6 +74,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const provisionedAccounts = new Set<string>();
+  const reusedOffboardedAccounts = new Set<string>();
   let provisioningLockVersion: number | null = null;
   let requestId: string | null = null;
 
@@ -86,7 +90,8 @@ export async function POST(
     requestId = resolvedParams.id;
 
     const { accessRequest, lockedVersion } = await prisma.$transaction(
-      async (tx: any) => {
+      async (tx: Prisma.TransactionClient) => {
+        const staleProvisioningStartedBefore = new Date(Date.now() - PROVISIONING_LOCK_STALE_AFTER_MS);
         const requestRecord = await tx.accessRequest.findUnique({
           where: { id: resolvedParams.id },
         });
@@ -112,7 +117,11 @@ export async function POST(
           );
         }
 
-        if (requestRecord.provisioningState === PROVISIONING_STATE_IN_PROGRESS) {
+        const hasActiveProvisioningLock =
+          requestRecord.provisioningState === PROVISIONING_STATE_IN_PROGRESS &&
+          (!requestRecord.provisioningStartedAt || requestRecord.provisioningStartedAt >= staleProvisioningStartedBefore);
+
+        if (hasActiveProvisioningLock) {
           throw new HttpError(
             'Another administrator is currently provisioning this request. Please refresh and try again.',
             409
@@ -144,7 +153,7 @@ export async function POST(
             ],
             id: { not: resolvedParams.id },
             accountCreatedAt: { not: null },
-            status: { notIn: ['rejected'] },
+            status: { notIn: ['rejected', 'offboarded'] },
           },
         });
 
@@ -160,6 +169,10 @@ export async function POST(
             OR: [
               { provisioningState: null },
               { provisioningState: PROVISIONING_STATE_FAILED },
+              {
+                provisioningState: PROVISIONING_STATE_IN_PROGRESS,
+                provisioningStartedAt: { lt: staleProvisioningStartedBefore },
+              },
             ],
           },
           data: {
@@ -197,21 +210,36 @@ export async function POST(
       !accessRequest.isInternal && accessRequest.vpnUsername
         ? accessRequest.vpnUsername
         : null;
+    let reusingOffboardedAd = false;
+    let reusingOffboardedVpn = false;
+    let reusableOffboardedRequestId: string | null = null;
 
     // Retry cleanup only touches accounts that still carry this request's description tag.
     try {
-      const existingUser = await searchLDAPUser(ldapUsername);
+      const existingUser = await searchLDAPUserForProvisioning(ldapUsername);
       if (existingUser) {
         console.log(`[Retry Safety] Found existing LDAP account ${ldapUsername} - checking if from failed attempt`);
         const descAttr = existingUser.attributes.find((attr: { type: string }) => attr.type === 'description');
         const description = descAttr?.values?.[0] || '';
         
         if (descriptionMatchesRequestTag(description, accessRequest.id)) {
-          console.log(`[Retry Safety] VPN account matches this request ID - cleaning up for retry`);
-          await deleteLDAPUser(vpnUsername!, accessRequest.id);
-          console.log(`[Retry Safety] Successfully cleaned up ${vpnUsername} for retry`);
+          console.log(`[Retry Safety] LDAP account matches this request ID - cleaning up for retry`);
+          await deleteLDAPUser(ldapUsername, accessRequest.id);
+          console.log(`[Retry Safety] Successfully cleaned up ${ldapUsername} for retry`);
         } else {
-          throw new HttpError('LDAP username already exists in Active Directory');
+          const reusableRequest = await findReusableOffboardedRequest({
+            username: ldapUsername,
+            email: accessRequest.email,
+          });
+
+          if (!reusableRequest) {
+            throw new HttpError('LDAP username already exists in Active Directory');
+          }
+
+          reusingOffboardedAd = true;
+          reusableOffboardedRequestId = reusableRequest.id;
+          reusedOffboardedAccounts.add(ldapUsername);
+          console.log(`[Re-enrollment] Reusing campaign-offboarded AD account ${ldapUsername}`);
         }
       }
     } catch (ldapError) {
@@ -228,7 +256,7 @@ export async function POST(
 
     if (vpnUsername && vpnUsername !== ldapUsername) {
       try {
-        const existingVpnUser = await searchLDAPUser(vpnUsername);
+        const existingVpnUser = await searchLDAPUserForProvisioning(vpnUsername);
         if (existingVpnUser) {
           console.log(`[Retry Safety] Found existing VPN account ${vpnUsername} - checking if from failed attempt`);
           
@@ -240,7 +268,19 @@ export async function POST(
             await deleteLDAPUser(ldapUsername, accessRequest.id);
             console.log(`[Retry Safety] Successfully cleaned up ${ldapUsername} for retry`);
           } else {
-            throw new HttpError('LDAP username already exists in Active Directory');
+            const reusableRequest = await findReusableOffboardedRequest({
+              username: vpnUsername,
+              email: accessRequest.email,
+            });
+
+            if (!reusableRequest) {
+              throw new HttpError('LDAP username already exists in Active Directory');
+            }
+
+            reusingOffboardedVpn = true;
+            reusableOffboardedRequestId = reusableOffboardedRequestId || reusableRequest.id;
+            reusedOffboardedAccounts.add(vpnUsername);
+            console.log(`[Re-enrollment] Reusing campaign-offboarded VPN account ${vpnUsername}`);
           }
         }
       } catch (ldapError) {
@@ -262,17 +302,21 @@ export async function POST(
 
     const plainPassword = decryptPassword(accessRequest.accountPassword);
 
-    console.log(`[Account Creation] Creating LDAP account: ${ldapUsername}`);
-    await createLDAPUser(
-      ldapUsername,
-      accessRequest.email,
-      accessRequest.name,
-      !accessRequest.isInternal,
-      accessRequest.id,
-      accessRequest.accountExpiresAt || undefined
-    );
-    provisionedAccounts.add(ldapUsername);
-    console.log(`[Account Creation] LDAP account created successfully: ${ldapUsername}`);
+    if (!reusingOffboardedAd) {
+      console.log(`[Account Creation] Creating LDAP account: ${ldapUsername}`);
+      await createLDAPUser(
+        ldapUsername,
+        accessRequest.email,
+        accessRequest.name,
+        !accessRequest.isInternal,
+        accessRequest.id,
+        accessRequest.accountExpiresAt || undefined
+      );
+      provisionedAccounts.add(ldapUsername);
+      console.log(`[Account Creation] LDAP account created successfully: ${ldapUsername}`);
+    } else {
+      console.log(`[Re-enrollment] Preparing existing offboarded LDAP account for reactivation: ${ldapUsername}`);
+    }
 
     await setLDAPUserPassword(ldapUsername, plainPassword);
 
@@ -286,17 +330,21 @@ export async function POST(
     }
 
     if (vpnUsername && vpnUsername !== ldapUsername) {
-      console.log(`[Account Creation] Creating VPN account: ${vpnUsername}`);
-      await createLDAPUser(
-        vpnUsername,
-        accessRequest.email,
-        accessRequest.name,
-        true,
-        accessRequest.id,
-        accessRequest.accountExpiresAt || undefined
-      );
-      provisionedAccounts.add(vpnUsername);
-      console.log(`[Account Creation] VPN account created successfully: ${vpnUsername}`);
+      if (!reusingOffboardedVpn) {
+        console.log(`[Account Creation] Creating VPN account: ${vpnUsername}`);
+        await createLDAPUser(
+          vpnUsername,
+          accessRequest.email,
+          accessRequest.name,
+          true,
+          accessRequest.id,
+          accessRequest.accountExpiresAt || undefined
+        );
+        provisionedAccounts.add(vpnUsername);
+        console.log(`[Account Creation] VPN account created successfully: ${vpnUsername}`);
+      } else {
+        console.log(`[Re-enrollment] Preparing existing offboarded VPN account for reactivation: ${vpnUsername}`);
+      }
 
       await setLDAPUserPassword(vpnUsername, plainPassword);
 
@@ -309,7 +357,7 @@ export async function POST(
 
     // Database state changes only happen after every LDAP call succeeds.
     const updatedRequest = await prisma.$transaction(
-      async (tx: any) => {
+      async (tx: Prisma.TransactionClient) => {
         const completionTime = new Date();
 
         const updateResult = await tx.accessRequest.updateMany({
@@ -325,6 +373,16 @@ export async function POST(
             acknowledgedAt: completionTime,
             acknowledgedBy: admin.username,
             status: 'pending_faculty',
+            ...(reusingOffboardedAd || reusingOffboardedVpn
+              ? {
+                  isManuallyAssigned: true,
+                  manuallyAssignedAt: completionTime,
+                  manuallyAssignedBy: admin.username,
+                  linkedAdUsername: ldapUsername,
+                  linkedVpnUsername: vpnUsername || ldapUsername,
+                  manualAssignmentNotes: `Prepared for reactivation from campaign-offboarded request ${reusableOffboardedRequestId}`,
+                }
+              : {}),
             version: { increment: 1 },
             provisioningState: PROVISIONING_STATE_SUCCEEDED,
             provisioningCompletedAt: completionTime,
@@ -410,7 +468,9 @@ export async function POST(
           });
         }
 
-        let commentText = `LDAP account created by ${admin.username} in Active Directory. Username: ${accessRequest.ldapUsername}`;
+        let commentText = reusingOffboardedAd || reusingOffboardedVpn
+          ? `Campaign-offboarded LDAP account prepared for reactivation by ${admin.username}. Username: ${accessRequest.ldapUsername}`
+          : `LDAP account created by ${admin.username} in Active Directory. Username: ${accessRequest.ldapUsername}`;
         if (
           !accessRequest.isInternal &&
           accessRequest.vpnUsername &&
@@ -425,7 +485,9 @@ export async function POST(
           commentText += `. Account will be automatically disabled on: ${disableDate}`;
         }
         commentText +=
-          '. Request moved to Pending Faculty. VPN account entry created for tracking.';
+          reusingOffboardedAd || reusingOffboardedVpn
+            ? '. Request moved to Pending Faculty. The account remains disabled until faculty approval re-enables access.'
+            : '. Request moved to Pending Faculty. VPN account entry created for tracking.';
 
         await tx.requestComment.create({
           data: {
@@ -451,13 +513,20 @@ export async function POST(
       action: AuditActions.CREATE_ACCOUNT,
       category: AuditCategories.ACCESS_REQUEST,
       username: admin.username,
+      actorType: 'admin',
       targetId: requestId!,
       targetType: 'AccessRequest',
+      subjectUsername: updatedRequest.ldapUsername || updatedRequest.vpnUsername,
+      subjectEmail: updatedRequest.email,
+      relatedRequestId: requestId!,
+      eventKind: 'write',
+      outcome: 'success',
       details: { 
         ldapUsername: updatedRequest.ldapUsername,
         vpnUsername: updatedRequest.vpnUsername,
         isInternal: updatedRequest.isInternal,
-        hasExpiration: !!updatedRequest.accountExpiresAt 
+        hasExpiration: !!updatedRequest.accountExpiresAt,
+        reactivatedOffboardedAccounts: Array.from(reusedOffboardedAccounts),
       },
       ipAddress: getIpAddress(request),
       userAgent: getUserAgent(request),
@@ -465,15 +534,18 @@ export async function POST(
 
     return NextResponse.json({
       success: true,
-      message:
-        'Account created successfully in Active Directory and moved to Faculty Review',
+      message: reusedOffboardedAccounts.size > 0
+        ? 'Offboarded account prepared for reactivation and moved to Faculty Review'
+        : 'Account created successfully in Active Directory and moved to Faculty Review',
       request: updatedRequest,
     });
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    const rawErrorMessage = error instanceof Error ? error.message : 'Unknown error';
+    const errorMessage = sanitizeDatabaseText(rawErrorMessage) || 'Unknown error';
     const errorDetails = {
       requestId,
       provisionedAccounts: Array.from(provisionedAccounts),
+      reusedOffboardedAccounts: Array.from(reusedOffboardedAccounts),
       error: errorMessage,
       timestamp: new Date().toISOString()
     };
@@ -497,9 +569,9 @@ export async function POST(
             await prisma.requestComment.create({
               data: {
                 requestId,
-                comment: `⚠️ CRITICAL: Automatic LDAP cleanup failed. Manual deletion required for: ${
-                  cleanupResult.failed.map(f => `${f.username} (${f.error})`).join(', ')
-                }. Original error: ${errorMessage}`,
+                comment: sanitizeDatabaseText(`CRITICAL: Automatic LDAP cleanup failed. Manual deletion required for: ${
+                  cleanupResult.failed.map(f => `${f.username} (${sanitizeDatabaseText(f.error)})`).join(', ')
+                }. Original error: ${errorMessage}`),
                 author: 'System',
                 type: 'system',
               },
@@ -518,7 +590,7 @@ export async function POST(
             await prisma.requestComment.create({
               data: {
                 requestId,
-                comment: `Account creation failed but cleanup was successful. You can safely retry. Error: ${errorMessage}`,
+                comment: sanitizeDatabaseText(`Account creation failed but cleanup was successful. You can safely retry. Error: ${errorMessage}`),
                 author: 'System',
                 type: 'system',
               },
@@ -544,8 +616,7 @@ export async function POST(
           data: {
             provisioningState: PROVISIONING_STATE_FAILED,
             provisioningCompletedAt: new Date(),
-            provisioningError:
-              error instanceof Error ? error.message : 'Unknown provisioning error',
+            provisioningError: errorMessage || 'Unknown provisioning error',
             version: { increment: 1 },
           },
         });
@@ -565,12 +636,17 @@ export async function POST(
             action: AuditActions.CREATE_ACCOUNT,
             category: AuditCategories.ACCESS_REQUEST,
             username: admin.username,
+            actorType: 'admin',
             targetId: requestId,
             targetType: 'AccessRequest',
             success: false,
-            errorMessage: error instanceof Error ? error.message : 'Unknown error',
+            errorMessage,
+            relatedRequestId: requestId,
+            eventKind: 'write',
+            outcome: provisionedAccounts.size > 0 ? 'rollback' : 'failure',
             details: { 
               cleanedUpAccounts: Array.from(provisionedAccounts),
+              reusedOffboardedAccounts: Array.from(reusedOffboardedAccounts),
               provisioningState: 'failed'
             },
             ipAddress: getIpAddress(request),

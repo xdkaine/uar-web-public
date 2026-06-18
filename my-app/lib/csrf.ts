@@ -194,6 +194,7 @@ function isUrlCsrfExempt(url: string): boolean {
       '/api/auth/session',
       '/api/csrf-token',
       '/api/events/active',
+      '/api/cron',
       '/api/admin/track-view',
       '/api/request',
       '/api/verify',

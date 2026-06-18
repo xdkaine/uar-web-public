@@ -6,9 +6,47 @@ import {
   withTimeout,
   sanitizeLdapError,
   escapeLDAPFilter,
+  escapeLDAPDN,
   LDAP_TIMEOUT,
   parseLDAPDate
 } from './utils';
+
+type LDAPUserSearchResult = {
+  objectName: string;
+  attributes: Array<{ type: string; values: string[] }>;
+};
+
+const LDAP_USER_LOOKUP_ATTRIBUTES: string[] = [
+  'cn',
+  'mail',
+  'memberOf',
+  'sAMAccountName',
+  'description',
+  'extensionAttribute15',
+  'displayName',
+  'userAccountControl',
+];
+
+function toLDAPUserSearchResult(entry: Record<string, unknown>): LDAPUserSearchResult {
+  const attributes = Object.entries(entry).map(([key, value]) => ({
+    type: key,
+    values: Array.isArray(value) ? value.map(String) : [String(value)]
+  })).filter(attr => attr.type !== 'dn');
+
+  return {
+    objectName: entry.dn as string,
+    attributes
+  };
+}
+
+function isNoSuchObjectError(error: unknown): boolean {
+  const ldapError = error as { code?: number | string; message?: string };
+  const message = ldapError?.message || '';
+  return ldapError?.code === 32 ||
+    ldapError?.code === '32' ||
+    message.includes('NO_OBJECT') ||
+    message.toLowerCase().includes('no such object');
+}
 
 /**
  * Search for a user by sAMAccountName
@@ -40,7 +78,7 @@ export async function searchLDAPUser(username: string): Promise<{
     const opts = {
       filter: `(sAMAccountName=${sanitizedUsername})`,
       scope: 'sub' as const,
-      attributes: ['cn', 'mail', 'memberOf', 'sAMAccountName', 'description', 'extensionAttribute15', 'displayName'],
+      attributes: LDAP_USER_LOOKUP_ATTRIBUTES,
     };
 
     const { searchEntries } = await withTimeout(client.search(searchBase, opts), LDAP_TIMEOUT);
@@ -49,19 +87,65 @@ export async function searchLDAPUser(username: string): Promise<{
       return null;
     }
 
-    const entry = searchEntries[0];
-
-    const attributes = Object.entries(entry).map(([key, value]) => ({
-      type: key,
-      values: Array.isArray(value) ? value.map(String) : [String(value)]
-    })).filter(attr => attr.type !== 'dn');
-
-    return {
-      objectName: entry.dn as string,
-      attributes
-    };
+    return toLDAPUserSearchResult(searchEntries[0]);
   } catch (err) {
     ldapLogger.error('Error searching for user', sanitizeLdapError(err));
+    throw err;
+  } finally {
+    if (client) {
+      try {
+        await client.unbind();
+      } catch (unbindErr) {
+        ldapLogger.error('Error unbinding connection', unbindErr);
+      }
+    }
+  }
+}
+
+/**
+ * Search for any LDAP entry that would conflict with provisioning this username.
+ * Account creation adds CN=<username> and sets sAMAccountName=<username>, so both
+ * identities must be treated as unavailable.
+ */
+export async function searchLDAPUserForProvisioning(username: string): Promise<LDAPUserSearchResult | null> {
+  if (!username) {
+    return null;
+  }
+
+  const samAccount = await searchLDAPUser(username);
+  if (samAccount) {
+    return samAccount;
+  }
+
+  let client: Client | null = null;
+  try {
+    const bindDN = getRequiredEnv('LDAP_BIND_DN');
+    const bindPassword = getRequiredEnv('LDAP_BIND_PASSWORD');
+    const searchBase = getRequiredEnv('LDAP_SEARCH_BASE');
+
+    client = createLDAPClient();
+    await withTimeout(client.bind(bindDN, bindPassword), LDAP_TIMEOUT);
+
+    const userDN = `CN=${escapeLDAPDN(username)},${searchBase}`;
+    const opts = {
+      filter: '(objectClass=*)',
+      scope: 'base' as const,
+      attributes: LDAP_USER_LOOKUP_ATTRIBUTES,
+    };
+
+    const { searchEntries } = await withTimeout(client.search(userDN, opts), LDAP_TIMEOUT);
+
+    if (searchEntries.length === 0) {
+      return null;
+    }
+
+    return toLDAPUserSearchResult(searchEntries[0]);
+  } catch (err) {
+    if (isNoSuchObjectError(err)) {
+      return null;
+    }
+
+    ldapLogger.error('Error searching for provisioning user conflict', sanitizeLdapError(err));
     throw err;
   } finally {
     if (client) {
@@ -271,7 +355,7 @@ export async function searchUserByEmail(email: string): Promise<{
     const opts = {
       filter: `(&(objectClass=user)(mail=${sanitizedEmail}))`,
       scope: 'sub' as const,
-      attributes: ['cn', 'mail', 'memberOf', 'sAMAccountName', 'description', 'extensionAttribute15', 'displayName'],
+      attributes: ['cn', 'mail', 'memberOf', 'sAMAccountName', 'description', 'extensionAttribute15', 'displayName', 'userAccountControl'],
     };
 
     const { searchEntries } = await withTimeout(client.search(searchBase, opts), LDAP_TIMEOUT);

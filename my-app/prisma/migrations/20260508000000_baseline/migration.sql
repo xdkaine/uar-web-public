@@ -1,0 +1,2 @@
+-- Baseline marker for databases created before Prisma migration history was introduced.
+-- The existing schema is recorded as applied by scripts/docker-migrate.sh.

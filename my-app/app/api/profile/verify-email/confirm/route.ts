@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { checkRateLimitAsync, getClientIp } from '@/lib/ratelimit';
+import { checkRateLimitAsync, getRequiredClientIp, isRateLimitUnavailable } from '@/lib/ratelimit';
 import { appLogger } from '@/lib/logger';
 import { updateUserAttribute, searchLDAPUser, formatRequestDescription } from '@/lib/ldap';
 import { extractBronconame } from '@/lib/validation';
@@ -14,7 +14,7 @@ import { getSessionFromCookies } from '@/lib/session';
 export async function GET(request: NextRequest) {
   try {
     // Apply rate limiting: 30 attempts per hour per IP to prevent token enumeration
-    const clientIp = getClientIp(request);
+    const clientIp = getRequiredClientIp(request);
     const rateLimitIpResult = await checkRateLimitAsync(clientIp, {
       maxRequests: 30,
       windowMs: 60 * 60 * 1000, // 1 hour
@@ -26,7 +26,7 @@ export async function GET(request: NextRequest) {
     const token = searchParams.get('token');
 
     // Add per-token rate limiting: 10 attempts per token per hour
-    const rateLimitTokenResult = await checkRateLimitAsync(clientIp, {
+    const rateLimitTokenResult = await checkRateLimitAsync('profile-email-verification-token', {
       maxRequests: 10,
       windowMs: 60 * 60 * 1000, // 1 hour
       identifier: token || 'no-token',
@@ -299,6 +299,11 @@ export async function GET(request: NextRequest) {
       return NextResponse.redirect(new URL('/profile?verification=error', origin));
     }
   } catch (error) {
+    if (isRateLimitUnavailable(error)) {
+      const origin = process.env.NEXT_PUBLIC_APP_URL || 'https://portal.calpolysoc.org';
+      return NextResponse.redirect(new URL('/profile?verification=error', origin));
+    }
+
     appLogger.error('Error confirming profile email verification', error);
     const origin = process.env.NEXT_PUBLIC_APP_URL || 'https://portal.calpolysoc.org';
     return NextResponse.redirect(new URL('/profile?verification=error', origin));

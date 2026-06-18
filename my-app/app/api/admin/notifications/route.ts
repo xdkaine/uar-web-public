@@ -3,8 +3,19 @@ import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import logger from '@/lib/logger';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { isJsonBodyError, parseAdminJson } from '@/lib/admin-json-parser';
 
 export const dynamic = 'force-dynamic';
+
+type NotificationCreateBody = {
+  message?: string;
+  type?: string;
+  priority?: number;
+  isActive?: boolean;
+  startDate?: string | null;
+  endDate?: string | null;
+  dismissible?: boolean;
+};
 
 // GET /api/admin/notifications - Get all notification banners
 export async function GET(request: NextRequest) {
@@ -42,7 +53,7 @@ export async function POST(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const body = await request.json();
+    const body = await parseAdminJson<NotificationCreateBody>(request);
     const { message, type, priority, isActive, startDate, endDate, dismissible } = body;
 
     // Validate required fields
@@ -110,6 +121,10 @@ export async function POST(request: NextRequest) {
       message: 'Notification created successfully',
     });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
     logger.error('Error creating notification', {
       action: 'create_notification',
       error: error instanceof Error ? error.message : 'Unknown error',

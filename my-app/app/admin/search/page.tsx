@@ -84,6 +84,7 @@ export default function GlobalSearchPage() {
       pending_faculty: 'bg-yellow-100 text-yellow-800',
       approved: 'bg-green-100 text-green-800',
       rejected: 'bg-red-100 text-red-800',
+      offboarded: 'bg-slate-100 text-slate-800',
 
       // Lifecycle Actions
       pending: 'bg-gray-100 text-gray-800',

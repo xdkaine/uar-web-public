@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
+import type { ReactNode } from 'react';
 import { useToast } from '@/hooks/useToast';
 import { fetchWithCsrf } from '@/lib/csrf';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -65,7 +66,7 @@ interface VPNAccountDetailModalProps {
   onRefresh?: () => void;
 }
 
-export default function VPNAccountDetailModal({ accountId, onClose, onRefresh }: VPNAccountDetailModalProps) {
+export default function VPNAccountDetailModal({ accountId, onClose }: VPNAccountDetailModalProps) {
   const { showToast } = useToast();
   const [account, setAccount] = useState<VPNAccountDetail | null>(null);
   const [comments, setComments] = useState<Comment[]>([]);
@@ -74,12 +75,7 @@ export default function VPNAccountDetailModal({ accountId, onClose, onRefresh }:
   const [newComment, setNewComment] = useState('');
   const [submittingComment, setSubmittingComment] = useState(false);
 
-  useEffect(() => {
-    fetchAccountDetails();
-    fetchComments();
-  }, [accountId]);
-
-  const fetchAccountDetails = async () => {
+  const fetchAccountDetails = useCallback(async () => {
     try {
       setLoading(true);
       const res = await fetch(`/api/admin/vpn-accounts/${accountId}`);
@@ -97,9 +93,9 @@ export default function VPNAccountDetailModal({ accountId, onClose, onRefresh }:
     } finally {
       setLoading(false);
     }
-  };
+  }, [accountId, showToast]);
 
-  const fetchComments = async () => {
+  const fetchComments = useCallback(async () => {
     try {
       setLoadingComments(true);
       const res = await fetchWithCsrf(`/api/admin/vpn-accounts/${accountId}/comments`);
@@ -116,7 +112,12 @@ export default function VPNAccountDetailModal({ accountId, onClose, onRefresh }:
     } finally {
       setLoadingComments(false);
     }
-  };
+  }, [accountId]);
+
+  useEffect(() => {
+    fetchAccountDetails();
+    fetchComments();
+  }, [fetchAccountDetails, fetchComments]);
 
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -181,13 +182,13 @@ export default function VPNAccountDetailModal({ accountId, onClose, onRefresh }:
     });
   };
 
-  const InfoRow = ({ label, value, highlight = false, icon = null }: { label: string; value: any; highlight?: boolean; icon?: React.ReactNode }) => (
+  const InfoRow = ({ label, value, highlight = false, icon = null }: { label: string; value?: ReactNode; highlight?: boolean; icon?: ReactNode }) => (
     <div className="flex py-3 border-b last:border-b-0 items-center">
       <dt className="w-1/3 text-sm font-medium text-muted-foreground flex items-center gap-2">
         {icon}
         {label}
       </dt>
-      <dd className={`w-2/3 text-sm ${highlight ? 'font-semibold text-foreground' : 'text-foreground'} break-words`}>
+      <dd className={`w-2/3 text-sm ${highlight ? 'font-semibold text-foreground' : 'text-foreground'} break-all`}>
         {value || 'N/A'}
       </dd>
     </div>

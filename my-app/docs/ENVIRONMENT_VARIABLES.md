@@ -34,6 +34,18 @@ Used for encrypting sensitive data at rest (e.g., stored passwords).
 | `REDIS_URL` | Redis connection string. Example: `redis://localhost:6379`. If omitted, falls back to in-memory (not for prod). | No |
 | `REDIS_TOKEN` | Upstash Redis token (if using Upstash). | No |
 
+## Proxy Headers
+
+| Variable | Description | Required |
+| :--- | :--- | :--- |
+| `TRUST_PROXY_HEADERS` | Set to `true` only in production deployments behind a trusted reverse proxy that strips inbound `X-Forwarded-For`/`X-Real-IP` headers and sets canonical forwarding headers. Leave `false` when the app port is exposed directly. | No |
+
+## Session Cookies
+
+| Variable | Description | Required |
+| :--- | :--- | :--- |
+| `SESSION_COOKIE_ALLOW_INSECURE` | Set to `true` only when intentionally serving the production app over plain HTTP. This removes the `Secure` flag from session and CSRF cookies so browsers will send them back over HTTP. Keep `false` for HTTPS deployments. | No |
+
 ## LDAP Configuration
 
 Required for Active Directory integration.
@@ -48,6 +60,20 @@ Required for Active Directory integration.
 | `LDAP_ADMIN_GROUP` | DN of the group that grants admin access to the portal. | Yes |
 | `LDAP_TIMEOUT` | Timeout in milliseconds (default: `30000`). | No |
 | `LDAP_MAX_RETRIES` | Number of retries for failed operations (default: `3`). | No |
+| `LDAP_DOMAIN_SEARCH_BASE` | Optional domain base DN for reading the AD `maxPwdAge` password policy if rootDSE does not expose `defaultNamingContext`. | No |
+
+## Password Expiration Monitoring
+
+Password age and expiration dates come from Active Directory computed values or
+the domain `maxPwdAge` policy; the portal does not provide a fallback password age.
+
+| Variable | Description | Required |
+| :--- | :--- | :--- |
+| `PASSWORD_EXPIRATION_WARNING_DAYS` | Days before AD password expiration when a portal-managed user is considered near expiration. Defaults to `14`. | No |
+| `PASSWORD_EXPIRATION_SCHEDULER_ENABLED` | Enables guarded automatic reminder processing when set to `true`. Defaults to `false`. | No |
+| `PASSWORD_EXPIRATION_SCHEDULER_INTERVAL_SECONDS` | Compose reminder worker interval. Defaults to `21600` seconds. | No |
+| `PASSWORD_EXPIRATION_SCHEDULER_INITIAL_DELAY_SECONDS` | Compose reminder worker startup delay. Defaults to `45` seconds. | No |
+| `PASSWORD_EXPIRATION_SCHEDULER_HEALTH_MAX_AGE_SECONDS` | Maximum age of the worker's last successful request. Defaults to `86400` seconds. | No |
 
 ## Email (SMTP)
 
@@ -67,4 +93,5 @@ Used for sending notifications.
 | Variable | Description | Required |
 | :--- | :--- | :--- |
 | `NEXT_PUBLIC_APP_URL` | The public URL of the application (e.g., `https://portal.example.com`). | Yes |
+| `CRON_SECRET` | Bearer token required by cron processing endpoints, including lifecycle and mass email queues. | Yes for scheduled processing |
 | `NODE_ENV` | `development` or `production`. | Yes |

@@ -4,11 +4,40 @@ import { sendRejectionEmail } from '@/lib/email';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { deleteLDAPUser, disableLDAPUser, setLDAPUserExpiration } from '@/lib/ldap';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit } from '@/lib/validation';
+
+const REJECTION_STATE_IN_PROGRESS = 'rejection_in_progress';
+const REJECTION_STATE_FAILED = 'rejection_failed';
+const REJECTION_EMAIL_PENDING = 'rejection_email_pending';
+const APPROVAL_STATE_IN_PROGRESS = 'approval_in_progress';
+const ACCOUNT_CREATION_IN_PROGRESS = 'in_progress';
+
+class HttpError extends Error {
+  status: number;
+
+  constructor(message: string, status = 400) {
+    super(message);
+    this.name = 'HttpError';
+    this.status = status;
+  }
+}
+
+interface RejectRequestBody {
+  reason?: unknown;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Unknown error';
+}
 
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  let requestId: string | null = null;
+  let adminUsername: string | null = null;
+  let claimedRejection = false;
+
   try {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
 
@@ -16,11 +45,14 @@ export async function POST(
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
+    adminUsername = admin.username;
     const resolvedParams = await params;
-    const body = await request.json();
+    requestId = resolvedParams.id;
+    const body = await parseJsonWithLimit<RejectRequestBody>(request, MAX_REQUEST_BODY_SIZE.SMALL);
     const { reason } = body;
+    const rejectionReason = typeof reason === 'string' ? reason.trim() : '';
 
-    if (!reason || !reason.trim()) {
+    if (!rejectionReason) {
       return NextResponse.json(
         { error: 'Rejection reason is required' },
         { status: 400 }
@@ -39,9 +71,45 @@ export async function POST(
     if (accessRequest.status === 'approved' || accessRequest.status === 'rejected') {
       return NextResponse.json(
         { error: 'Request has already been processed and cannot be rejected' },
-        { status: 400 }
+        { status: 409 }
       );
     }
+
+    const claimResult = await prisma.accessRequest.updateMany({
+      where: {
+        id: resolvedParams.id,
+        version: accessRequest.version,
+        status: { notIn: ['approved', 'rejected'] },
+        OR: [
+          { provisioningState: null },
+          {
+            provisioningState: {
+              notIn: [
+                APPROVAL_STATE_IN_PROGRESS,
+                REJECTION_STATE_IN_PROGRESS,
+                ACCOUNT_CREATION_IN_PROGRESS,
+              ],
+            },
+          },
+        ],
+      },
+      data: {
+        provisioningState: REJECTION_STATE_IN_PROGRESS,
+        provisioningStartedAt: new Date(),
+        provisioningCompletedAt: null,
+        provisioningError: null,
+        version: { increment: 1 },
+      },
+    });
+
+    if (claimResult.count !== 1) {
+      throw new HttpError(
+        'Another administrator is currently processing this request. Please refresh and try again.',
+        409
+      );
+    }
+    claimedRejection = true;
+    const lockedVersion = accessRequest.version + 1;
 
     // AUTOMATIC CLEANUP: Delete LDAP accounts and VPN records if they were created
     // This enables clean retry and prevents orphaned accounts
@@ -148,13 +216,19 @@ export async function POST(
     const result = await prisma.accessRequest.updateMany({
       where: { 
         id: resolvedParams.id,
-        status: { notIn: ['approved', 'rejected'] }
+        version: lockedVersion,
+        status: { notIn: ['approved', 'rejected'] },
+        provisioningState: REJECTION_STATE_IN_PROGRESS,
       },
       data: {
         status: 'rejected',
-        rejectionReason: reason,
+        rejectionReason,
         rejectedBy: admin.username,
         rejectedAt: new Date(),
+        provisioningState: null,
+        provisioningCompletedAt: new Date(),
+        provisioningError: null,
+        version: { increment: 1 },
       },
     });
 
@@ -166,8 +240,9 @@ export async function POST(
       
       return NextResponse.json({ 
         error: `Cannot reject request. Current status: ${current?.status}` 
-      }, { status: 400 });
+      }, { status: 409 });
     }
+    claimedRejection = false;
 
     const updatedRequest = await prisma.accessRequest.findUnique({
       where: { id: resolvedParams.id },
@@ -178,7 +253,7 @@ export async function POST(
     }
 
     // Create a rejection comment for tracking
-    let commentText = `Request rejected.\n\nReason: ${reason}`;
+    let commentText = `Request rejected.\n\nReason: ${rejectionReason}`;
     
     // Add VPN cleanup info to comment
     if (vpnAccountToDelete) {
@@ -205,11 +280,63 @@ export async function POST(
     });
 
     // Send rejection email to user
-    await sendRejectionEmail(
-      updatedRequest.email,
-      updatedRequest.name,
-      reason
-    );
+    try {
+      await sendRejectionEmail(
+        updatedRequest.email,
+        updatedRequest.name,
+        rejectionReason
+      );
+    } catch (emailError) {
+      await prisma.accessRequest.update({
+        where: { id: resolvedParams.id },
+        data: {
+          provisioningState: REJECTION_EMAIL_PENDING,
+          provisioningCompletedAt: new Date(),
+          provisioningError: errorMessage(emailError),
+        },
+      });
+
+      await prisma.requestComment.create({
+        data: {
+          requestId: resolvedParams.id,
+          comment: `Rejection email failed after the request was rejected. Manual follow-up required. Error: ${errorMessage(emailError)}`,
+          author: 'System',
+          type: 'system',
+        },
+      });
+
+      await logAuditAction({
+        action: AuditActions.REJECT_REQUEST,
+        category: AuditCategories.ACCESS_REQUEST,
+        username: admin.username,
+        targetId: resolvedParams.id,
+        targetType: 'AccessRequest',
+        details: {
+          requestName: updatedRequest.name,
+          requestEmail: updatedRequest.email,
+          rejectionReason,
+          vpnAccountDeleted: vpnAccountToDelete ? vpnAccountToDelete.username : null,
+          ldapCleanup: cleanupResults,
+          emailSent: false,
+          emailFailureState: REJECTION_EMAIL_PENDING,
+        },
+        ipAddress: getIpAddress(request),
+        userAgent: getUserAgent(request),
+      });
+
+      const requestWithFailureState = await prisma.accessRequest.findUnique({
+        where: { id: resolvedParams.id },
+      });
+
+      return NextResponse.json(
+        {
+          success: true,
+          warning: 'Request rejected, but the rejection email failed. Manual follow-up is required.',
+          request: requestWithFailureState,
+        },
+        { status: 202 }
+      );
+    }
 
     // Log the rejection action
     await logAuditAction({
@@ -221,7 +348,7 @@ export async function POST(
       details: {
         requestName: updatedRequest.name,
         requestEmail: updatedRequest.email,
-        rejectionReason: reason,
+        rejectionReason,
         vpnAccountDeleted: vpnAccountToDelete ? vpnAccountToDelete.username : null,
         ldapCleanup: cleanupResults,
         emailSent: true,
@@ -235,22 +362,46 @@ export async function POST(
       request: updatedRequest 
     });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
+    if (error instanceof HttpError) {
+      return NextResponse.json({ error: error.message }, { status: error.status });
+    }
+
     console.error('Error rejecting request:', error);
-    
-    // Log the failed rejection attempt
-    const resolvedParams = await params;
-    const { admin } = await checkAdminAuthWithRateLimit(request);
-    if (admin) {
+
+    if (claimedRejection && requestId) {
+      await prisma.accessRequest.updateMany({
+        where: {
+          id: requestId,
+          provisioningState: REJECTION_STATE_IN_PROGRESS,
+        },
+        data: {
+          provisioningState: REJECTION_STATE_FAILED,
+          provisioningCompletedAt: new Date(),
+          provisioningError: errorMessage(error),
+          version: { increment: 1 },
+        },
+      }).catch((markError: unknown) => {
+        console.error('Failed to mark rejection as failed:', markError);
+      });
+    }
+
+    if (requestId && adminUsername) {
       await logAuditAction({
         action: AuditActions.REJECT_REQUEST,
         category: AuditCategories.ACCESS_REQUEST,
-        username: admin.username,
-        targetId: resolvedParams.id,
+        username: adminUsername,
+        targetId: requestId,
         targetType: 'AccessRequest',
         success: false,
-        errorMessage: error instanceof Error ? error.message : 'Unknown error',
+        errorMessage: errorMessage(error),
         ipAddress: getIpAddress(request),
         userAgent: getUserAgent(request),
+      }).catch((logError) => {
+        console.error('Failed to log rejection failure:', logError);
       });
     }
     

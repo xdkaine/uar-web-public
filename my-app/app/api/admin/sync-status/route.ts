@@ -257,7 +257,7 @@ export async function GET(req: NextRequest) {
       const issues: string[] = [];
 
       // Internal users should have all three
-      if (account.hasAccessRequest && account.requestStatus !== 'rejected') {
+      if (account.hasAccessRequest && !['rejected', 'offboarded'].includes(account.requestStatus || '')) {
         if (!account.hasAdAccount) {
           issues.push('Access request exists but no AD account found');
         }

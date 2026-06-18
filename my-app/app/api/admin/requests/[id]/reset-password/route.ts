@@ -91,7 +91,7 @@ export async function POST(
         });
 
         try {
-            await sendPasswordResetEmail(accessRequest.email, resetToken);
+            await sendPasswordResetEmail(accessRequest.email, resetToken, { initiatedByAdmin: true });
 
             appLogger.info('Password reset email triggered by admin', {
                 requestId,
@@ -99,12 +99,30 @@ export async function POST(
                 targetEmail: accessRequest.email,
             });
 
+            await prisma.accessRequest.updateMany({
+                where: {
+                    id: requestId,
+                    provisioningState: 'credentials_email_pending',
+                },
+                data: {
+                    provisioningState: null,
+                    provisioningCompletedAt: new Date(),
+                    provisioningError: null,
+                },
+            });
+
             await logAuditAction({
                 action: AuditActions.ADMIN_TRIGGER_PASSWORD_RESET || 'admin_trigger_password_reset',
                 category: AuditCategories.USER,
                 username: admin.username,
+                actorType: 'admin',
                 targetId: requestId,
                 targetType: 'AccessRequest',
+                subjectUsername: accessRequest.ldapUsername,
+                subjectEmail: accessRequest.email,
+                relatedRequestId: requestId,
+                eventKind: 'notification',
+                outcome: 'success',
                 details: {
                     email: accessRequest.email,
                     name: accessRequest.name,

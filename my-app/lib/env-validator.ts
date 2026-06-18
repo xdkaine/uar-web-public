@@ -1,6 +1,7 @@
 interface EnvConfig {
   // Database
   DATABASE_URL: string;
+  DATABASE_SSL_ALLOW_INSECURE?: string;
 
   // Email Configuration
   SMTP_HOST: string;
@@ -25,11 +26,19 @@ interface EnvConfig {
   LDAP_MAX_RETRIES?: string; // Optional max retries for LDAP operations, defaults to 3
   LDAP_RETRY_DELAY?: string; // Optional delay between retries in milliseconds, defaults to 1000 (1s)
   LDAP_ALLOW_INVALID_CERTS?: string; // Optional: only for trusted dev environments
+  LDAP_DOMAIN_SEARCH_BASE?: string;
+  PASSWORD_EXPIRATION_WARNING_DAYS?: string;
+  PASSWORD_EXPIRATION_SCHEDULER_ENABLED?: string;
 
   // Application
   NEXT_PUBLIC_APP_URL: string;
   NEXTAUTH_SECRET: string;
   NODE_ENV?: string;
+  TRUST_PROXY_HEADERS?: string;
+  SESSION_COOKIE_ALLOW_INSECURE?: string;
+  CRON_SECRET?: string;
+  OFFBOARD_SCHEDULER_ENABLED?: string;
+  OFFBOARD_SCHEDULER_GRACE_SECONDS?: string;
 
   // Security / Encryption
   ENCRYPTION_SECRET: string;
@@ -153,14 +162,84 @@ function validateSpecificFormats(): void {
     throw new Error('CRITICAL: DATABASE_URL must be a valid PostgreSQL connection string');
   }
 
-  if (!dbUrl.includes('sslmode=require')) {
-    throw new Error('CRITICAL: DATABASE_URL must include sslmode=require to enforce TLS to PostgreSQL');
+  if (
+    process.env.DATABASE_SSL_ALLOW_INSECURE &&
+    !['true', 'false'].includes(process.env.DATABASE_SSL_ALLOW_INSECURE)
+  ) {
+    throw new Error('CRITICAL: DATABASE_SSL_ALLOW_INSECURE must be either true or false');
+  }
+
+  const allowInsecureDatabase = process.env.DATABASE_SSL_ALLOW_INSECURE === 'true';
+  if (!dbUrl.includes('sslmode=require') && !allowInsecureDatabase) {
+    throw new Error(
+      'CRITICAL: DATABASE_URL must include sslmode=require to enforce TLS to PostgreSQL. ' +
+      'Set DATABASE_SSL_ALLOW_INSECURE=true only for a trusted private container network.'
+    );
   }
 
   // Validate NEXT_PUBLIC_APP_URL format
   const appUrl = process.env.NEXT_PUBLIC_APP_URL || '';
   if (!appUrl.startsWith('http://') && !appUrl.startsWith('https://')) {
     throw new Error('CRITICAL: NEXT_PUBLIC_APP_URL must start with http:// or https://');
+  }
+
+  if (
+    process.env.TRUST_PROXY_HEADERS &&
+    !['true', 'false'].includes(process.env.TRUST_PROXY_HEADERS)
+  ) {
+    throw new Error('CRITICAL: TRUST_PROXY_HEADERS must be either true or false');
+  }
+
+  if (
+    process.env.SESSION_COOKIE_ALLOW_INSECURE &&
+    !['true', 'false'].includes(process.env.SESSION_COOKIE_ALLOW_INSECURE)
+  ) {
+    throw new Error('CRITICAL: SESSION_COOKIE_ALLOW_INSECURE must be either true or false');
+  }
+
+  if (process.env.CRON_SECRET && process.env.CRON_SECRET.length < 32) {
+    throw new Error('CRITICAL: CRON_SECRET must be at least 32 characters long');
+  }
+
+  if (
+    process.env.OFFBOARD_SCHEDULER_ENABLED &&
+    !['true', 'false'].includes(process.env.OFFBOARD_SCHEDULER_ENABLED)
+  ) {
+    throw new Error('CRITICAL: OFFBOARD_SCHEDULER_ENABLED must be either true or false');
+  }
+
+  if (process.env.OFFBOARD_SCHEDULER_ENABLED === 'true' && !process.env.CRON_SECRET) {
+    throw new Error(
+      'CRITICAL: CRON_SECRET is required when OFFBOARD_SCHEDULER_ENABLED=true'
+    );
+  }
+
+  if (process.env.OFFBOARD_SCHEDULER_GRACE_SECONDS) {
+    const graceSeconds = Number.parseInt(process.env.OFFBOARD_SCHEDULER_GRACE_SECONDS, 10);
+    if (!Number.isFinite(graceSeconds) || graceSeconds < 60 || graceSeconds > 86_400) {
+      throw new Error('CRITICAL: OFFBOARD_SCHEDULER_GRACE_SECONDS must be between 60 and 86400');
+    }
+  }
+
+  if (
+    process.env.PASSWORD_EXPIRATION_SCHEDULER_ENABLED &&
+    !['true', 'false'].includes(process.env.PASSWORD_EXPIRATION_SCHEDULER_ENABLED)
+  ) {
+    throw new Error('CRITICAL: PASSWORD_EXPIRATION_SCHEDULER_ENABLED must be either true or false');
+  }
+
+  if (process.env.PASSWORD_EXPIRATION_WARNING_DAYS) {
+    const warningDays = Number.parseInt(process.env.PASSWORD_EXPIRATION_WARNING_DAYS, 10);
+    if (!Number.isFinite(warningDays) || warningDays < 1 || warningDays > 90) {
+      throw new Error('CRITICAL: PASSWORD_EXPIRATION_WARNING_DAYS must be between 1 and 90');
+    }
+  }
+
+  if (
+    process.env.LDAP_ALLOW_INVALID_CERTS &&
+    !['true', 'false'].includes(process.env.LDAP_ALLOW_INVALID_CERTS)
+  ) {
+    throw new Error('CRITICAL: LDAP_ALLOW_INVALID_CERTS must be either true or false');
   }
 
   // Validate NEXTAUTH_SECRET length (should be at least 32 characters)

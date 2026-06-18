@@ -79,7 +79,9 @@ export async function POST(
                     { ldapUsername: username },
                     { linkedAdUsername: username },
                 ],
+                status: { notIn: ['rejected', 'offboarded'] },
             },
+            orderBy: { createdAt: 'desc' },
         });
 
         const lifecycleAction = await prisma.accountLifecycleAction.create({
@@ -176,7 +178,9 @@ export async function DELETE(
                     { ldapUsername: username },
                     { linkedAdUsername: username },
                 ],
+                status: { notIn: ['rejected', 'offboarded'] },
             },
+            orderBy: { createdAt: 'desc' },
         });
 
         const lifecycleAction = await prisma.accountLifecycleAction.create({

@@ -1,14 +1,39 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { createHash } from 'crypto';
 import { prisma } from '@/lib/prisma';
 import { setLDAPUserPassword } from '@/lib/ldap';
-import { validatePasswordStrength } from '@/lib/password';
-import { checkRateLimitAsync, getClientIp, RateLimitPresets } from '@/lib/ratelimit';
+import { validatePasswordPolicy } from '@/lib/password-policy';
+import { checkRateLimitAsync, getRequiredClientIp, isRateLimitUnavailable, RateLimitPresets } from '@/lib/ratelimit';
 import { sendAccountActivationSuccessEmail } from '@/lib/email';
 import { appLogger } from '@/lib/logger';
-import { parseJsonWithLimit, MAX_REQUEST_BODY_SIZE } from '@/lib/validation';
+import { parseJsonWithLimit, MAX_REQUEST_BODY_SIZE, isJsonBodyError } from '@/lib/validation';
+import { logActionHistoryEvent } from '@/lib/action-history';
+import { AuditActions, AuditCategories, getUserAgent } from '@/lib/audit-log';
 
 const MAX_TOKEN_ATTEMPTS = 5;
+
+type ActivationAccessRequest = {
+  id: string;
+  email: string;
+  name: string;
+  ldapUsername: string | null;
+  isInternal: boolean;
+  status: string;
+};
+
+type ActivationTransactionResult =
+  | {
+      ok: true;
+      accessRequest: ActivationAccessRequest;
+      tokenId: string;
+      usedAt: Date;
+    }
+  | {
+      ok: false;
+      reason: string;
+      issues?: string[];
+    };
 
 export async function POST(request: NextRequest) {
   try {
@@ -20,11 +45,11 @@ export async function POST(request: NextRequest) {
 
     // Apply rate limiting: 5 attempts per hour per IP/User to prevent token brute forcing
     // We use the username as identifier so shared IPs (NAT) don't block each other
-    const clientIp = getClientIp(request);
+    const clientIp = getRequiredClientIp(request);
     const rateLimitResult = await checkRateLimitAsync(clientIp, {
       maxRequests: 5,
       windowMs: RateLimitPresets.passwordReset.windowMs,
-      identifier: username // Add username to unique key
+      identifier: typeof username === 'string' ? username.trim() : undefined // Add username to unique key
     });
 
     if (!rateLimitResult.success) {
@@ -45,31 +70,32 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (!token || !username || !newPassword) {
+    if (
+      typeof token !== 'string' ||
+      typeof username !== 'string' ||
+      typeof newPassword !== 'string' ||
+      !token ||
+      !username.trim() ||
+      !newPassword
+    ) {
       return NextResponse.json(
         { error: 'Token, username, and password are required' },
         { status: 400 }
       );
     }
 
-    // Validate password strength
-    const passwordValidation = validatePasswordStrength(newPassword);
-    if (!passwordValidation.isValid) {
-      return NextResponse.json(
-        { error: 'Password does not meet requirements', issues: passwordValidation.issues },
-        { status: 400 }
-      );
-    }
-
+    const requestedUsername = username.trim();
     const tokenHash = createHash('sha256').update(token).digest('hex');
+    const correlationId = `account-activation:${Date.now()}:${tokenHash.substring(0, 8)}`;
 
     // ATOMIC: Use transaction to fetch and validate token, then mark as used
-    let accessRequest;
+    let accessRequest: ActivationAccessRequest;
+    let consumedToken: { id: string; usedAt: Date };
 
     try {
       const now = new Date();
 
-      const result = await prisma.$transaction(async (tx: any) => {
+      const result = await prisma.$transaction(async (tx: Prisma.TransactionClient): Promise<ActivationTransactionResult> => {
         // Fetch the token first within transaction
         const tokenData = await tx.accountActivationToken.findUnique({
           where: { tokenHash },
@@ -89,55 +115,90 @@ export async function POST(request: NextRequest) {
 
         // Validate token exists
         if (!tokenData) {
-          throw new Error('INVALID_TOKEN');
+          return { ok: false, reason: 'INVALID_TOKEN' };
         }
 
         // Validate token state
         if (tokenData.used) {
-          throw new Error('TOKEN_ALREADY_USED');
+          return { ok: false, reason: 'TOKEN_ALREADY_USED' };
         }
 
         if (tokenData.attempts >= MAX_TOKEN_ATTEMPTS) {
-          throw new Error('TOO_MANY_ATTEMPTS');
+          return { ok: false, reason: 'TOO_MANY_ATTEMPTS' };
         }
 
         if (tokenData.expiresAt <= now) {
-          throw new Error('TOKEN_EXPIRED');
+          return { ok: false, reason: 'TOKEN_EXPIRED' };
         }
 
         // Validate username matches the access request
-        if (tokenData.accessRequest.ldapUsername !== username) {
+        if (
+          !tokenData.accessRequest.ldapUsername ||
+          tokenData.accessRequest.ldapUsername.toLowerCase() !== requestedUsername.toLowerCase()
+        ) {
           // Increment attempts but don't mark as used - wrong username
-          await tx.accountActivationToken.update({
-            where: { tokenHash },
+          await tx.accountActivationToken.updateMany({
+            where: {
+              id: tokenData.id,
+              tokenHash,
+              used: false,
+              attempts: { lt: MAX_TOKEN_ATTEMPTS },
+              expiresAt: { gt: now },
+            },
             data: {
               attempts: { increment: 1 },
             },
           });
-          throw new Error('USERNAME_MISMATCH');
+          return { ok: false, reason: 'USERNAME_MISMATCH' };
         }
 
         // Validate request is for internal user (security check)
         if (!tokenData.accessRequest.isInternal) {
-          throw new Error('INVALID_USER_TYPE');
+          return { ok: false, reason: 'INVALID_USER_TYPE' };
         }
 
         // Validate request status is approved
         if (tokenData.accessRequest.status !== 'approved') {
-          throw new Error('REQUEST_NOT_APPROVED');
+          return { ok: false, reason: 'REQUEST_NOT_APPROVED' };
         }
 
-        // Mark token as used atomically in same transaction
-        await tx.accountActivationToken.update({
-          where: { tokenHash },
+        const passwordValidation = validatePasswordPolicy(newPassword, {
+          username: tokenData.accessRequest.ldapUsername,
+          email: tokenData.accessRequest.email,
+          fullName: tokenData.accessRequest.name,
+        });
+
+        if (!passwordValidation.isValid) {
+          return {
+            ok: false,
+            reason: 'PASSWORD_POLICY',
+            issues: passwordValidation.issues,
+          };
+        }
+
+        const usedAt = now;
+
+        // Mark token as used with a conditional update so concurrent submits cannot both consume it.
+        const consumeResult = await tx.accountActivationToken.updateMany({
+          where: {
+            id: tokenData.id,
+            tokenHash,
+            used: false,
+            attempts: { lt: MAX_TOKEN_ATTEMPTS },
+            expiresAt: { gt: now },
+          },
           data: {
             attempts: { increment: 1 },
             used: true,
-            usedAt: now,
+            usedAt,
             ipAddress: clientIp,
             userAgent: request.headers.get('user-agent') || undefined,
           },
         });
+
+        if (consumeResult.count !== 1) {
+          return { ok: false, reason: 'TOKEN_CONSUME_CONFLICT' };
+        }
 
         // Clear any legacy encrypted password from the access request
         await tx.accessRequest.update({
@@ -148,15 +209,74 @@ export async function POST(request: NextRequest) {
         });
 
         return {
-          token: tokenData,
-          request: tokenData.accessRequest,
+          ok: true,
+          accessRequest: tokenData.accessRequest,
+          tokenId: tokenData.id,
+          usedAt,
         };
       }, {
         isolationLevel: 'Serializable', // Prevent race conditions
         timeout: 10000,
       });
 
-      accessRequest = result.request;
+      if (!result.ok) {
+        if (result.reason === 'PASSWORD_POLICY') {
+          await logActionHistoryEvent({
+            action: AuditActions.ACCOUNT_ACTIVATION_FAILED,
+            category: AuditCategories.AUTH,
+            username: requestedUsername,
+            actorType: 'user',
+            subjectUsername: requestedUsername,
+            eventKind: 'security',
+            outcome: 'denied',
+            success: false,
+            details: { reason: result.reason, issueCount: result.issues?.length || 0 },
+            ipAddress: clientIp,
+            userAgent: getUserAgent(request),
+            correlationId,
+          });
+          return NextResponse.json(
+            { error: 'Password does not meet requirements', issues: result.issues || [] },
+            { status: 400 }
+          );
+        }
+
+        appLogger.warn('Account activation failed', {
+          errorType: result.reason,
+          timestamp: new Date().toISOString(),
+          ip: clientIp,
+          username: requestedUsername
+        });
+        console.error('[Account Activation] Error processing token:', result.reason);
+
+        await logActionHistoryEvent({
+          action: AuditActions.ACCOUNT_ACTIVATION_FAILED,
+          category: AuditCategories.AUTH,
+          username: requestedUsername,
+          actorType: 'user',
+          subjectUsername: requestedUsername,
+          eventKind: 'security',
+          outcome: 'denied',
+          success: false,
+          details: { reason: result.reason },
+          ipAddress: clientIp,
+          userAgent: getUserAgent(request),
+          correlationId,
+        });
+
+        return NextResponse.json(
+          {
+            error: 'Invalid or expired activation link. Please contact IT support if you continue to have issues.',
+          },
+          { status: 400 }
+        );
+      }
+
+      accessRequest = result.accessRequest;
+      consumedToken = {
+        id: result.tokenId,
+        usedAt: result.usedAt,
+      };
     } catch (error) {
       // Log specific error for debugging (not exposed to user)
       if (error instanceof Error) {
@@ -167,6 +287,22 @@ export async function POST(request: NextRequest) {
           username: username
         });
         console.error('[Account Activation] Error processing token:', error.message);
+
+        await logActionHistoryEvent({
+          action: AuditActions.ACCOUNT_ACTIVATION_FAILED,
+          category: AuditCategories.AUTH,
+          username: username || 'anonymous',
+          actorType: username ? 'user' : 'anonymous',
+          subjectUsername: typeof username === 'string' ? username : null,
+          eventKind: 'security',
+          outcome: 'failure',
+          success: false,
+          errorMessage: error.message,
+          details: { reason: 'activation_transaction_error' },
+          ipAddress: clientIp,
+          userAgent: getUserAgent(request),
+          correlationId,
+        });
 
         // Return specific error messages for certain cases
         // Return generic error message for all validation failures to prevent enumeration
@@ -190,7 +326,7 @@ export async function POST(request: NextRequest) {
 
     // Set password in Active Directory
     try {
-      await setLDAPUserPassword(username, newPassword);
+      await setLDAPUserPassword(accessRequest.ldapUsername!, newPassword);
       // Password operation completed - details logged by ldapLogger
     } catch (ldapError) {
       console.error('[Account Activation] ❌ Failed to set password in AD:', ldapError);
@@ -198,14 +334,20 @@ export async function POST(request: NextRequest) {
       const errorMessage = ldapError instanceof Error ? ldapError.message : 'Unknown error';
 
       appLogger.error('Failed to set password in AD during activation', {
-        username,
+        username: accessRequest.ldapUsername,
         error: errorMessage,
         timestamp: new Date().toISOString(),
       });
 
-      // Mark token as unused so user can retry
-      await prisma.accountActivationToken.update({
-        where: { tokenHash },
+      // Mark token as unused so user can retry. Only roll back this exact token attempt.
+      await prisma.accountActivationToken.updateMany({
+        where: {
+          id: consumedToken.id,
+          tokenHash,
+          used: true,
+          usedAt: consumedToken.usedAt,
+          attempts: { gt: 0 },
+        },
         data: {
           used: false,
           usedAt: null,
@@ -213,11 +355,31 @@ export async function POST(request: NextRequest) {
         },
       });
 
+      await logActionHistoryEvent({
+        action: AuditActions.ACCOUNT_ACTIVATION_TOKEN_ROLLED_BACK,
+        category: AuditCategories.AUTH,
+        username: accessRequest.ldapUsername || requestedUsername,
+        actorType: 'user',
+        targetId: accessRequest.id,
+        targetType: 'AccessRequest',
+        subjectUsername: accessRequest.ldapUsername,
+        subjectEmail: accessRequest.email,
+        relatedRequestId: accessRequest.id,
+        eventKind: 'security',
+        outcome: 'rollback',
+        success: false,
+        errorMessage,
+        details: { reason: 'ldap_password_set_failed' },
+        ipAddress: clientIp,
+        userAgent: getUserAgent(request),
+        correlationId,
+      });
+
       // Provide more specific error messages for known LDAP issues
       let clientErrorMessage = 'Failed to set password in Active Directory. Please try again.';
 
       if (errorMessage.includes('WILL_NOT_PERFORM') || errorMessage.includes('constraint violation')) {
-        clientErrorMessage = 'Password was rejected by Active Directory. It may not meet complexity requirements or matches previous passwords.';
+        clientErrorMessage = 'Password was rejected by Active Directory. It may match a previous password or a directory-only rule. Please choose a different password and try again.';
       } else if (errorMessage.includes('data 532') || errorMessage.includes('data 533')) {
         // 532 = password expired, 533 = account disabled - shouldn't happen here usually but good to handle
         clientErrorMessage = 'Account status prevents password change. Please contact support.';
@@ -230,24 +392,45 @@ export async function POST(request: NextRequest) {
     }
 
     // Send confirmation email
+    let confirmationEmailSent = true;
     try {
       await sendAccountActivationSuccessEmail(
         accessRequest.email,
         accessRequest.name,
-        username
+        accessRequest.ldapUsername!
       );
       console.log('[Account Activation] ✅ Confirmation email sent to:', accessRequest.email);
     } catch (emailError) {
+      confirmationEmailSent = false;
       console.error('[Account Activation] ⚠️ Failed to send confirmation email:', emailError);
       // Don't fail the request if email fails - password was set successfully
     }
 
     // Log success
     appLogger.info('Account password set via activation link', {
-      username,
+      username: accessRequest.ldapUsername,
       email: accessRequest.email,
       ip: clientIp,
       timestamp: new Date().toISOString(),
+    });
+
+    await logActionHistoryEvent({
+      action: AuditActions.ACCOUNT_ACTIVATION_COMPLETED,
+      category: AuditCategories.AUTH,
+      username: accessRequest.ldapUsername || requestedUsername,
+      actorType: 'user',
+      targetId: accessRequest.id,
+      targetType: 'AccessRequest',
+      subjectUsername: accessRequest.ldapUsername,
+      subjectEmail: accessRequest.email,
+      relatedRequestId: accessRequest.id,
+      eventKind: 'security',
+      outcome: 'success',
+      success: true,
+      details: { confirmationEmailSent },
+      ipAddress: clientIp,
+      userAgent: getUserAgent(request),
+      correlationId,
     });
 
     return NextResponse.json({
@@ -255,6 +438,17 @@ export async function POST(request: NextRequest) {
       message: 'Password set successfully. You can now log in with your credentials.',
     });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
+    if (isRateLimitUnavailable(error)) {
+      return NextResponse.json(
+        { error: 'This service is temporarily unavailable. Please try again later.' },
+        { status: 503 }
+      );
+    }
+
     console.error('[Account Activation] Unexpected error:', error);
 
     appLogger.error('Account activation unexpected error', {

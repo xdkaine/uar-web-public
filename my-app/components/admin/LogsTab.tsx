@@ -36,9 +36,6 @@ import {
   ChevronRight, 
   Search, 
   RefreshCw, 
-  Play, 
-  Pause,
-  X 
 } from "lucide-react";
 
 interface AuditLog {
@@ -47,13 +44,31 @@ interface AuditLog {
   action: string;
   category: string;
   username: string;
+  actorType?: string;
   targetId?: string;
   targetType?: string;
-  details?: Record<string, any>;
+  subjectUsername?: string;
+  subjectEmail?: string;
+  relatedRequestId?: string;
+  relatedVpnAccountId?: string;
+  relatedLifecycleActionId?: string;
+  eventKind?: string;
+  outcome?: string;
+  correlationId?: string;
+  details?: Record<string, unknown>;
   ipAddress?: string;
   userAgent?: string;
   success: boolean;
   errorMessage?: string;
+}
+
+interface AuditStats {
+  last24Hours: number;
+  last7Days: number;
+  last30Days: number;
+  topUsers?: Array<{ username: string; count: number }>;
+  topActions?: Array<{ action: string; count: number }>;
+  actionsByCategory?: Array<{ category: string; count: number }>;
 }
 
 interface LogsTabProps {
@@ -76,6 +91,8 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
   const [categoryFilter, setCategoryFilter] = useState('');
   const [usernameFilter, setUsernameFilter] = useState('');
   const [targetTypeFilter, setTargetTypeFilter] = useState('');
+  const [eventKindFilter, setEventKindFilter] = useState('');
+  const [outcomeFilter, setOutcomeFilter] = useState('');
   const [successFilter, setSuccessFilter] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
   const [startDate, setStartDate] = useState('');
@@ -87,7 +104,7 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
   const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Stats
-  const [stats, setStats] = useState<any>(null);
+  const [stats, setStats] = useState<AuditStats | null>(null);
 
   // Debounce search query
   useEffect(() => {
@@ -122,6 +139,8 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
     if (categoryFilter) params.append('category', categoryFilter);
     if (debouncedUsername) params.append('username', debouncedUsername);
     if (targetTypeFilter) params.append('targetType', targetTypeFilter);
+    if (eventKindFilter) params.append('eventKind', eventKindFilter);
+    if (outcomeFilter) params.append('outcome', outcomeFilter);
     if (successFilter) params.append('success', successFilter);
     if (debouncedSearch) params.append('search', debouncedSearch);
     if (startDate) params.append('startDate', startDate);
@@ -131,10 +150,9 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
     if (!response.ok) throw new Error('Failed to fetch logs');
     
     return await response.json();
-  }, [currentPage, limit, actionFilter, categoryFilter, debouncedUsername, targetTypeFilter, successFilter, debouncedSearch, startDate, endDate]);
+  }, [currentPage, limit, actionFilter, categoryFilter, debouncedUsername, targetTypeFilter, eventKindFilter, outcomeFilter, successFilter, debouncedSearch, startDate, endDate]);
 
   const { 
-    data: polledData,
     isLoading: isPollingLoading, 
     isPolling, 
     togglePolling, 
@@ -156,7 +174,7 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
   // Fetch stats when filters change
   useEffect(() => {
     fetchStats();
-  }, [currentPage, limit, actionFilter, categoryFilter, debouncedUsername, targetTypeFilter, successFilter, debouncedSearch, startDate, endDate]);
+  }, [currentPage, limit, actionFilter, categoryFilter, debouncedUsername, targetTypeFilter, eventKindFilter, outcomeFilter, successFilter, debouncedSearch, startDate, endDate]);
 
   const fetchStats = async () => {
     try {
@@ -178,6 +196,8 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
     setCategoryFilter('');
     setUsernameFilter('');
     setTargetTypeFilter('');
+    setEventKindFilter('');
+    setOutcomeFilter('');
     setSuccessFilter('');
     setSearchQuery('');
     setStartDate('');
@@ -457,6 +477,47 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
                 </Select>
               </div>
               <div className="flex flex-col">
+                <label className="block text-sm font-medium text-gray-700 mb-2">Event Kind</label>
+                <Select
+                  value={eventKindFilter}
+                  onValueChange={setEventKindFilter}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="All Events" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All Events</SelectItem>
+                    <SelectItem value="read">Read</SelectItem>
+                    <SelectItem value="write">Write</SelectItem>
+                    <SelectItem value="security">Security</SelectItem>
+                    <SelectItem value="notification">Notification</SelectItem>
+                    <SelectItem value="lifecycle">Lifecycle</SelectItem>
+                    <SelectItem value="sync">Sync</SelectItem>
+                    <SelectItem value="system">System</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex flex-col">
+                <label className="block text-sm font-medium text-gray-700 mb-2">Outcome</label>
+                <Select
+                  value={outcomeFilter}
+                  onValueChange={setOutcomeFilter}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="All Outcomes" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All Outcomes</SelectItem>
+                    <SelectItem value="success">Success</SelectItem>
+                    <SelectItem value="failure">Failure</SelectItem>
+                    <SelectItem value="denied">Denied</SelectItem>
+                    <SelectItem value="pending">Pending</SelectItem>
+                    <SelectItem value="rollback">Rollback</SelectItem>
+                    <SelectItem value="skipped">Skipped</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex flex-col">
                 <DateTimePicker
                   label="Start Date"
                   value={startDate}
@@ -510,6 +571,8 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
               <TableHead>Category</TableHead>
               <TableHead>Action</TableHead>
               <TableHead>Username</TableHead>
+              <TableHead>Subject</TableHead>
+              <TableHead>Event</TableHead>
               <TableHead>Target</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Details</TableHead>
@@ -518,7 +581,7 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
           <TableBody>
             {logs.length === 0 ? (
               <TableRow>
-                 <TableCell colSpan={7} className="h-24 text-center">
+                 <TableCell colSpan={9} className="h-24 text-center">
                   No logs found matching your filters
                 </TableCell>
               </TableRow>
@@ -537,7 +600,24 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
                     {getActionDisplayName(log.action)}
                   </TableCell>
                   <TableCell className="font-medium">
-                    {log.username}
+                    <div>{log.username}</div>
+                    {log.actorType && <div className="text-xs text-gray-500 capitalize">{log.actorType}</div>}
+                  </TableCell>
+                  <TableCell className="text-gray-500">
+                    {log.subjectUsername || log.subjectEmail ? (
+                      <div>
+                        {log.subjectUsername && <div className="font-medium text-gray-700">{log.subjectUsername}</div>}
+                        {log.subjectEmail && <div className="text-xs text-gray-500 truncate max-w-xs">{log.subjectEmail}</div>}
+                      </div>
+                    ) : (
+                      <span className="text-gray-400">—</span>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex flex-col gap-1">
+                      {log.eventKind && <Badge variant="outline" className="capitalize w-fit">{log.eventKind}</Badge>}
+                      {log.outcome && <span className="text-xs text-gray-500 capitalize">{log.outcome}</span>}
+                    </div>
                   </TableCell>
                   <TableCell className="text-gray-500">
                     {log.targetType && log.targetId ? (
@@ -622,6 +702,12 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
                   <label className="block text-sm font-medium text-gray-500">Username</label>
                   <p className="mt-1 text-sm text-gray-900 font-medium">{selectedLog.username}</p>
                 </div>
+                {selectedLog.actorType && (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-500">Actor Type</label>
+                    <p className="mt-1 text-sm text-gray-900 capitalize">{selectedLog.actorType}</p>
+                  </div>
+                )}
                 <div>
                   <label className="block text-sm font-medium text-gray-500">Category</label>
                   <div className="mt-1">
@@ -650,9 +736,59 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-500">Log ID</label>
-                  <p className="mt-1 text-sm text-gray-900 font-mono text-xs">{selectedLog.id}</p>
+                  <p className="mt-1 text-gray-900 font-mono text-xs">{selectedLog.id}</p>
                 </div>
+                {(selectedLog.eventKind || selectedLog.outcome) && (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-500">History Classification</label>
+                    <div className="mt-1 flex flex-wrap gap-2">
+                      {selectedLog.eventKind && <Badge variant="outline" className="capitalize">{selectedLog.eventKind}</Badge>}
+                      {selectedLog.outcome && <Badge variant="secondary" className="capitalize">{selectedLog.outcome}</Badge>}
+                    </div>
+                  </div>
+                )}
               </div>
+
+              {(selectedLog.subjectUsername || selectedLog.subjectEmail || selectedLog.relatedRequestId || selectedLog.relatedVpnAccountId || selectedLog.relatedLifecycleActionId || selectedLog.correlationId) && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 rounded border border-gray-200 bg-gray-50 p-3">
+                  {selectedLog.subjectUsername && (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500">Subject Username</label>
+                      <p className="mt-1 text-sm text-gray-900 font-mono">{selectedLog.subjectUsername}</p>
+                    </div>
+                  )}
+                  {selectedLog.subjectEmail && (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500">Subject Email</label>
+                      <p className="mt-1 text-sm text-gray-900 break-all">{selectedLog.subjectEmail}</p>
+                    </div>
+                  )}
+                  {selectedLog.relatedRequestId && (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500">Related Request</label>
+                      <p className="mt-1 text-xs text-gray-900 font-mono break-all">{selectedLog.relatedRequestId}</p>
+                    </div>
+                  )}
+                  {selectedLog.relatedVpnAccountId && (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500">Related VPN Account</label>
+                      <p className="mt-1 text-xs text-gray-900 font-mono break-all">{selectedLog.relatedVpnAccountId}</p>
+                    </div>
+                  )}
+                  {selectedLog.relatedLifecycleActionId && (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500">Related Lifecycle Action</label>
+                      <p className="mt-1 text-xs text-gray-900 font-mono break-all">{selectedLog.relatedLifecycleActionId}</p>
+                    </div>
+                  )}
+                  {selectedLog.correlationId && (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500">Correlation ID</label>
+                      <p className="mt-1 text-xs text-gray-900 font-mono break-all">{selectedLog.correlationId}</p>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {selectedLog.targetType && (
                 <div>
@@ -683,7 +819,7 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
               {selectedLog.errorMessage && (
                 <div>
                   <label className="block text-sm font-medium text-red-500">Error Message</label>
-                  <p className="mt-1 text-sm text-red-700 bg-red-50 p-3 rounded border border-red-200">
+                  <p className="mt-1 text-sm text-red-700 bg-red-50 p-3 rounded border border-red-200 whitespace-pre-wrap wrap-break-word">
                     {selectedLog.errorMessage}
                   </p>
                 </div>
@@ -692,7 +828,7 @@ export default function LogsTab({ isLoading: initialLoading }: LogsTabProps) {
               {selectedLog.details && Object.keys(selectedLog.details).length > 0 && (
                 <div>
                   <label className="block text-sm font-medium text-gray-500 mb-2">Additional Details</label>
-                  <pre className="mt-1 text-xs text-gray-900 bg-gray-50 p-4 rounded border border-gray-200 overflow-x-auto">
+                  <pre className="mt-1 max-h-80 overflow-y-auto text-xs text-gray-900 bg-gray-50 p-4 rounded border border-gray-200 whitespace-pre-wrap wrap-break-word">
                     {JSON.stringify(selectedLog.details, null, 2)}
                   </pre>
                 </div>

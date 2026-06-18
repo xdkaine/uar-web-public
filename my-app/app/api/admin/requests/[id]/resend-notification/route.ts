@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { retryNotification } from '@/lib/notification-queue';
 import { appLogger } from '@/lib/logger';
-import { logAuditAction } from '@/lib/audit-log';
+import { getIpAddress, logAuditAction } from '@/lib/audit-log';
 
 /**
  * Admin endpoint to manually retry sending notification for a request
@@ -38,7 +38,7 @@ export async function POST(
         targetId: requestId,
         targetType: 'access_request',
         details: { action: 'manually_resent_notification' },
-        ipAddress: request.headers.get('x-forwarded-for') || 'unknown',
+        ipAddress: getIpAddress(request) || 'unknown',
         success: true,
       });
       

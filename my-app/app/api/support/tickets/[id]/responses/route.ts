@@ -2,6 +2,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSessionFromCookies } from '@/lib/session';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { checkRateLimitAsync, isRateLimitUnavailable } from '@/lib/ratelimit';
+import { INPUT_LIMITS, isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit, validateStringLength } from '@/lib/validation';
+
+interface TicketResponseBody {
+  message?: unknown;
+}
 
 async function checkUserAuth() {
   const session = await getSessionFromCookies();
@@ -68,14 +74,44 @@ export async function POST(
     }
 
     const resolvedParams = await params;
-    const body = await request.json();
-    const { message } = body;
+    const rateLimitResult = await checkRateLimitAsync('support-ticket-response', {
+      maxRequests: 30,
+      windowMs: 60 * 60 * 1000,
+      identifier: `${auth.username}:${resolvedParams.id}`,
+    });
 
-    if (!message || !message.trim()) {
+    if (!rateLimitResult.success) {
+      return NextResponse.json(
+        {
+          error: 'Too many support ticket responses. Please try again later.',
+          retryAfter: Math.ceil((rateLimitResult.reset - Date.now()) / 1000),
+        },
+        {
+          status: 429,
+          headers: {
+            'X-RateLimit-Limit': rateLimitResult.limit.toString(),
+            'X-RateLimit-Remaining': rateLimitResult.remaining.toString(),
+            'X-RateLimit-Reset': new Date(rateLimitResult.reset).toISOString(),
+            'Retry-After': Math.ceil((rateLimitResult.reset - Date.now()) / 1000).toString(),
+          },
+        }
+      );
+    }
+
+    const body = await parseJsonWithLimit<TicketResponseBody>(request, MAX_REQUEST_BODY_SIZE.MEDIUM);
+    const { message } = body;
+    const normalizedMessage = typeof message === 'string' ? message.trim() : '';
+
+    if (!normalizedMessage) {
       return NextResponse.json(
         { error: 'Message is required' },
         { status: 400 }
       );
+    }
+
+    const messageValidation = validateStringLength(normalizedMessage, 'Message', INPUT_LIMITS.MESSAGE, 1);
+    if (!messageValidation.valid) {
+      return NextResponse.json({ error: messageValidation.error }, { status: 400 });
     }
 
     // Verify the ticket exists and user has access
@@ -94,7 +130,7 @@ export async function POST(
     const response = await prisma.ticketResponse.create({
       data: {
         ticketId: resolvedParams.id,
-        message: message.trim(),
+        message: normalizedMessage,
         author: auth.username,
         isStaff: auth.isAdmin,
       },
@@ -116,7 +152,7 @@ export async function POST(
         targetType: 'SupportTicket',
         details: {
           subject: ticket.subject,
-          responsePreview: message.trim().substring(0, 100),
+          responsePreview: normalizedMessage.substring(0, 100),
         },
         ipAddress: getIpAddress(request),
         userAgent: getUserAgent(request),
@@ -138,7 +174,14 @@ export async function POST(
     } else {
       // Try to find email from any access request with this username
       const accessRequest = await prisma.accessRequest.findFirst({
-        where: { ldapUsername: ticket.username },
+        where: {
+          OR: [
+            { ldapUsername: ticket.username },
+            { vpnUsername: ticket.username },
+            { linkedAdUsername: ticket.username },
+            { linkedVpnUsername: ticket.username },
+          ],
+        },
         select: { email: true, name: true },
         orderBy: { createdAt: 'desc' },
       });
@@ -155,7 +198,7 @@ export async function POST(
           subject: ticket.subject,
           userEmail: userEmail!,
           userName: userName || undefined,
-          responseMessage: message.trim(),
+          responseMessage: normalizedMessage,
           staffUsername: auth.username,
         }).catch((error) => {
           console.error('[Ticket Response] Failed to send user notification:', error);
@@ -169,7 +212,7 @@ export async function POST(
           subject: ticket.subject,
           username: auth.username,
           userEmail,
-          responseMessage: message.trim(),
+          responseMessage: normalizedMessage,
         }).catch((error) => {
           console.error('[Ticket Response] Failed to send admin notification:', error);
         });
@@ -184,6 +227,17 @@ export async function POST(
       { status: 201 }
     );
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
+    if (isRateLimitUnavailable(error)) {
+      return NextResponse.json(
+        { error: 'This service is temporarily unavailable. Please try again later.' },
+        { status: 503 }
+      );
+    }
+
     console.error('Error adding ticket response:', error);
     return NextResponse.json(
       { error: 'Failed to add ticket response' },

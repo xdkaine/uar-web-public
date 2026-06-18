@@ -1,10 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import logger from '@/lib/logger';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { isJsonBodyError, parseAdminJson } from '@/lib/admin-json-parser';
 
 export const dynamic = 'force-dynamic';
+
+type NotificationUpdateBody = {
+  message?: string;
+  type?: string;
+  priority?: number;
+  isActive?: boolean;
+  startDate?: string | null;
+  endDate?: string | null;
+  dismissible?: boolean;
+};
 
 // PATCH /api/admin/notifications/[id] - Update a notification banner
 export async function PATCH(
@@ -23,7 +35,7 @@ export async function PATCH(
     if (!id) {
       return NextResponse.json({ error: 'Missing notification id' }, { status: 400 });
     }
-    const body = await request.json();
+    const body = await parseAdminJson<NotificationUpdateBody>(request);
     const { message, type, priority, isActive, startDate, endDate, dismissible } = body;
 
     // Check if notification exists
@@ -62,7 +74,7 @@ export async function PATCH(
     }
 
     // Build update data
-    const updateData: any = {};
+    const updateData: Prisma.NotificationBannerUpdateInput = {};
     if (message !== undefined) updateData.message = message;
     if (type !== undefined) updateData.type = type;
     if (priority !== undefined) updateData.priority = priority;
@@ -99,6 +111,10 @@ export async function PATCH(
       message: 'Notification updated successfully',
     });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
     logger.error('Error updating notification', {
       action: 'update_notification',
       error: error instanceof Error ? error.message : 'Unknown error',

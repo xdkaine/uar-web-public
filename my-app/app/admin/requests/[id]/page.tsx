@@ -581,15 +581,6 @@ Thank you!`;
     }
   };
 
-  // Calendar helper functions
-  const getDaysInMonth = (date: Date) => {
-    return new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
-  };
-
-  const getFirstDayOfMonth = (date: Date) => {
-    return new Date(date.getFullYear(), date.getMonth(), 1).getDay();
-  };
-
   const handleUndoNotifyFaculty = async () => {
     setConfirmModalConfig({
       title: 'Undo Sent to Faculty',
@@ -969,11 +960,13 @@ Thank you!`;
                 request.status === 'pending_student_directors' ? 'bg-blue-100 text-blue-800' :
                   request.status === 'pending_faculty' ? 'bg-yellow-100 text-yellow-800' :
                     request.status === 'approved' ? 'bg-green-100 text-green-800' :
-                      'bg-red-100 text-red-800'
+                      request.status === 'offboarded' ? 'bg-slate-100 text-slate-800' :
+                        'bg-red-100 text-red-800'
                 }`}>
                 {request.status === 'pending_verification' ? 'Pending Verification' :
                   request.status === 'pending_student_directors' ? 'Pending Student Directors' :
                     request.status === 'pending_faculty' ? 'Pending Faculty' :
+                      request.status === 'offboarded' ? 'Offboarded' :
                       request.status.charAt(0).toUpperCase() + request.status.slice(1)}
               </span>
             </div>

@@ -4,48 +4,110 @@ import { prisma } from '@/lib/prisma';
 import { sendPasswordResetEmail } from '@/lib/email';
 import { appLogger } from '@/lib/logger';
 import { getLDAPUserEmail, searchUserByEmail } from '@/lib/ldap';
-import { checkRateLimitAsync, getClientIp, RateLimitPresets } from '@/lib/ratelimit';
+import { checkRateLimitAsync, getRequiredClientIp, isRateLimitUnavailable, RateLimitPresets } from '@/lib/ratelimit';
 import { verifyTurnstileToken } from '@/lib/turnstile';
 import { StandardErrors, internalError } from '@/lib/standardErrors';
+import { getSessionFromCookies } from '@/lib/session';
+import { isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit, validateEmail } from '@/lib/validation';
+import { logActionHistoryEvent } from '@/lib/action-history';
+import { AuditActions, AuditCategories, getUserAgent } from '@/lib/audit-log';
+
+interface PasswordResetRequestBody {
+  email?: unknown;
+  username?: unknown;
+  turnstileToken?: unknown;
+}
+
+function rateLimitedResponse(rateLimitResult: {
+  limit: number;
+  remaining: number;
+  reset: number;
+}) {
+  return NextResponse.json(
+    {
+      error: StandardErrors.RATE_LIMIT_EXCEEDED,
+      retryAfter: Math.ceil((rateLimitResult.reset - Date.now()) / 1000),
+    },
+    {
+      status: 429,
+      headers: {
+        'X-RateLimit-Limit': rateLimitResult.limit.toString(),
+        'X-RateLimit-Remaining': rateLimitResult.remaining.toString(),
+        'X-RateLimit-Reset': new Date(rateLimitResult.reset).toISOString(),
+        'Retry-After': Math.ceil((rateLimitResult.reset - Date.now()) / 1000).toString(),
+      },
+    }
+  );
+}
 
 export async function POST(request: NextRequest) {
   try {
-    const { email, username, turnstileToken } = await request.json();
+    const { email, username, turnstileToken } = await parseJsonWithLimit<PasswordResetRequestBody>(
+      request,
+      MAX_REQUEST_BODY_SIZE.SMALL
+    );
 
     // Determine if this is a logged-in user request (has username) or non-logged-in (has email)
     let targetEmail: string | null = null;
     const successMessage =
       'If an account exists with this email, you will receive a password reset link.';
 
-    // Apply rate limiting: 3 attempts per hour per email/IP combination
-    const clientIp = getClientIp(request);
-    const identifier = email || username || '';
-    const rateLimitResult = await checkRateLimitAsync(clientIp, {
-      ...RateLimitPresets.passwordReset,
-      identifier,
-    });
+    const providedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    const providedUsername = typeof username === 'string' ? username.trim() : '';
+    const correlationId = `password-reset-request:${Date.now()}:${randomBytes(4).toString('hex')}`;
 
-    if (!rateLimitResult.success) {
-      return NextResponse.json(
-        {
-          error: StandardErrors.RATE_LIMIT_EXCEEDED,
-          retryAfter: Math.ceil((rateLimitResult.reset - Date.now()) / 1000),
-        },
-        {
-          status: 429,
-          headers: {
-            'X-RateLimit-Limit': rateLimitResult.limit.toString(),
-            'X-RateLimit-Remaining': rateLimitResult.remaining.toString(),
-            'X-RateLimit-Reset': new Date(rateLimitResult.reset).toISOString(),
-            'Retry-After': Math.ceil((rateLimitResult.reset - Date.now()) / 1000).toString(),
-          },
-        }
-      );
+    // Apply independent IP and target limits.
+    const clientIp = getRequiredClientIp(request);
+    const ipRateLimitResult = await checkRateLimitAsync(clientIp, RateLimitPresets.passwordReset);
+
+    if (!ipRateLimitResult.success) {
+      return rateLimitedResponse(ipRateLimitResult);
     }
 
-    // Verify Turnstile for public requests (email provided, no username)
-    if (email && !username) {
-      if (!turnstileToken) {
+    if (providedUsername) {
+      const session = await getSessionFromCookies();
+
+      if (!session) {
+        return NextResponse.json({ error: StandardErrors.UNAUTHORIZED }, { status: 401 });
+      }
+
+      if (session.username.toLowerCase() !== providedUsername.toLowerCase()) {
+        return NextResponse.json({ error: StandardErrors.FORBIDDEN }, { status: 403 });
+      }
+
+      const targetRateLimitResult = await checkRateLimitAsync('password-reset-target', {
+        maxRequests: 3,
+        windowMs: RateLimitPresets.passwordReset.windowMs,
+        identifier: session.username.toLowerCase(),
+      });
+
+      if (!targetRateLimitResult.success) {
+        return rateLimitedResponse(targetRateLimitResult);
+      }
+
+      // Logged-in user - get their email from LDAP
+      const ldapEmail = await getLDAPUserEmail(session.username);
+      if (!ldapEmail) {
+        appLogger.warn(
+          'LDAP username not found during password reset request',
+          { username: session.username }
+        );
+      } else {
+        targetEmail = ldapEmail.trim().toLowerCase();
+      }
+    } else if (providedEmail) {
+      const targetRateLimitResult = await checkRateLimitAsync('password-reset-target', {
+        maxRequests: 3,
+        windowMs: RateLimitPresets.passwordReset.windowMs,
+        identifier: providedEmail,
+      });
+
+      if (!targetRateLimitResult.success) {
+        return rateLimitedResponse(targetRateLimitResult);
+      }
+
+      // Verify Turnstile for public requests
+      if (typeof turnstileToken !== 'string' || !turnstileToken) {
         return NextResponse.json(
           { error: StandardErrors.TURNSTILE_VALIDATION_FAILED },
           { status: 400 }
@@ -59,29 +121,15 @@ export async function POST(request: NextRequest) {
           { status: 400 }
         );
       }
-    }
 
-    if (username) {
-      // Logged-in user - get their email from LDAP
-      const ldapEmail = await getLDAPUserEmail(username);
-      if (!ldapEmail) {
-        appLogger.warn(
-          'LDAP username not found during password reset request',
-          { username }
-        );
-      } else {
-        targetEmail = ldapEmail;
-      }
-    } else if (email) {
       // Non-logged-in user - verify email format
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(email)) {
+      if (!validateEmail(providedEmail)) {
         return NextResponse.json(
           { error: StandardErrors.INVALID_INPUT },
           { status: 400 }
         );
       }
-      targetEmail = email;
+      targetEmail = providedEmail;
     } else {
       return NextResponse.json(
         { error: StandardErrors.INVALID_INPUT },
@@ -91,7 +139,22 @@ export async function POST(request: NextRequest) {
 
     if (!targetEmail) {
       // Return uniform success response even when no matching LDAP user is found
-      appLogger.info('Password reset: No target email resolved (invalid input or LDAP lookup failure)', { username, providedEmail: email });
+      appLogger.info('Password reset: No target email resolved (invalid input or LDAP lookup failure)', { username: providedUsername, providedEmail });
+      await logActionHistoryEvent({
+        action: AuditActions.PASSWORD_RESET_DENIED,
+        category: AuditCategories.AUTH,
+        username: providedUsername || 'anonymous',
+        actorType: providedUsername ? 'user' : 'anonymous',
+        subjectUsername: providedUsername || null,
+        subjectEmail: providedEmail || null,
+        eventKind: 'security',
+        outcome: 'denied',
+        success: true,
+        details: { reason: 'no_target_email_resolved' },
+        ipAddress: clientIp,
+        userAgent: getUserAgent(request),
+        correlationId,
+      });
       return NextResponse.json({ message: successMessage });
     }
 
@@ -101,6 +164,21 @@ export async function POST(request: NextRequest) {
     if (!adUser) {
       // Return uniform success response without logging to avoid notifying the user/logs
       appLogger.info('Password reset: User not found in AD', { email: targetEmail });
+      await logActionHistoryEvent({
+        action: AuditActions.PASSWORD_RESET_DENIED,
+        category: AuditCategories.AUTH,
+        username: providedUsername || 'anonymous',
+        actorType: providedUsername ? 'user' : 'anonymous',
+        subjectUsername: providedUsername || null,
+        subjectEmail: targetEmail,
+        eventKind: 'security',
+        outcome: 'denied',
+        success: true,
+        details: { reason: 'ad_user_not_found' },
+        ipAddress: clientIp,
+        userAgent: getUserAgent(request),
+        correlationId,
+      });
       return NextResponse.json({ message: successMessage });
     }
 
@@ -113,6 +191,8 @@ export async function POST(request: NextRequest) {
         status: true,
         accountExpiresAt: true,
         rejectionReason: true,
+        ldapUsername: true,
+        linkedAdUsername: true,
       },
     });
 
@@ -133,6 +213,24 @@ export async function POST(request: NextRequest) {
         isExpired
       ) {
         appLogger.info('Password reset: Account status invalid or expired', { email: targetEmail, status, isExpired });
+        await logActionHistoryEvent({
+          action: AuditActions.PASSWORD_RESET_DENIED,
+          category: AuditCategories.AUTH,
+          username: providedUsername || 'anonymous',
+          actorType: providedUsername ? 'user' : 'anonymous',
+          targetId: accessRequest.id,
+          targetType: 'AccessRequest',
+          subjectUsername: accessRequest.ldapUsername || accessRequest.linkedAdUsername || providedUsername || null,
+          subjectEmail: targetEmail,
+          relatedRequestId: accessRequest.id,
+          eventKind: 'security',
+          outcome: 'denied',
+          success: true,
+          details: { reason: 'account_status_not_resettable', status, isExpired },
+          ipAddress: clientIp,
+          userAgent: getUserAgent(request),
+          correlationId,
+        });
         return NextResponse.json({ message: successMessage });
       }
     }
@@ -172,9 +270,39 @@ export async function POST(request: NextRequest) {
     // Send the reset email
     await sendPasswordResetEmail(targetEmail, resetToken);
 
+    await logActionHistoryEvent({
+      action: AuditActions.PASSWORD_RESET_LINK_SENT,
+      category: AuditCategories.AUTH,
+      username: providedUsername || 'anonymous',
+      actorType: providedUsername ? 'user' : 'anonymous',
+      targetId: accessRequest?.id,
+      targetType: accessRequest ? 'AccessRequest' : 'User',
+      subjectUsername: accessRequest?.ldapUsername || accessRequest?.linkedAdUsername || providedUsername || null,
+      subjectEmail: targetEmail,
+      relatedRequestId: accessRequest?.id,
+      eventKind: 'notification',
+      outcome: 'success',
+      success: true,
+      details: { expiresAt: expiresAt.toISOString(), initiatedBy: providedUsername ? 'self_service' : 'public_request' },
+      ipAddress: clientIp,
+      userAgent: getUserAgent(request),
+      correlationId,
+    });
+
     // Return success without revealing if the email exists
     return NextResponse.json({ message: successMessage });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
+    if (isRateLimitUnavailable(error)) {
+      return NextResponse.json(
+        { error: StandardErrors.SERVICE_UNAVAILABLE },
+        { status: 503 }
+      );
+    }
+
     return internalError(error, 'Password Reset Request');
   }
 }

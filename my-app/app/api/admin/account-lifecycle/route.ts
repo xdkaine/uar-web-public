@@ -5,6 +5,13 @@ import { prisma } from '@/lib/prisma';
 import { processLifecycleAction } from '@/lib/lifecycle-processor';
 import { secureJsonResponse } from '@/lib/apiResponse';
 
+type LifecycleActionWhere = {
+  status?: string;
+  actionType?: string;
+  targetUsername?: { contains: string; mode: 'insensitive' };
+  batchId?: string;
+};
+
 /**
  * GET /api/admin/account-lifecycle
  * Get all lifecycle actions with filtering
@@ -22,7 +29,7 @@ export async function GET(request: NextRequest) {
     const username = searchParams.get('username');
     const batchId = searchParams.get('batchId');
 
-    const where: any = {};
+    const where: LifecycleActionWhere = {};
     if (status) where.status = status;
     if (actionType) where.actionType = actionType;
     if (username) where.targetUsername = { contains: username, mode: 'insensitive' };
@@ -38,7 +45,7 @@ export async function GET(request: NextRequest) {
         },
       },
       orderBy: [
-        { createdAt: 'asc' },
+        { createdAt: 'desc' },
       ],
       take: 100,
     });
@@ -78,6 +85,13 @@ export async function POST(request: NextRequest) {
       notes,
     } = body;
 
+    const effectiveTargetAccountType = ['disable_both', 'enable_both'].includes(actionType)
+      ? 'BOTH'
+      : targetAccountType;
+    const explicitRelatedRequestId = typeof relatedRequestId === 'string' && relatedRequestId.trim()
+      ? relatedRequestId.trim()
+      : null;
+
     // Validate required fields
     if (!actionType || !targetAccountType || !targetUsername || !reason) {
       return NextResponse.json(
@@ -106,24 +120,33 @@ export async function POST(request: NextRequest) {
 
     // Check if target account exists
     let targetUserId = null;
-    if (targetAccountType === 'AD' || targetAccountType === 'BOTH') {
-      const adAccount = await prisma.accessRequest.findFirst({
-        where: {
-          OR: [
-            { ldapUsername: targetUsername },
-            { linkedAdUsername: targetUsername },
-          ],
-        },
-      });
+    let resolvedRelatedRequestId = explicitRelatedRequestId;
+    if (effectiveTargetAccountType === 'AD' || effectiveTargetAccountType === 'BOTH') {
+      const adAccount = explicitRelatedRequestId
+        ? await prisma.accessRequest.findUnique({
+            where: { id: explicitRelatedRequestId },
+          })
+        : await prisma.accessRequest.findFirst({
+            where: {
+              OR: [
+                { ldapUsername: targetUsername },
+                { linkedAdUsername: targetUsername },
+              ],
+              status: { notIn: ['rejected', 'offboarded'] },
+            },
+            orderBy: { createdAt: 'desc' },
+          });
       if (adAccount) {
         targetUserId = adAccount.id;
+        resolvedRelatedRequestId = adAccount.id;
       }
-    } else if (targetAccountType === 'VPN') {
+    } else if (effectiveTargetAccountType === 'VPN') {
       const vpnAccount = await prisma.vPNAccount.findUnique({
         where: { username: targetUsername },
       });
       if (vpnAccount) {
         targetUserId = vpnAccount.id;
+        resolvedRelatedRequestId = explicitRelatedRequestId || vpnAccount.accessRequestId || null;
       }
     }
 
@@ -131,13 +154,13 @@ export async function POST(request: NextRequest) {
     const action = await prisma.accountLifecycleAction.create({
       data: {
         actionType,
-        targetAccountType,
+        targetAccountType: effectiveTargetAccountType,
         targetUsername,
         targetUserId,
         reason,
         requestedBy: admin.username,
         scheduledFor: scheduledFor ? new Date(scheduledFor) : null,
-        relatedRequestId,
+        relatedRequestId: resolvedRelatedRequestId,
         relatedTicketId,
         vpnRoleChange,
         notes,
@@ -156,7 +179,7 @@ export async function POST(request: NextRequest) {
         newStatus: 'processing',
         details: JSON.stringify({
           actionType,
-          targetAccountType,
+          targetAccountType: effectiveTargetAccountType,
           targetUsername,
           reason,
         }),
@@ -202,7 +225,7 @@ export async function POST(request: NextRequest) {
       success: processResult.success,
       details: {
         actionType,
-        targetAccountType,
+        targetAccountType: effectiveTargetAccountType,
         targetUsername,
         reason,
         status: updatedAction?.status,

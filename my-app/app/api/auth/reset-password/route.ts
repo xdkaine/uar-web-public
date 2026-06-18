@@ -1,18 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { createHash } from 'crypto';
 import { prisma } from '@/lib/prisma';
 import { changeLDAPUserPassword, searchLDAPUser } from '@/lib/ldap';
 import { validatePasswordStrength } from '@/lib/password';
-import { checkRateLimitAsync, getClientIp, RateLimitPresets } from '@/lib/ratelimit';
+import { checkRateLimitAsync, getRequiredClientIp, isRateLimitUnavailable, RateLimitPresets } from '@/lib/ratelimit';
 import { appLogger } from '@/lib/logger';
-import { parseJsonWithLimit, MAX_REQUEST_BODY_SIZE } from '@/lib/validation';
+import { parseJsonWithLimit, MAX_REQUEST_BODY_SIZE, isJsonBodyError } from '@/lib/validation';
+import { logActionHistoryEvent } from '@/lib/action-history';
+import { AuditActions, AuditCategories, getUserAgent } from '@/lib/audit-log';
 
 const MAX_TOKEN_ATTEMPTS = 5;
 
 export async function POST(request: NextRequest) {
   try {
     // Apply rate limiting: 3 attempts per hour per IP to prevent token brute forcing
-    const clientIp = getClientIp(request);
+    const clientIp = getRequiredClientIp(request);
     const rateLimitResult = await checkRateLimitAsync(clientIp, RateLimitPresets.passwordReset);
     
     if (!rateLimitResult.success) {
@@ -52,6 +55,7 @@ export async function POST(request: NextRequest) {
     }
 
     const tokenHash = createHash('sha256').update(token).digest('hex');
+    const correlationId = `password-reset:${Date.now()}:${tokenHash.substring(0, 8)}`;
 
     // ATOMIC: Use transaction to fetch and mark token as used atomically
     // This prevents TOCTOU race conditions and ensures data consistency
@@ -59,7 +63,7 @@ export async function POST(request: NextRequest) {
     try {
       const now = new Date();
       
-      resetToken = await prisma.$transaction(async (tx: any) => {
+      resetToken = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         // Fetch the token first within transaction
         const tokenData = await tx.passwordResetToken.findUnique({
           where: { tokenHash },
@@ -107,8 +111,34 @@ export async function POST(request: NextRequest) {
           ip: clientIp
         });
         console.error('[Password Reset] Error processing token:', error.message);
+        await logActionHistoryEvent({
+          action: AuditActions.PASSWORD_RESET_TOKEN_INVALID,
+          category: AuditCategories.AUTH,
+          username: 'anonymous',
+          actorType: 'anonymous',
+          eventKind: 'security',
+          outcome: 'denied',
+          success: false,
+          details: { reason: error.message, tokenPresent: true },
+          ipAddress: clientIp,
+          userAgent: getUserAgent(request),
+          correlationId,
+        });
       } else {
         console.error('[Password Reset] Error processing token:', error);
+        await logActionHistoryEvent({
+          action: AuditActions.PASSWORD_RESET_TOKEN_INVALID,
+          category: AuditCategories.AUTH,
+          username: 'anonymous',
+          actorType: 'anonymous',
+          eventKind: 'security',
+          outcome: 'denied',
+          success: false,
+          details: { reason: 'unknown_token_error', tokenPresent: true },
+          ipAddress: clientIp,
+          userAgent: getUserAgent(request),
+          correlationId,
+        });
       }
       
       // Return uniform error to prevent token enumeration
@@ -154,6 +184,20 @@ export async function POST(request: NextRequest) {
         const { searchEntries } = await client.search(process.env.LDAP_SEARCH_BASE || '', opts);
 
         if (searchEntries.length === 0) {
+          await logActionHistoryEvent({
+            action: AuditActions.PASSWORD_RESET_DENIED,
+            category: AuditCategories.AUTH,
+            username: 'anonymous',
+            actorType: 'anonymous',
+            subjectEmail: email,
+            eventKind: 'security',
+            outcome: 'denied',
+            success: false,
+            details: { reason: 'ldap_email_not_found' },
+            ipAddress: clientIp,
+            userAgent: getUserAgent(request),
+            correlationId,
+          });
           return NextResponse.json(
             { error: 'No account found with this email address' },
             { status: 404 }
@@ -183,6 +227,20 @@ export async function POST(request: NextRequest) {
     }
 
     if (!username || !userDN) {
+      await logActionHistoryEvent({
+        action: AuditActions.PASSWORD_RESET_DENIED,
+        category: AuditCategories.AUTH,
+        username: 'anonymous',
+        actorType: 'anonymous',
+        subjectEmail: email,
+        eventKind: 'security',
+        outcome: 'denied',
+        success: false,
+        details: { reason: 'missing_ldap_username_or_dn' },
+        ipAddress: clientIp,
+        userAgent: getUserAgent(request),
+        correlationId,
+      });
       return NextResponse.json(
         { error: 'No account found with this email address' },
         { status: 404 }
@@ -192,6 +250,21 @@ export async function POST(request: NextRequest) {
     // Verify user exists in LDAP
     const userInfo = await searchLDAPUser(username);
     if (!userInfo) {
+      await logActionHistoryEvent({
+        action: AuditActions.PASSWORD_RESET_DENIED,
+        category: AuditCategories.AUTH,
+        username,
+        actorType: 'user',
+        subjectUsername: username,
+        subjectEmail: email,
+        eventKind: 'security',
+        outcome: 'denied',
+        success: false,
+        details: { reason: 'ldap_user_not_found' },
+        ipAddress: clientIp,
+        userAgent: getUserAgent(request),
+        correlationId,
+      });
       return NextResponse.json(
         { error: 'User account not found in directory' },
         { status: 404 }
@@ -218,6 +291,22 @@ export async function POST(request: NextRequest) {
           },
         });
         appLogger.info('Password reset: Token usage rolled back due to password change failure', { username });
+        await logActionHistoryEvent({
+          action: AuditActions.PASSWORD_RESET_TOKEN_ROLLED_BACK,
+          category: AuditCategories.AUTH,
+          username,
+          actorType: 'user',
+          subjectUsername: username,
+          subjectEmail: email,
+          eventKind: 'security',
+          outcome: 'rollback',
+          success: false,
+          errorMessage,
+          details: { reason: 'ldap_password_change_failed' },
+          ipAddress: clientIp,
+          userAgent: getUserAgent(request),
+          correlationId,
+        });
       } catch (rollbackError) {
         console.error('[Password Reset] Failed to rollback token:', rollbackError);
         // Log but don't fail the response - user needs to request new token
@@ -240,10 +329,46 @@ export async function POST(request: NextRequest) {
 
     // Token is already marked as used (atomically at the beginning)
     // Password has been successfully changed
+    const relatedRequest = await prisma.accessRequest.findFirst({
+      where: { email: email.toLowerCase() },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    });
+
+    await logActionHistoryEvent({
+      action: AuditActions.PASSWORD_RESET_COMPLETED,
+      category: AuditCategories.AUTH,
+      username,
+      actorType: 'user',
+      targetId: relatedRequest?.id,
+      targetType: relatedRequest ? 'AccessRequest' : 'User',
+      subjectUsername: username,
+      subjectEmail: email,
+      relatedRequestId: relatedRequest?.id,
+      eventKind: 'security',
+      outcome: 'success',
+      success: true,
+      details: { method: 'reset_link' },
+      ipAddress: clientIp,
+      userAgent: getUserAgent(request),
+      correlationId,
+    });
+
     return NextResponse.json({
       message: 'Password has been successfully reset',
     });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
+    if (isRateLimitUnavailable(error)) {
+      return NextResponse.json(
+        { error: 'This service is temporarily unavailable. Please try again later.' },
+        { status: 503 }
+      );
+    }
+
     console.error('[Password Reset] Error:', error);
     return NextResponse.json(
       { error: 'Failed to reset password' },

@@ -58,7 +58,7 @@ interface VPNAccount {
   id: string;
   username: string;
   name: string;
-  email: string;
+  email: string | null;
   portalType: string;
   isInternal: boolean;
   status: string;
@@ -76,8 +76,8 @@ interface VPNAccount {
   restoredAt?: string;
   restoredBy?: string;
   canRestore?: boolean;
-  notes?: string;
-  adUsername?: string; // Linked AD account username
+  notes?: string | null;
+  adUsername?: string | null; // Linked AD account username
 }
 
 export type StatusFilter = 'all' | 'active' | 'pending_faculty' | 'disabled' | 'revoked';
@@ -85,17 +85,40 @@ export type PortalFilter = 'all' | 'Management' | 'Limited' | 'External';
 export type FacultyFilter = 'all' | 'approved' | 'pending';
 
 interface VPNManagementTabProps {
-  accounts: VPNAccount[];
-  isLoading: boolean;
-  onRefresh: () => Promise<void>;
+  accounts?: VPNAccount[];
+  isLoading?: boolean;
 }
 
-export default function VPNManagementTab({ accounts: initialAccounts, isLoading: initialLoading, onRefresh: parentRefresh }: VPNManagementTabProps) {
-  const [accounts, setAccounts] = useState<VPNAccount[]>(initialAccounts);
+interface VPNImportSummary {
+  id: string;
+  fileName: string;
+  userType: string;
+  portalType?: string | null;
+  importedBy: string;
+  createdAt: string;
+  totalRecords?: number | null;
+  matchedRecords?: number | null;
+  unmatchedRecords?: number | null;
+  createdAccounts?: number | null;
+  status?: string | null;
+}
+
+function searchText(value: string | null | undefined): string {
+  return value?.toLowerCase() || '';
+}
+
+function displayText(value: string | null | undefined, fallback = '-'): string {
+  return value?.trim() || fallback;
+}
+
+export default function VPNManagementTab({ accounts: initialAccounts, isLoading: initialLoading = true }: VPNManagementTabProps) {
+  const [accounts, setAccounts] = useState<VPNAccount[]>(initialAccounts ?? []);
   const [isLoading, setIsLoading] = useState(initialLoading);
 
   useEffect(() => {
-    setAccounts(initialAccounts);
+    if (initialAccounts !== undefined) {
+      setAccounts(initialAccounts);
+    }
   }, [initialAccounts]);
 
   useEffect(() => {
@@ -145,7 +168,7 @@ export default function VPNManagementTab({ accounts: initialAccounts, isLoading:
   const [importUserType, setImportUserType] = useState<'Internal' | 'External'>('Internal');
   const [importPortalType, setImportPortalType] = useState<'Management' | 'Limited'>('Management');
   const [showImportQueueModal, setShowImportQueueModal] = useState(false);
-  const [imports, setImports] = useState<any[]>([]);
+  const [imports, setImports] = useState<VPNImportSummary[]>([]);
   const [selectedImportId, setSelectedImportId] = useState<string | null>(null);
   const [showMatchModal, setShowMatchModal] = useState(false);
   const [isProcessingImport, setIsProcessingImport] = useState(false);
@@ -176,7 +199,7 @@ export default function VPNManagementTab({ accounts: initialAccounts, isLoading:
     const csvData = filteredAndSortedAccounts.map((acc: VPNAccount) => [
       acc.username,
       acc.name,
-      acc.email,
+      acc.email || '',
       acc.portalType,
       acc.status,
       new Date(acc.createdAt).toLocaleDateString(),
@@ -205,13 +228,14 @@ export default function VPNManagementTab({ accounts: initialAccounts, isLoading:
   const filteredAccounts = useMemo(() => {
     return accounts.filter((account: VPNAccount) => {
       // Text search filter
-      const searchLower = searchQuery.toLowerCase();
-      const matchesSearch = !searchQuery || (
-        account.username.toLowerCase().includes(searchLower) ||
-        account.name.toLowerCase().includes(searchLower) ||
-        account.email.toLowerCase().includes(searchLower) ||
-        (account.createdBy && account.createdBy.toLowerCase().includes(searchLower)) ||
-        (account.notes && account.notes.toLowerCase().includes(searchLower))
+      const searchLower = searchQuery.trim().toLowerCase();
+      const matchesSearch = !searchLower || (
+        searchText(account.username).includes(searchLower) ||
+        searchText(account.name).includes(searchLower) ||
+        searchText(account.email).includes(searchLower) ||
+        searchText(account.createdBy).includes(searchLower) ||
+        searchText(account.notes).includes(searchLower) ||
+        searchText(account.adUsername).includes(searchLower)
       );
 
       // Status filter
@@ -238,16 +262,16 @@ export default function VPNManagementTab({ accounts: initialAccounts, isLoading:
 
       switch (sortField) {
         case 'username':
-          aValue = a.username.toLowerCase();
-          bValue = b.username.toLowerCase();
+          aValue = searchText(a.username);
+          bValue = searchText(b.username);
           break;
         case 'name':
-          aValue = a.name.toLowerCase();
-          bValue = b.name.toLowerCase();
+          aValue = searchText(a.name);
+          bValue = searchText(b.name);
           break;
         case 'email':
-          aValue = a.email.toLowerCase();
-          bValue = b.email.toLowerCase();
+          aValue = searchText(a.email);
+          bValue = searchText(b.email);
           break;
         case 'createdAt':
           aValue = new Date(a.createdAt).getTime();
@@ -552,7 +576,7 @@ export default function VPNManagementTab({ accounts: initialAccounts, isLoading:
                       setShowDetailModal(true);
                     }}
                   >
-                    {account.email}
+                    {displayText(account.email)}
                   </TableCell>
                   {!title && (
                     <TableCell 
@@ -1365,7 +1389,7 @@ export default function VPNManagementTab({ accounts: initialAccounts, isLoading:
                     <textarea
                       value={statusReason}
                       onChange={(e) => setStatusReason(e.target.value)}
-                      className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                      className="flex min-h-20 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                       rows={4}
                       placeholder="Enter a reason for this status change..."
                     />
@@ -1425,7 +1449,7 @@ export default function VPNManagementTab({ accounts: initialAccounts, isLoading:
               <div className="text-center text-gray-600 py-8">No imports in queue</div>
             ) : (
               <div className="space-y-4">
-                {imports.map((imp: any) => (
+                {imports.map((imp: VPNImportSummary) => (
                   <Card key={imp.id}>
                     <CardContent className="p-4">
                       <div className="flex justify-between items-start">
@@ -1483,7 +1507,7 @@ export default function VPNManagementTab({ accounts: initialAccounts, isLoading:
                               Match Users
                             </Button>
                           )}
-                          {imp.matchedRecords > 0 && imp.createdAccounts < imp.matchedRecords && (
+                          {(imp.matchedRecords ?? 0) > 0 && (imp.createdAccounts ?? 0) < (imp.matchedRecords ?? 0) && (
                             <Button
                               variant="default"
                               size="sm"
@@ -1682,7 +1706,7 @@ export default function VPNManagementTab({ accounts: initialAccounts, isLoading:
               <textarea
                 value={bulkReason}
                 onChange={(e) => setBulkReason(e.target.value)}
-                className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                className="flex min-h-20 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                 rows={4}
                 placeholder="Enter a reason for this bulk status change..."
               />

@@ -18,11 +18,13 @@ export {
 export {
   createLDAPClient,
   authenticateLDAP,
+  isPasswordChangeRequiredAuthStatus,
 } from './client';
 
 // User Search
 export {
   searchLDAPUser,
+  searchLDAPUserForProvisioning,
   isUserDomainAdmin,
   getLDAPUserEmail,
   listUsersInOU,
@@ -42,6 +44,8 @@ export {
 export {
   setLDAPUserPassword,
   changeLDAPUserPassword,
+  changeLDAPUserPasswordWithCurrentPassword,
+  clearLDAPUserPasswordChangeRequired,
 } from './password';
 
 // Attribute Management

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { secureJsonResponse, secureErrorResponse } from '@/lib/apiResponse';
 import { cancelLifecycleAction } from '@/lib/lifecycle-processor';
-import { logAuditAction, AuditCategories, AuditActions } from '@/lib/audit-log';
+import { logAuditAction, AuditCategories, AuditActions, getIpAddress } from '@/lib/audit-log';
 
 export async function POST(
   request: NextRequest,
@@ -28,7 +28,7 @@ export async function POST(
       action: AuditActions.CANCEL_LIFECYCLE_ACTION,
       category: AuditCategories.LIFECYCLE,
       details: { actionId: id },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
+      ipAddress: getIpAddress(request) || 'unknown',
       userAgent: request.headers.get('user-agent') || 'unknown',
     });
 

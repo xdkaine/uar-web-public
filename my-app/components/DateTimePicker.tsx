@@ -1,29 +1,116 @@
 'use client';
 
-import { useState } from 'react';
+import { useId, useMemo, useState } from 'react';
+import {
+  CalendarDays,
+  ChevronLeft,
+  ChevronRight,
+  Clock3,
+  X,
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
-} from "@/components/ui/dialog";
+} from '@/components/ui/dialog';
+import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { cn } from '@/lib/utils';
 
 interface DateTimePickerProps {
-  value: string; // ISO datetime string (YYYY-MM-DDTHH:mm)
+  value: string;
   onChange: (datetime: string) => void;
   label?: string;
+  ariaLabel?: string;
   placeholder?: string;
   required?: boolean;
-  minDate?: Date; // Minimum selectable date
-  maxDate?: Date; // Maximum selectable date
+  minDate?: Date;
+  maxDate?: Date;
   disabled?: boolean;
   className?: string;
+}
+
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const HOURS = Array.from({ length: 12 }, (_, index) => String(index + 1));
+const MINUTES = Array.from({ length: 60 }, (_, index) => String(index).padStart(2, '0'));
+
+function formatLocalDate(date: Date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+  ].join('-');
+}
+
+function formatLocalTime(date: Date) {
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+function parseValue(value: string) {
+  if (!value) return { date: '', time: '12:00', parsed: null as Date | null };
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return { date: '', time: '12:00', parsed: null as Date | null };
+  }
+
+  return {
+    date: formatLocalDate(parsed),
+    time: formatLocalTime(parsed),
+    parsed,
+  };
+}
+
+function getTimeParts(time: string) {
+  const [hourValue = '12', minute = '00'] = time.split(':');
+  const hour24 = Number(hourValue);
+
+  return {
+    hour: String(hour24 % 12 || 12),
+    minute,
+    period: hour24 >= 12 ? 'PM' : 'AM',
+  };
+}
+
+function composeTime(hour: string, minute: string, period: string) {
+  const hour12 = Number(hour);
+  const hour24 = period === 'PM'
+    ? (hour12 % 12) + 12
+    : hour12 % 12;
+
+  return `${String(hour24).padStart(2, '0')}:${minute}`;
+}
+
+function formatDateTimeForDisplay(value: string) {
+  const { parsed } = parseValue(value);
+  if (!parsed) return '';
+
+  return parsed.toLocaleString('en-US', {
+    weekday: 'short',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
 }
 
 export default function DateTimePicker({
   value,
   onChange,
   label,
+  ariaLabel,
   placeholder = 'Select date and time',
   required = false,
   minDate,
@@ -31,227 +118,254 @@ export default function DateTimePicker({
   disabled = false,
   className = '',
 }: DateTimePickerProps) {
+  const fieldId = useId();
   const [showCalendar, setShowCalendar] = useState(false);
-  const [calendarMonth, setCalendarMonth] = useState(() => {
-    if (value) {
-      return new Date(value);
-    }
-    return new Date();
-  });
-  const [selectedDate, setSelectedDate] = useState(() => {
-    if (value) {
-      return value.split('T')[0];
-    }
-    return '';
-  });
-  const [selectedTime, setSelectedTime] = useState(() => {
-    if (value) {
-      return value.split('T')[1] || '12:00';
-    }
-    return '12:00';
-  });
+  const [calendarMonth, setCalendarMonth] = useState(() => parseValue(value).parsed || new Date());
+  const [selectedDate, setSelectedDate] = useState(() => parseValue(value).date);
+  const [selectedTime, setSelectedTime] = useState(() => parseValue(value).time);
 
-  const getDaysInMonth = (date: Date) => {
-    return new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+  const setCalendarOpen = (open: boolean) => {
+    if (open) {
+      const nextValue = parseValue(value);
+      setSelectedDate(nextValue.date);
+      setSelectedTime(nextValue.time);
+      setCalendarMonth(nextValue.parsed || new Date());
+    }
+    setShowCalendar(open);
   };
 
-  const getFirstDayOfMonth = (date: Date) => {
-    return new Date(date.getFullYear(), date.getMonth(), 1).getDay();
-  };
+  const timeParts = useMemo(() => getTimeParts(selectedTime), [selectedTime]);
+  const selectedDateTime = useMemo(() => {
+    if (!selectedDate || !selectedTime) return null;
+    const parsed = new Date(`${selectedDate}T${selectedTime}`);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }, [selectedDate, selectedTime]);
 
-  const formatDateForInput = (date: Date) => {
-    return date.toISOString().split('T')[0];
-  };
-
-  const formatDateTimeForDisplay = (datetimeStr: string) => {
-    if (!datetimeStr) return '';
-    try {
-      const dt = new Date(datetimeStr);
-      return dt.toLocaleString('en-US', {
-        weekday: 'short',
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true,
-      });
-    } catch {
-      return '';
+  const selectionError = useMemo(() => {
+    if (!selectedDateTime) return null;
+    if (minDate && selectedDateTime < minDate) {
+      return `Choose a time on or after ${minDate.toLocaleString()}.`;
     }
-  };
+    if (maxDate && selectedDateTime > maxDate) {
+      return `Choose a time on or before ${maxDate.toLocaleString()}.`;
+    }
+    return null;
+  }, [maxDate, minDate, selectedDateTime]);
+
+  const getDaysInMonth = (date: Date) => (
+    new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate()
+  );
+
+  const getFirstDayOfMonth = (date: Date) => (
+    new Date(date.getFullYear(), date.getMonth(), 1).getDay()
+  );
 
   const isDateDisabled = (date: Date) => {
-    if (minDate) {
-      const min = new Date(minDate);
-      min.setHours(0, 0, 0, 0);
-      if (date < min) return true;
-    }
-    if (maxDate) {
-      const max = new Date(maxDate);
-      max.setHours(0, 0, 0, 0);
-      if (date > max) return true;
-    }
+    const dayStart = new Date(date);
+    dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(date);
+    dayEnd.setHours(23, 59, 59, 999);
+
+    if (minDate && dayEnd < minDate) return true;
+    if (maxDate && dayStart > maxDate) return true;
     return false;
   };
 
   const selectDate = (day: number) => {
     const date = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), day);
     if (!isDateDisabled(date)) {
-      setSelectedDate(formatDateForInput(date));
+      setSelectedDate(formatLocalDate(date));
     }
   };
 
   const navigateMonth = (direction: number) => {
-    const newMonth = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + direction, 1);
-    setCalendarMonth(newMonth);
+    setCalendarMonth(previous => (
+      new Date(previous.getFullYear(), previous.getMonth() + direction, 1)
+    ));
   };
 
   const handleConfirm = () => {
-    if (selectedDate && selectedTime) {
-      const datetime = `${selectedDate}T${selectedTime}`;
-      onChange(datetime);
-      setShowCalendar(false);
-    }
+    if (!selectedDateTime || selectionError) return;
+    onChange(`${selectedDate}T${selectedTime}`);
+    setShowCalendar(false);
   };
 
   const handleClear = () => {
-    if (!required) {
-      onChange('');
-      setSelectedDate('');
-      setSelectedTime('12:00');
-    }
+    if (required) return;
+    onChange('');
+    setSelectedDate('');
+    setSelectedTime('12:00');
   };
 
   return (
-    <>
+    <div className={cn('space-y-2', className)}>
       {label && (
-        <label className="block text-sm font-medium text-gray-700 mb-2">
+        <Label htmlFor={fieldId}>
           {label}
-          {required && <span className="text-red-500 ml-1">*</span>}
-        </label>
+          {required && <span className="ml-1 text-destructive">*</span>}
+        </Label>
       )}
 
-      <div className={`flex gap-2 ${className}`}>
-        <input
-          type="text"
-          value={value ? formatDateTimeForDisplay(value) : ''}
-          readOnly
-          placeholder={placeholder}
-          disabled={disabled}
-          className="flex-1 px-3 py-2 bg-white border border-gray-300 rounded-md text-gray-900 text-sm cursor-pointer focus:outline-none focus:ring-2 focus:ring-blue-500"
-          onClick={() => !disabled && setShowCalendar(true)}
-        />
-        <button
+      <div className="flex min-w-0 gap-2">
+        <Button
+          id={fieldId}
           type="button"
-          onClick={() => setShowCalendar(true)}
+          variant="outline"
           disabled={disabled}
-          className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md flex items-center justify-center disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
-          title="Select date and time"
+          aria-label={ariaLabel || label || placeholder}
+          aria-haspopup="dialog"
+          onClick={() => setCalendarOpen(true)}
+          className={cn(
+            'h-auto min-h-9 min-w-0 flex-1 justify-start whitespace-normal px-3 py-2 text-left font-normal',
+            !value && 'text-muted-foreground'
+          )}
         >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-          </svg>
-        </button>
+          <CalendarDays className="size-4 shrink-0" />
+          <span className="min-w-0 truncate">
+            {value ? formatDateTimeForDisplay(value) : placeholder}
+          </span>
+        </Button>
         {value && !required && !disabled && (
-          <button
+          <Button
             type="button"
+            size="icon"
+            variant="ghost"
             onClick={handleClear}
-            className="px-3 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-md text-sm font-semibold transition-colors"
-            title="Clear date and time"
+            aria-label={`Clear ${label || ariaLabel || 'date and time'}`}
           >
-            ×
-          </button>
+            <X className="size-4" />
+          </Button>
         )}
       </div>
 
-      <Dialog open={showCalendar} onOpenChange={setShowCalendar}>
-        <DialogContent className="sm:max-w-md">
+      <Dialog open={showCalendar} onOpenChange={setCalendarOpen}>
+        <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Select Date and Time</DialogTitle>
+            <DialogTitle>Select date and time</DialogTitle>
+            <DialogDescription>
+              Choose the calendar date, then set an exact local time.
+            </DialogDescription>
           </DialogHeader>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between mb-4">
-            <button
-              type="button"
-              onClick={() => navigateMonth(-1)}
-              className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-              </svg>
-            </button>
-            <h3 className="text-lg font-semibold text-gray-900">
-              {calendarMonth.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
-            </h3>
-            <button
-              type="button"
-              onClick={() => navigateMonth(1)}
-              className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-              </svg>
-            </button>
-          </div>
 
-          <div className="grid grid-cols-7 gap-1">
-            {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day) => (
-              <div key={day} className="text-center text-xs font-semibold text-gray-600 py-2">
-                {day}
-              </div>
-            ))}
-
-            {Array.from({ length: getFirstDayOfMonth(calendarMonth) }).map((_, index) => (
-              <div key={`empty-${index}`} className="aspect-square" />
-            ))}
-
-            {Array.from({ length: getDaysInMonth(calendarMonth) }).map((_, index) => {
-              const day = index + 1;
-              const date = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), day);
-              const isDisabled = isDateDisabled(date);
-              const isSelected = selectedDate === formatDateForInput(date);
-              const isToday = formatDateForInput(new Date()) === formatDateForInput(date);
-
-              return (
-                <button
-                  key={day}
+          <div className="space-y-5">
+            <div className="rounded-xl border p-3">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <Button
                   type="button"
-                  onClick={() => selectDate(day)}
-                  disabled={isDisabled}
-                  className={`aspect-square p-2 rounded-lg text-sm font-medium transition-colors ${
-                    isDisabled
-                      ? 'text-gray-300 cursor-not-allowed'
-                      : isSelected
-                      ? 'bg-blue-600 text-white hover:bg-blue-700'
-                      : isToday
-                      ? 'bg-blue-100 text-blue-900 hover:bg-blue-200'
-                      : 'text-gray-900 hover:bg-gray-100'
-                  }`}
+                  size="icon-sm"
+                  variant="ghost"
+                  onClick={() => navigateMonth(-1)}
+                  aria-label="Previous month"
                 >
-                  {day}
-                </button>
-              );
-            })}
-          </div>
+                  <ChevronLeft className="size-4" />
+                </Button>
+                <p className="text-sm font-semibold">
+                  {calendarMonth.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                </p>
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  onClick={() => navigateMonth(1)}
+                  aria-label="Next month"
+                >
+                  <ChevronRight className="size-4" />
+                </Button>
+              </div>
 
-          <div className="pt-4 border-t border-gray-200">
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              Time
-            </label>
-            <input
-              type="time"
-              value={selectedTime}
-              onChange={(e) => setSelectedTime(e.target.value)}
-              className="w-full px-4 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900"
-            />
-          </div>
+              <div className="grid grid-cols-7 gap-1">
+                {WEEKDAYS.map(day => (
+                  <div key={day} className="py-1 text-center text-[0.7rem] font-medium text-muted-foreground">
+                    {day}
+                  </div>
+                ))}
 
-          {selectedDate && selectedTime && (
-            <div className="mt-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-              <p className="text-sm text-blue-900">
-                <span className="font-semibold">Selected:</span>{' '}
-                {new Date(`${selectedDate}T${selectedTime}`).toLocaleString('en-US', {
+                {Array.from({ length: getFirstDayOfMonth(calendarMonth) }).map((_, index) => (
+                  <div key={`empty-${index}`} className="aspect-square" />
+                ))}
+
+                {Array.from({ length: getDaysInMonth(calendarMonth) }).map((_, index) => {
+                  const day = index + 1;
+                  const date = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), day);
+                  const dateValue = formatLocalDate(date);
+                  const isDisabled = isDateDisabled(date);
+                  const isSelected = selectedDate === dateValue;
+                  const isToday = formatLocalDate(new Date()) === dateValue;
+
+                  return (
+                    <button
+                      key={day}
+                      type="button"
+                      onClick={() => selectDate(day)}
+                      disabled={isDisabled}
+                      aria-pressed={isSelected}
+                      className={cn(
+                        'aspect-square rounded-md text-sm font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
+                        isDisabled && 'cursor-not-allowed text-muted-foreground/35',
+                        !isDisabled && !isSelected && 'hover:bg-accent hover:text-accent-foreground',
+                        isToday && !isSelected && 'bg-accent text-accent-foreground',
+                        isSelected && 'bg-primary text-primary-foreground hover:bg-primary/90'
+                      )}
+                    >
+                      {day}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label className="flex items-center gap-2">
+                <Clock3 className="size-4" />
+                Time
+              </Label>
+              <div className="grid grid-cols-[1fr_auto_1fr_1fr] items-center gap-2">
+                <Select
+                  value={timeParts.hour}
+                  onValueChange={hour => setSelectedTime(composeTime(hour, timeParts.minute, timeParts.period))}
+                >
+                  <SelectTrigger className="w-full" aria-label="Hour">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent position="item-aligned" className="z-[80] max-h-72">
+                    {HOURS.map(hour => <SelectItem key={hour} value={hour}>{hour}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+                <span className="font-semibold text-muted-foreground">:</span>
+                <Select
+                  value={timeParts.minute}
+                  onValueChange={minute => setSelectedTime(composeTime(timeParts.hour, minute, timeParts.period))}
+                >
+                  <SelectTrigger className="w-full" aria-label="Minute">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent position="item-aligned" className="z-[80] max-h-72">
+                    {MINUTES.map(minute => <SelectItem key={minute} value={minute}>{minute}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+                <Select
+                  value={timeParts.period}
+                  onValueChange={period => setSelectedTime(composeTime(timeParts.hour, timeParts.minute, period))}
+                >
+                  <SelectTrigger className="w-full" aria-label="AM or PM">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent position="item-aligned" className="z-[80] max-h-72">
+                    <SelectItem value="AM">AM</SelectItem>
+                    <SelectItem value="PM">PM</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            {selectedDateTime && (
+              <div className={cn(
+                'rounded-lg border px-3 py-2 text-sm',
+                selectionError
+                  ? 'border-destructive/40 bg-destructive/5 text-destructive'
+                  : 'bg-muted/40 text-foreground'
+              )}>
+                {selectionError || selectedDateTime.toLocaleString('en-US', {
                   weekday: 'long',
                   year: 'numeric',
                   month: 'long',
@@ -260,30 +374,24 @@ export default function DateTimePicker({
                   minute: '2-digit',
                   hour12: true,
                 })}
-              </p>
-            </div>
-          )}
+              </div>
+            )}
+          </div>
 
-          <div className="flex justify-end gap-3 mt-4">
-            <button
-              type="button"
-              onClick={() => setShowCalendar(false)}
-              className="px-4 py-2 text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
-            >
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setShowCalendar(false)}>
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               onClick={handleConfirm}
-              disabled={!selectedDate}
-              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
+              disabled={!selectedDateTime || Boolean(selectionError)}
             >
-              Confirm
-            </button>
-          </div>
-        </div>
+              Confirm date and time
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
-    </>
+    </div>
   );
 }

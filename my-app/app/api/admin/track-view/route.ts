@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { logAuditAction, AuditActions, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { isJsonBodyError, parseAdminJson } from '@/lib/admin-json-parser';
+
+type TrackViewBody = {
+  pageName?: string;
+  category?: string;
+};
 
 export async function POST(request: NextRequest) {
   try {
@@ -10,7 +16,7 @@ export async function POST(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const body = await request.json();
+    const body = await parseAdminJson<TrackViewBody>(request);
     const { pageName, category } = body;
 
     if (!pageName || !category) {
@@ -34,6 +40,10 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ success: true });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
     console.error('Error tracking page view:', error);
     return NextResponse.json(
       { error: 'Failed to track page view' },

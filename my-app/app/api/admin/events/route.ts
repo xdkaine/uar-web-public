@@ -2,6 +2,14 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { isJsonBodyError, parseAdminJson } from '@/lib/admin-json-parser';
+
+type EventRequestBody = {
+  name?: string;
+  description?: string | null;
+  endDate?: string | null;
+  isActive?: boolean;
+};
 
 export async function GET(request: NextRequest) {
   try {
@@ -52,7 +60,7 @@ export async function POST(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const body = await request.json();
+    const body = await parseAdminJson<EventRequestBody>(request);
     const { name, description, endDate, isActive } = body;
 
     if (!name) {
@@ -85,6 +93,10 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ event }, { status: 201 });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
     console.error('Error creating event:', error);
 
     // Log the failure

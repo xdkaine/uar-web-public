@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { nanoid } from 'nanoid';
 import { prisma } from '@/lib/prisma';
 import { getSessionFromCookies } from '@/lib/session';
-import { checkRateLimitAsync, getClientIp } from '@/lib/ratelimit';
-import { parseJsonWithLimit, MAX_REQUEST_BODY_SIZE, validateStringLength, INPUT_LIMITS, extractBronconame } from '@/lib/validation';
+import { checkRateLimitAsync, getRequiredClientIp, isRateLimitUnavailable } from '@/lib/ratelimit';
+import { parseJsonWithLimit, MAX_REQUEST_BODY_SIZE, validateStringLength, INPUT_LIMITS, extractBronconame, isJsonBodyError } from '@/lib/validation';
 import { sendProfileEmailVerification } from '@/lib/email';
 import { searchLDAPUser } from '@/lib/ldap';
 import { appLogger } from '@/lib/logger';
@@ -30,7 +30,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Apply rate limiting: 10 requests per hour per user to prevent spam
-    const clientIp = getClientIp(request);
+    const clientIp = getRequiredClientIp(request);
     const rateLimitResult = await checkRateLimitAsync(clientIp, {
       maxRequests: 10,
       windowMs: 60 * 60 * 1000, // 1 hour
@@ -239,6 +239,17 @@ export async function POST(request: NextRequest) {
       message: 'Verification email sent. Please check your inbox and click the verification link.',
     });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
+    if (isRateLimitUnavailable(error)) {
+      return NextResponse.json(
+        { error: 'This service is temporarily unavailable. Please try again later.' },
+        { status: 503 }
+      );
+    }
+
     appLogger.error('Error requesting profile email verification', error);
     return NextResponse.json(
       { error: 'Failed to send verification email' },

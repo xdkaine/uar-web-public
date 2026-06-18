@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { prisma } from '@/lib/prisma';
 import { sendFacultyNotification } from '@/lib/email';
-import { logAuditAction } from '@/lib/audit-log';
+import { getIpAddress, logAuditAction } from '@/lib/audit-log';
 import { appLogger } from '@/lib/logger';
 
 /**
@@ -125,7 +125,7 @@ export async function POST(
         requestName: accessRequest.name,
         hasCustomMessage: !!customMessage,
       },
-      ipAddress: request.headers.get('x-forwarded-for') || 'unknown',
+      ipAddress: getIpAddress(request) || 'unknown',
       success: true,
     });
 

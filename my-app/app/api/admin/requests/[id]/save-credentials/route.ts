@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
-import { searchLDAPUser } from '@/lib/ldap';
+import { searchLDAPUserForProvisioning } from '@/lib/ldap';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { encryptPassword } from '@/lib/encryption';
 
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { findReusableOffboardedRequest } from '@/lib/offboard-reenrollment';
+
+type ReusableOffboardedRequest = { id: string } | null;
 
 // Retry configuration for handling unique constraint violations
 const MAX_RETRIES = 3;
@@ -66,8 +70,10 @@ export async function POST(
 
     // Only check Active Directory if the account hasn't been created yet
     // If accountCreatedAt is set, we're updating an existing account (e.g., after moving back)
+    let reusableAdRequest: ReusableOffboardedRequest = null;
+    let reusableVpnRequest: ReusableOffboardedRequest = null;
     if (!accessRequest.accountCreatedAt) {
-      // Pre-check: Ensure username isn't in use by another active request (excluding rejected)
+      // Pre-check: Ensure username isn't in use by another active request.
       const usernameConflict = await prisma.accessRequest.findFirst({
         where: {
           OR: [
@@ -75,7 +81,7 @@ export async function POST(
             ...(!accessRequest.isInternal && vpnUsername ? [{ vpnUsername }] : []),
           ],
           id: { not: resolvedParams.id },
-          status: { notIn: ['rejected'] }, // Exclude rejected requests
+          status: { notIn: ['rejected', 'offboarded'] },
         },
         select: { id: true, ldapUsername: true, vpnUsername: true, status: true },
       });
@@ -92,13 +98,20 @@ export async function POST(
 
       // Check if LDAP username already exists in Active Directory
       try {
-        const ldapUser = await searchLDAPUser(ldapUsername);
+        const ldapUser = await searchLDAPUserForProvisioning(ldapUsername);
         
         if (ldapUser) {
-          return NextResponse.json(
-            { error: `LDAP username "${ldapUsername}" already exists in Active Directory` },
-            { status: 400 }
-          );
+          reusableAdRequest = await findReusableOffboardedRequest({
+            username: ldapUsername,
+            email: accessRequest.email,
+          });
+
+          if (!reusableAdRequest) {
+            return NextResponse.json(
+              { error: `LDAP username "${ldapUsername}" already exists in Active Directory` },
+              { status: 400 }
+            );
+          }
         }
       } catch (ldapError) {
         console.error('LDAP search error during credential save:', ldapError);
@@ -111,13 +124,20 @@ export async function POST(
       // Check if VPN username already exists in Active Directory (for external users)
       if (!accessRequest.isInternal && vpnUsername) {
         try {
-          const vpnUser = await searchLDAPUser(vpnUsername);
+          const vpnUser = await searchLDAPUserForProvisioning(vpnUsername);
           
           if (vpnUser) {
-            return NextResponse.json(
-              { error: `VPN username "${vpnUsername}" already exists in Active Directory` },
-              { status: 400 }
-            );
+            reusableVpnRequest = await findReusableOffboardedRequest({
+              username: vpnUsername,
+              email: accessRequest.email,
+            });
+
+            if (!reusableVpnRequest) {
+              return NextResponse.json(
+                { error: `VPN username "${vpnUsername}" already exists in Active Directory` },
+                { status: 400 }
+              );
+            }
           }
         } catch (ldapError) {
           console.error('LDAP search error for VPN username:', ldapError);
@@ -135,8 +155,10 @@ export async function POST(
 
     while (retryCount < MAX_RETRIES) {
       try {
+        const reusableRequest = reusableAdRequest || reusableVpnRequest;
+
         // Use a transaction to ensure atomicity and leverage database-level unique constraints
-        const result = await prisma.$transaction(async (tx: any) => {
+        const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
           // Re-fetch the request within transaction to get latest state
           const currentRequest = await tx.accessRequest.findUnique({
             where: { id: resolvedParams.id },
@@ -163,12 +185,27 @@ export async function POST(
             accountPassword: string;
             vpnUsername?: string | null;
             accountExpiresAt?: Date | null;
+            linkedAdUsername?: string | null;
+            linkedVpnUsername?: string | null;
+            isManuallyAssigned?: boolean;
+            manuallyAssignedAt?: Date;
+            manuallyAssignedBy?: string;
+            manualAssignmentNotes?: string | null;
             version: { increment: number };
           } = {
             ldapUsername,
             accountPassword: encryptPassword(password),
             version: { increment: 1 }, // Increment version for optimistic locking
           };
+
+          if (reusableRequest) {
+            updateData.linkedAdUsername = ldapUsername;
+            updateData.linkedVpnUsername = vpnUsername || ldapUsername;
+            updateData.isManuallyAssigned = true;
+            updateData.manuallyAssignedAt = new Date();
+            updateData.manuallyAssignedBy = admin.username;
+            updateData.manualAssignmentNotes = `Prepared for reactivation from campaign-offboarded request ${reusableRequest.id}`;
+          }
 
           // Only set VPN username for external users
           if (!accessRequest.isInternal) {
@@ -215,6 +252,9 @@ export async function POST(
           }
           // Always note if password was updated (don't show actual passwords)
           changes.push('Password was updated');
+          if (reusableRequest) {
+            changes.push(`Prepared for reactivation from campaign-offboarded request ${reusableRequest.id}`);
+          }
 
           // Create a comment if credentials were changed
           if (changes.length > 0) {

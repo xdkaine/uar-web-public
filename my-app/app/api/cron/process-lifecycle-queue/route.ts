@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { processAllQueuedActions } from '@/lib/lifecycle-processor';
+import { processMassEmailCampaigns } from '@/lib/mass-email';
 import { appLogger } from '@/lib/logger';
+import { runGuardedOffboardScheduler } from '@/lib/offboard-scheduler';
 
 /**
  * GET /api/cron/process-lifecycle-queue
@@ -26,12 +28,16 @@ export async function GET(request: NextRequest) {
 
     appLogger.info('Starting lifecycle queue processing via cron');
 
+    const offboardScheduler = await runGuardedOffboardScheduler();
+    const massEmailResults = await processMassEmailCampaigns({ actor: 'cron' });
     const results = await processAllQueuedActions();
 
     const summary = {
       total: results.length,
       successful: results.filter(r => r.success).length,
       failed: results.filter(r => !r.success).length,
+      offboardSchedulerStatus: offboardScheduler.status,
+      massEmailCampaigns: massEmailResults.length,
       timestamp: new Date().toISOString(),
     };
 
@@ -41,6 +47,8 @@ export async function GET(request: NextRequest) {
       success: true,
       message: `Processed ${results.length} lifecycle actions`,
       summary,
+      offboardScheduler,
+      massEmailResults,
       results: results.slice(0, 10), // Return first 10 for reference
     });
   } catch (error) {

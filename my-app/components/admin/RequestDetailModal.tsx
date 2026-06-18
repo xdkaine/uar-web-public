@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
+import type { ReactNode } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -25,6 +26,7 @@ interface RequestDetail {
 
   // Internal fields
   ldapUsername?: string;
+  vpnUsername?: string;
   accountPassword?: string;
   accountCreatedAt?: string;
   accountExpiresAt?: string;
@@ -74,13 +76,9 @@ export default function RequestDetailModal({ requestId, onClose }: RequestDetail
   const { showToast } = useToast();
   const [request, setRequest] = useState<RequestDetail | null>(null);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<'overview' | 'timeline' | 'technical'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'technical'>('overview');
 
-  useEffect(() => {
-    fetchRequestDetails();
-  }, [requestId]);
-
-  const fetchRequestDetails = async () => {
+  const fetchRequestDetails = useCallback(async () => {
     try {
       setLoading(true);
       const res = await fetch(`/api/admin/requests/${requestId}`);
@@ -99,7 +97,11 @@ export default function RequestDetailModal({ requestId, onClose }: RequestDetail
     } finally {
       setLoading(false);
     }
-  };
+  }, [requestId, showToast]);
+
+  useEffect(() => {
+    fetchRequestDetails();
+  }, [fetchRequestDetails]);
 
   const getStatusColor = (status: string) => {
     const colors: Record<string, string> = {
@@ -108,6 +110,7 @@ export default function RequestDetailModal({ requestId, onClose }: RequestDetail
       pending_faculty: 'bg-yellow-100 text-yellow-800 border-yellow-300',
       approved: 'bg-green-100 text-green-800 border-green-300',
       rejected: 'bg-red-100 text-red-800 border-red-300',
+      offboarded: 'bg-slate-100 text-slate-800 border-slate-300',
     };
     return colors[status] || 'bg-gray-100 text-gray-800 border-gray-300';
   };
@@ -124,10 +127,10 @@ export default function RequestDetailModal({ requestId, onClose }: RequestDetail
     });
   };
 
-  const InfoRow = ({ label, value, highlight = false }: { label: string; value: any; highlight?: boolean }) => (
+  const InfoRow = ({ label, value, highlight = false }: { label: string; value?: ReactNode; highlight?: boolean }) => (
     <div className="flex py-3 border-b border-gray-200 last:border-b-0">
-      <dt className="w-1/3 font-semibold text-gray-700 break-words">{label}</dt>
-      <dd className={`w-2/3 ${highlight ? 'font-bold text-gray-900' : 'text-gray-900'} break-words`}>
+      <dt className="w-1/3 font-semibold text-gray-700 break-all">{label}</dt>
+      <dd className={`w-2/3 ${highlight ? 'font-bold text-gray-900' : 'text-gray-900'} break-all`}>
         {value || 'N/A'}
       </dd>
     </div>
@@ -170,7 +173,7 @@ export default function RequestDetailModal({ requestId, onClose }: RequestDetail
           <DialogTitle>Request Details</DialogTitle>
         </DialogHeader>
         <div className="space-y-6">
-          <div className="bg-gradient-to-r from-blue-50 to-indigo-50 p-6 rounded-lg border-2 border-blue-200">
+          <div className="bg-blue-50 p-6 rounded-lg border-2 border-blue-200">
             <div className="flex items-start justify-between mb-4">
               <div>
                 <h3 className="text-2xl font-bold text-gray-900 mb-2">{request.name}</h3>
@@ -215,15 +218,6 @@ export default function RequestDetailModal({ requestId, onClose }: RequestDetail
                   }`}
               >
                 Overview
-              </button>
-              <button
-                onClick={() => setActiveTab('timeline')}
-                className={`px-4 py-2 font-semibold border-b-2 transition-colors ${activeTab === 'timeline'
-                  ? 'border-blue-600 text-blue-600'
-                  : 'border-transparent text-gray-600 hover:text-gray-900'
-                  }`}
-              >
-                Timeline
               </button>
               <button
                 onClick={() => setActiveTab('technical')}
@@ -360,96 +354,6 @@ export default function RequestDetailModal({ requestId, onClose }: RequestDetail
               </div>
             )}
 
-            {activeTab === 'timeline' && (
-              <div className="space-y-4">
-                <div className="relative border-l-4 border-blue-500 pl-8 pb-8">
-                  <div className="absolute w-4 h-4 bg-blue-500 rounded-full -left-2 top-0"></div>
-                  <div className="bg-white border-2 border-gray-200 rounded-lg p-4">
-                    <h5 className="font-bold text-gray-900 mb-1">Request Created</h5>
-                    <p className="text-sm text-gray-600">{formatDate(request.createdAt)}</p>
-                  </div>
-                </div>
-
-                {request.verifiedAt && (
-                  <div className="relative border-l-4 border-green-500 pl-8 pb-8">
-                    <div className="absolute w-4 h-4 bg-green-500 rounded-full -left-2 top-0"></div>
-                    <div className="bg-white border-2 border-gray-200 rounded-lg p-4">
-                      <h5 className="font-bold text-gray-900 mb-1">Email Verified</h5>
-                      <p className="text-sm text-gray-600">{formatDate(request.verifiedAt)}</p>
-                    </div>
-                  </div>
-                )}
-
-                {request.emailSentAt && (
-                  <div className="relative border-l-4 border-purple-500 pl-8 pb-8">
-                    <div className="absolute w-4 h-4 bg-purple-500 rounded-full -left-2 top-0"></div>
-                    <div className="bg-white border-2 border-gray-200 rounded-lg p-4">
-                      <h5 className="font-bold text-gray-900 mb-1">Notification Email Sent</h5>
-                      <p className="text-sm text-gray-600">{formatDate(request.emailSentAt)}</p>
-                    </div>
-                  </div>
-                )}
-
-                {request.studentDirectorApprovedAt && (
-                  <div className="relative border-l-4 border-yellow-500 pl-8 pb-8">
-                    <div className="absolute w-4 h-4 bg-yellow-500 rounded-full -left-2 top-0"></div>
-                    <div className="bg-white border-2 border-gray-200 rounded-lg p-4">
-                      <h5 className="font-bold text-gray-900 mb-1">Student Director Approved</h5>
-                      <p className="text-sm text-gray-600">{formatDate(request.studentDirectorApprovedAt)}</p>
-                      <p className="text-sm text-gray-700 mt-1">By: {request.studentDirectorApproval}</p>
-                    </div>
-                  </div>
-                )}
-
-                {request.facultyApprovedAt && (
-                  <div className="relative border-l-4 border-indigo-500 pl-8 pb-8">
-                    <div className="absolute w-4 h-4 bg-indigo-500 rounded-full -left-2 top-0"></div>
-                    <div className="bg-white border-2 border-gray-200 rounded-lg p-4">
-                      <h5 className="font-bold text-gray-900 mb-1">Faculty Approved</h5>
-                      <p className="text-sm text-gray-600">{formatDate(request.facultyApprovedAt)}</p>
-                      <p className="text-sm text-gray-700 mt-1">By: {request.facultyApproval}</p>
-                    </div>
-                  </div>
-                )}
-
-                {request.accountCreatedAt && (
-                  <div className="relative border-l-4 border-cyan-500 pl-8 pb-8">
-                    <div className="absolute w-4 h-4 bg-cyan-500 rounded-full -left-2 top-0"></div>
-                    <div className="bg-white border-2 border-gray-200 rounded-lg p-4">
-                      <h5 className="font-bold text-gray-900 mb-1">Account Created</h5>
-                      <p className="text-sm text-gray-600">{formatDate(request.accountCreatedAt)}</p>
-                      {request.ldapUsername && (
-                        <p className="text-sm text-gray-700 mt-1">Username: {request.ldapUsername}</p>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {request.approvedAt && (
-                  <div className="relative border-l-4 border-green-600 pl-8 pb-8">
-                    <div className="absolute w-4 h-4 bg-green-600 rounded-full -left-2 top-0"></div>
-                    <div className="bg-white border-2 border-gray-200 rounded-lg p-4">
-                      <h5 className="font-bold text-gray-900 mb-1">Request Approved</h5>
-                      <p className="text-sm text-gray-600">{formatDate(request.approvedAt)}</p>
-                    </div>
-                  </div>
-                )}
-
-                {request.rejectedAt && (
-                  <div className="relative border-l-4 border-red-600 pl-8 pb-8">
-                    <div className="absolute w-4 h-4 bg-red-600 rounded-full -left-2 top-0"></div>
-                    <div className="bg-white border-2 border-gray-200 rounded-lg p-4">
-                      <h5 className="font-bold text-gray-900 mb-1">Request Rejected</h5>
-                      <p className="text-sm text-gray-600">{formatDate(request.rejectedAt)}</p>
-                      {request.rejectionReason && (
-                        <p className="text-sm text-red-700 mt-2 whitespace-pre-wrap">{request.rejectionReason}</p>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
             {activeTab === 'technical' && (
               <div className="space-y-6">
                 <div className="bg-white border-2 border-gray-200 rounded-lg p-6">
@@ -474,7 +378,7 @@ export default function RequestDetailModal({ requestId, onClose }: RequestDetail
                         <InfoRow label="Completed At" value={formatDate(request.provisioningCompletedAt)} />
                       )}
                       {request.provisioningError && (
-                        <InfoRow label="Error" value={<span className="text-red-600 text-sm break-words">{request.provisioningError}</span>} />
+                        <InfoRow label="Error" value={<span className="text-red-600 text-sm break-all">{request.provisioningError}</span>} />
                       )}
                     </dl>
                   </div>

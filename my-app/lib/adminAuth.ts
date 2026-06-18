@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { isUserDomainAdmin } from '@/lib/ldap';
-import { checkRateLimitAsync, getClientIp, RateLimitPresets } from '@/lib/ratelimit';
+import { checkRateLimitAsync, getClientIp, isRateLimitUnavailable, RateLimitPresets } from '@/lib/ratelimit';
 import { getSessionFromCookies, revokeSessionById, clearSession } from '@/lib/session';
 import { logAuditAction, AuditActions, categorizeRequest, getIpAddress, getUserAgent } from '@/lib/audit-log';
 
@@ -13,12 +13,28 @@ export async function checkAdminAuthWithRateLimit(
 ): Promise<{ admin: AdminAuthResult | null; response?: NextResponse }> {
   const clientIp = getClientIp(request);
   const session = await getSessionFromCookies();
+  const rateLimitKey = session?.id ? 'admin-session' : clientIp;
   const identifier = session?.id || undefined;
 
-  const rateLimitResult = await checkRateLimitAsync(clientIp, {
-    ...RateLimitPresets.adminOperations,
-    identifier,
-  });
+  let rateLimitResult;
+  try {
+    rateLimitResult = await checkRateLimitAsync(rateLimitKey, {
+      ...RateLimitPresets.adminOperations,
+      identifier,
+    });
+  } catch (error) {
+    if (isRateLimitUnavailable(error)) {
+      return {
+        admin: null,
+        response: NextResponse.json(
+          { error: 'Rate limit service is temporarily unavailable' },
+          { status: 503 }
+        ),
+      };
+    }
+
+    throw error;
+  }
   
   if (!rateLimitResult.success) {
     return {

@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
-import { logAuditAction } from '@/lib/audit-log';
+import { getIpAddress, logAuditAction } from '@/lib/audit-log';
 import { encryptPassword } from '@/lib/encryption';
 import { generateStrongPassword } from '@/lib/password';
 import { appLogger } from '@/lib/logger';
+import { isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit } from '@/lib/validation';
 
 /**
  * Process a VPN import by creating VPN accounts for all matched records
@@ -24,14 +25,14 @@ export async function POST(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const body = await request.json();
+    const body = await parseJsonWithLimit<{ importId?: unknown }>(request, MAX_REQUEST_BODY_SIZE.SMALL);
     const { importId: reqImportId } = body;
 
-    if (!reqImportId) {
+    if (typeof reqImportId !== 'string' || !reqImportId.trim()) {
       return NextResponse.json({ error: 'Import ID is required' }, { status: 400 });
     }
 
-    importId = reqImportId;
+    importId = reqImportId.trim();
 
     // Fetch the import with all matched records
     const vpnImport = await prisma.vPNImport.findUnique({
@@ -115,6 +116,7 @@ export async function POST(request: NextRequest) {
                 { vpnUsername: record.vpnUsername },
                 { linkedAdUsername: record.adUsername },
               ],
+              status: { notIn: ['rejected', 'offboarded'] },
             },
           });
 
@@ -317,7 +319,7 @@ export async function POST(request: NextRequest) {
         errors: result.errors,
         duration: `${duration}ms`,
       },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
+      ipAddress: getIpAddress(request) || 'unknown',
       success: result.errorCount === 0,
     });
 
@@ -371,6 +373,10 @@ export async function POST(request: NextRequest) {
       },
     });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
     const duration = Date.now() - startTime;
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     
@@ -392,7 +398,7 @@ export async function POST(request: NextRequest) {
         error: errorMessage,
         duration: `${duration}ms`,
       },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
+      ipAddress: getIpAddress(request) || 'unknown',
       success: false,
       errorMessage,
     });

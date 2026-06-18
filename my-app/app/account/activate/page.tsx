@@ -4,6 +4,13 @@ import { useState, useEffect, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
+import {
+  PASSWORD_ALLOWED_SPECIAL_CHARS,
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_MIN_LENGTH,
+  isPasswordCharacterAllowed,
+  validatePasswordPolicy,
+} from '@/lib/password-policy';
 
 function ActivateAccountForm() {
   const searchParams = useSearchParams();
@@ -26,6 +33,8 @@ function ActivateAccountForm() {
     lowercase: false,
     number: false,
     special: false,
+    supportedChars: false,
+    noUsername: false,
   });
 
   useEffect(() => {
@@ -39,17 +48,26 @@ function ActivateAccountForm() {
   }, [token, router]);
 
   useEffect(() => {
+    const passwordPolicy = validatePasswordPolicy(password, {
+      username: username.trim(),
+    });
+    const hasIdentityFragment = passwordPolicy.issues.some((issue) =>
+      issue.includes('username, email prefix, or name')
+    );
+
     setPasswordRequirements({
-      length: password.length >= 12,
+      length: password.length >= PASSWORD_MIN_LENGTH && password.length <= PASSWORD_MAX_LENGTH,
       uppercase: /[A-Z]/.test(password),
       lowercase: /[a-z]/.test(password),
       number: /[0-9]/.test(password),
-      special: /[!@#$%^&*(),.?":{}|<>]/.test(password),
+      special: [...password].some((char) => PASSWORD_ALLOWED_SPECIAL_CHARS.includes(char)),
+      supportedChars: password.length > 0 && [...password].every(isPasswordCharacterAllowed),
+      noUsername: password.length > 0 && !hasIdentityFragment,
     });
-  }, [password]);
+  }, [password, username]);
 
   const isPasswordValid = () => {
-    return Object.values(passwordRequirements).every((req) => req);
+    return validatePasswordPolicy(password, { username: username.trim() }).isValid;
   };
 
   const isFormValid = () => {
@@ -65,8 +83,16 @@ function ActivateAccountForm() {
     setError('');
     setIssues([]);
 
+    const passwordValidation = validatePasswordPolicy(password, {
+      username: username.trim(),
+    });
+
     if (!isFormValid()) {
       setError('Please ensure all requirements are met');
+      setIssues([
+        ...passwordValidation.issues,
+        ...(password !== confirmPassword ? ['Passwords do not match'] : []),
+      ]);
       return;
     }
 
@@ -80,7 +106,7 @@ function ActivateAccountForm() {
         },
         body: JSON.stringify({
           token,
-          username,
+          username: username.trim(),
           newPassword: password,
         }),
       });
@@ -336,7 +362,7 @@ function ActivateAccountForm() {
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={passwordRequirements.length ? 'M5 13l4 4L19 7' : 'M6 18L18 6M6 6l12 12'} />
                   </svg>
-                  At least 12 characters
+                  {PASSWORD_MIN_LENGTH}-{PASSWORD_MAX_LENGTH} characters
                 </li>
                 <li className={`flex items-center gap-2 ${passwordRequirements.uppercase ? 'text-green-600' : 'text-gray-600'}`}>
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -360,7 +386,19 @@ function ActivateAccountForm() {
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={passwordRequirements.special ? 'M5 13l4 4L19 7' : 'M6 18L18 6M6 6l12 12'} />
                   </svg>
-                  At least one special character (!@#$%^&*...)
+                  At least one allowed special character ({PASSWORD_ALLOWED_SPECIAL_CHARS})
+                </li>
+                <li className={`flex items-center gap-2 ${passwordRequirements.supportedChars ? 'text-green-600' : 'text-gray-600'}`}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={passwordRequirements.supportedChars ? 'M5 13l4 4L19 7' : 'M6 18L18 6M6 6l12 12'} />
+                  </svg>
+                  Only letters, numbers, and allowed special characters
+                </li>
+                <li className={`flex items-center gap-2 ${passwordRequirements.noUsername ? 'text-green-600' : 'text-gray-600'}`}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={passwordRequirements.noUsername ? 'M5 13l4 4L19 7' : 'M6 18L18 6M6 6l12 12'} />
+                  </svg>
+                  Does not contain your username
                 </li>
               </ul>
             </div>

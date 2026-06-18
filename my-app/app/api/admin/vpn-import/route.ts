@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
-import { logAuditAction } from '@/lib/audit-log';
+import { getIpAddress, logAuditAction } from '@/lib/audit-log';
 import { sanitizeCsvImport } from '@/lib/csv-security';
 
 export async function POST(request: NextRequest) {
@@ -97,7 +97,7 @@ export async function POST(request: NextRequest) {
         columnMapping,
         duration: `${duration}ms`,
       },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
+      ipAddress: getIpAddress(request) || 'unknown',
       success: true,
     });
 
@@ -130,7 +130,7 @@ export async function POST(request: NextRequest) {
         error: errorMessage,
         duration: `${duration}ms`,
       },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
+      ipAddress: getIpAddress(request) || 'unknown',
       success: false,
       errorMessage,
     });

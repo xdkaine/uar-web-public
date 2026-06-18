@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
@@ -130,12 +131,12 @@ export async function POST(
       }
     }
 
-    // Rejected requests do not reserve usernames.
+    // Rejected and campaign-offboarded requests do not reserve usernames.
     const existingRequestWithUsername = await prisma.accessRequest.findFirst({
       where: {
         ldapUsername: linkedAdUsername.trim(),
         id: { not: resolvedParams.id },
-        status: { notIn: ['rejected'] },
+        status: { notIn: ['rejected', 'offboarded'] },
       },
       select: { id: true, name: true, email: true, status: true },
     });
@@ -155,7 +156,7 @@ export async function POST(
         where: {
           vpnUsername: vpnUsernameToCheck,
           id: { not: resolvedParams.id },
-          status: { notIn: ['rejected'] },
+          status: { notIn: ['rejected', 'offboarded'] },
         },
         select: { id: true, name: true, email: true, status: true },
       });
@@ -173,10 +174,10 @@ export async function POST(
     let updatedRequest;
     
     try {
-      const result = await prisma.$transaction(async (tx: any) => {
+      const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         console.log(`[Manual Assignment] Starting transaction for request ${resolvedParams.id}`);
         
-        const updateData: any = {
+        const updateData: Prisma.AccessRequestUpdateManyMutationInput = {
           isManuallyAssigned: true,
           manuallyAssignedAt: new Date(),
           manuallyAssignedBy: admin.username,
@@ -391,11 +392,17 @@ export async function POST(
       console.error('[Manual Assignment] Transaction ROLLED BACK due to error:', transactionError);
 
       await logAuditAction({
-        action: AuditActions.APPROVE_REQUEST,
+        action: AuditActions.MANUAL_ASSIGN_REQUEST,
         category: AuditCategories.ACCESS_REQUEST,
         username: admin.username,
+        actorType: 'admin',
         targetId: resolvedParams.id,
         targetType: 'AccessRequest',
+        subjectUsername: linkedAdUsername.trim(),
+        subjectEmail: accessRequest.email,
+        relatedRequestId: resolvedParams.id,
+        eventKind: 'write',
+        outcome: 'rollback',
         details: {
           manuallyAssigned: true,
           failed: true,
@@ -414,11 +421,17 @@ export async function POST(
 
     console.log(`[Manual Assignment] Logging successful assignment to audit log`);
     await logAuditAction({
-      action: AuditActions.APPROVE_REQUEST,
+      action: AuditActions.MANUAL_ASSIGN_REQUEST,
       category: AuditCategories.ACCESS_REQUEST,
       username: admin.username,
+      actorType: 'admin',
       targetId: resolvedParams.id,
       targetType: 'AccessRequest',
+      subjectUsername: linkedAdUsername.trim(),
+      subjectEmail: updatedRequest.email,
+      relatedRequestId: resolvedParams.id,
+      eventKind: 'write',
+      outcome: 'success',
       details: {
         requestName: updatedRequest.name,
         requestEmail: updatedRequest.email,

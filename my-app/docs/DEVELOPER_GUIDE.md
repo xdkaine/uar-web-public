@@ -2,7 +2,7 @@
 
 This guide provides an in-depth look at the UAR Portal's architecture, database schema, and key implementation details. It is intended for developers who need to understand the inner workings of the system.
 
-## Database Schema (Prisma)
+## 🗄️ Database Schema (Prisma)
 
 The application uses **PostgreSQL** with **Prisma ORM**. The connection requires SSL (`sslmode=require`) to ensure secure communication with the database. Below is a detailed breakdown of the core models.
 
@@ -47,7 +47,7 @@ Tracks asynchronous operations like disabling/enabling accounts.
 
 ---
 
-## LDAP Integration (`lib/ldap.ts`)
+## 🔐 LDAP Integration (`lib/ldap.ts`)
 
 The application interacts with Active Directory using the `ldapts` library.
 
@@ -66,6 +66,7 @@ The application interacts with Active Directory using the `ldapts` library.
 3.  **Account Creation**:
     *   Creates user in the specified `LDAP_USER_BASE`.
     *   Sets `userAccountControl` to `514` (Disabled) initially, then enables it.
+    *   Enabled accounts use `userAccountControl` `512`, allowing the Active Directory domain password-expiration policy to apply.
     *   Adds user to the default group (`LDAP_GROUP2ADD`).
 4.  **Password Management**:
     *   Uses `unicodePwd` attribute (requires active SSL connection).
@@ -78,7 +79,7 @@ The application interacts with Active Directory using the `ldapts` library.
 
 ---
 
-## Email System (`lib/email.ts`)
+## 📧 Email System (`lib/email.ts`)
 
 Emails are sent using `nodemailer` with SMTP.
 
@@ -95,7 +96,7 @@ Emails are sent using `nodemailer` with SMTP.
 
 ---
 
-## Frontend Architecture
+## 🖥️ Frontend Architecture
 
 ### Admin Dashboard Pattern
 The admin dashboard (`/admin`) is built using a **Tab Pattern**.
@@ -114,7 +115,7 @@ The admin dashboard (`/admin`) is built using a **Tab Pattern**.
 
 ---
 
-## Backend Architecture
+## ⚙️ Backend Architecture
 
 ### API Route Structure
 *   **Standardized Responses**: JSON responses with consistent error formats.

@@ -12,9 +12,13 @@ import VPNManagementTab from '@/components/admin/VPNManagementTab';
 import SystemSettingsTab from '@/components/admin/SystemSettingsTab';
 import LogsTab from '@/components/admin/LogsTab';
 import SessionManagementTab from '@/components/admin/SessionManagementTab';
+import RateLimitManagementTab from '@/components/admin/RateLimitManagementTab';
+import PasswordExpirationTab from '@/components/admin/PasswordExpirationTab';
 import AccountLifecycleTab from '@/components/admin/AccountLifecycleTab';
 import AccountSyncStatusTab from '@/components/admin/AccountSyncStatusTab';
+import ActionHistoryMonitoringTab from '@/components/admin/ActionHistoryMonitoringTab';
 import CommunicationsTab from '@/components/admin/CommunicationsTab';
+import OffboardCampaignsPanel from '@/components/admin/OffboardCampaignsPanel';
 import { useAdminPageTracking } from '@/hooks/useAdminPageTracking';
 import {
   DropdownMenu,
@@ -27,35 +31,8 @@ import { Button } from "@/components/ui/button";
 import {
   Search, Settings, Users, Shield, Activity, RefreshCw,
   Ban, Monitor, FileText, Ticket, Package, Calendar,
-  ChevronDown, Menu, ClipboardList, LifeBuoy, Layers
+  ChevronDown, Menu, ClipboardList, LifeBuoy, ShieldAlert, Gauge, KeyRound
 } from "lucide-react";
-
-interface AccessRequest {
-  id: string;
-  createdAt: string;
-  name: string;
-  email: string;
-  isInternal: boolean;
-  needsDomainAccount: boolean;
-  institution?: string;
-  eventReason?: string;
-  eventId?: string;
-  event?: { id: string; name: string; };
-  accountExpiresAt?: string;
-  isVerified: boolean;
-  status: string;
-  verifiedAt?: string;
-}
-
-interface Event {
-  id: string;
-  name: string;
-  description?: string;
-  isActive: boolean;
-  createdAt: string;
-  updatedAt: string;
-  _count: { accessRequests: number; };
-}
 
 interface LDAPUser {
   dn: string;
@@ -67,6 +44,9 @@ interface LDAPUser {
   accountExpires: string | null;
   whenCreated: string;
   memberOf: string[];
+  lastVerifiedAt?: string | null;
+  lastVerifiedSource?: string | null;
+  originalRegistrationAt?: string | null;
 }
 
 interface TicketResponse {
@@ -130,68 +110,55 @@ interface BatchCreation {
   };
 }
 
-interface VPNAccount {
-  id: string;
-  username: string;
-  name: string;
-  email: string;
-  portalType: string;
-  isInternal: boolean;
-  status: string;
-  expiresAt?: string;
-  createdAt: string;
-  createdBy: string;
-  createdByFaculty: boolean;
-  facultyCreatedAt?: string;
-  disabledAt?: string;
-  disabledBy?: string;
-  disabledReason?: string;
-  notes?: string;
-  adUsername?: string; // Linked AD account username
-}
+type AdminTab =
+  | 'requests'
+  | 'events'
+  | 'users'
+  | 'support'
+  | 'batch'
+  | 'vpn'
+  | 'blocklist'
+  | 'settings'
+  | 'logs'
+  | 'action-history'
+  | 'sessions'
+  | 'password-expiration'
+  | 'ratelimits'
+  | 'lifecycle'
+  | 'sync-status'
+  | 'communications'
+  | 'offboard-campaigns';
 
-interface SyncStatusAccount {
-  identifier: string;
-  name: string;
-  email: string;
-  hasAdAccount: boolean;
-  adUsername: string | null;
-  adDisplayName: string | null;
-  adEmail: string | null;
-  adSyncDate: string | null;
-  hasVpnAccount: boolean;
-  vpnUsername: string | null;
-  vpnPortalType: string | null;
-  vpnStatus: string | null;
-  vpnCreatedAt: string | null;
-  hasAccessRequest: boolean;
-  requestId: string | null;
-  requestStatus: string | null;
-  requestCreatedAt: string | null;
-  isManuallyAssigned: boolean;
-  syncStatus: 'fully_synced' | 'partial_sync' | 'ad_only' | 'vpn_only' | 'request_only' | 'orphaned';
-  syncIssues: string[];
-  lastSyncId: string | null;
-  wasAutoAssigned: boolean;
+const adminTabs: AdminTab[] = [
+  'requests',
+  'events',
+  'users',
+  'support',
+  'batch',
+  'vpn',
+  'blocklist',
+  'settings',
+  'logs',
+  'action-history',
+  'sessions',
+  'password-expiration',
+  'ratelimits',
+  'lifecycle',
+  'sync-status',
+  'communications',
+  'offboard-campaigns',
+];
+
+function isAdminTab(tab: string | null): tab is AdminTab {
+  return tab !== null && adminTabs.includes(tab as AdminTab);
 }
 
 export default function AdminDashboard() {
-  const [requests, setRequests] = useState<AccessRequest[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<'requests' | 'events' | 'users' | 'support' | 'batch' | 'vpn' | 'blocklist' | 'settings' | 'logs' | 'sessions' | 'lifecycle' | 'sync-status' | 'communications'>('requests');
-  const [events, setEvents] = useState<Event[]>([]);
-  const [eventsLoading, setEventsLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState<AdminTab>('requests');
   const [users, setUsers] = useState<LDAPUser[]>([]);
   const [usersLoading, setUsersLoading] = useState(true);
   const [supportTickets, setSupportTickets] = useState<SupportTicket[]>([]);
-  const [supportTicketsLoading, setSupportTicketsLoading] = useState(true);
   const [batches, setBatches] = useState<BatchCreation[]>([]);
-  const [, setBatchesLoading] = useState(false);
-  const [vpnAccounts, setVpnAccounts] = useState<VPNAccount[]>([]);
-  const [vpnAccountsLoading, setVpnAccountsLoading] = useState(true);
-  const [syncStatusAccounts, setSyncStatusAccounts] = useState<SyncStatusAccount[]>([]);
-  const [syncStatusLoading, setSyncStatusLoading] = useState(false);
-  const [latestSync, setLatestSync] = useState<any>(null);
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -201,8 +168,8 @@ export default function AdminDashboard() {
 
   useEffect(() => {
     const tab = searchParams.get('tab');
-    if (tab && ['requests', 'events', 'users', 'support', 'batch', 'vpn', 'blocklist', 'settings', 'logs', 'sessions', 'lifecycle', 'sync-status', 'communications'].includes(tab)) {
-      setActiveTab(tab as any);
+    if (isAdminTab(tab)) {
+      setActiveTab(tab);
     }
   }, [searchParams]);
 
@@ -219,180 +186,17 @@ export default function AdminDashboard() {
       settings: 'settings',
       logs: 'logs',
       sessions: 'session',
+      'password-expiration': 'user',
+      ratelimits: 'rate_limit',
       lifecycle: 'lifecycle',
       'sync-status': 'sync_status',
       communications: 'communications',
+      'offboard-campaigns': 'offboard_campaign',
     };
     return categoryMap[tab] || 'navigation';
   };
 
   useAdminPageTracking(`Admin Dashboard - ${activeTab}`, getCategoryForTab(activeTab));
-
-  useEffect(() => {
-    const fetchRequests = async () => {
-      try {
-        const response = await fetch('/api/admin/requests');
-        if (response.status === 401 || response.status === 403) {
-          router.push('`/login?redirect=`' + encodeURIComponent('/admin'));
-          return;
-        }
-        if (!response.ok) throw new Error('Failed to fetch requests');
-        const data = await response.json();
-        setRequests(data.requests);
-      } catch (error) {
-        console.error('Error fetching requests:', error);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-
-    const fetchEvents = async () => {
-      try {
-        const response = await fetch('/api/admin/events');
-        if (response.status === 401 || response.status === 403) {
-          router.push('`/login?redirect=`' + encodeURIComponent('/admin'));
-          return;
-        }
-        if (!response.ok) throw new Error('Failed to fetch events');
-        const data = await response.json();
-        setEvents(data.events);
-      } catch (error) {
-        console.error('Error fetching events:', error);
-      } finally {
-        setEventsLoading(false);
-      }
-    };
-
-    const fetchUsers = async () => {
-      try {
-        const response = await fetch('/api/admin/users');
-        if (response.status === 401 || response.status === 403) {
-          router.push('`/login?redirect=`' + encodeURIComponent('/admin'));
-          return;
-        }
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
-          const errorMsg = errorData.details || errorData.error || 'Unknown error';
-
-          // Handle LDAP sizing limit exceeded error
-          if (errorMsg.includes('0x4') || errorMsg.includes('0x2c')) {
-            console.warn('LDAP query size limit exceeded. Some users may not be displayed.');
-            // Set empty array instead of throwing - the tab will show "no users" message
-            setUsers([]);
-            return;
-          }
-
-          throw new Error('Failed to fetch users: ' + errorMsg);
-        }
-        const data = await response.json();
-        setUsers(data.users || []);
-      } catch (error) {
-        console.error('Error fetching users:', error);
-        // Don't show alert for known LDAP limit errors
-        if (error instanceof Error && !error.message.includes('0x')) {
-          console.error('Unexpected error loading users:', error.message);
-        }
-      } finally {
-        setUsersLoading(false);
-      }
-    };
-
-    const fetchSupportTickets = async () => {
-      try {
-        const response = await fetch('/api/admin/support/tickets');
-        if (response.status === 401 || response.status === 403) {
-          router.push('/login?redirect=' + encodeURIComponent('/admin'));
-          return;
-        }
-        if (!response.ok) throw new Error('Failed to fetch support tickets');
-        const data = await response.json();
-        setSupportTickets(data.tickets || []);
-      } catch (error) {
-        console.error('Error fetching support tickets:', error);
-      } finally {
-        setSupportTicketsLoading(false);
-      }
-    };
-
-    const fetchBatches = async () => {
-      try {
-        const response = await fetch('/api/admin/batch-accounts');
-        if (response.status === 401 || response.status === 403) {
-          router.push('/login?redirect=' + encodeURIComponent('/admin'));
-          return;
-        }
-        if (!response.ok) throw new Error('Failed to fetch batches');
-        const data = await response.json();
-        setBatches(data.batches || []);
-      } catch (error) {
-        console.error('Error fetching batches:', error);
-      } finally {
-        setBatchesLoading(false);
-      }
-    };
-
-    const fetchVpnAccounts = async () => {
-      try {
-        const response = await fetch('/api/admin/vpn-accounts');
-        if (response.status === 401 || response.status === 403) {
-          router.push('/login?redirect=' + encodeURIComponent('/admin'));
-          return;
-        }
-        if (!response.ok) throw new Error('Failed to fetch VPN accounts');
-        const data = await response.json();
-        setVpnAccounts(data.accounts || []);
-      } catch (error) {
-        console.error('Error fetching VPN accounts:', error);
-      } finally {
-        setVpnAccountsLoading(false);
-      }
-    };
-
-    const fetchSyncStatus = async () => {
-      if (activeTab !== 'sync-status') return;
-      try {
-        setSyncStatusLoading(true);
-        const response = await fetch('/api/admin/sync-status');
-        if (response.status === 401 || response.status === 403) {
-          router.push('/login?redirect=' + encodeURIComponent('/admin'));
-          return;
-        }
-        if (!response.ok) throw new Error('Failed to fetch sync status');
-        const data = await response.json();
-        setSyncStatusAccounts(data.accounts || []);
-        setLatestSync(data.latestSync || null);
-      } catch (error) {
-        console.error('Error fetching sync status:', error);
-      } finally {
-        setSyncStatusLoading(false);
-      }
-    };
-
-    fetchRequests();
-    fetchEvents();
-    fetchUsers();
-    fetchSupportTickets();
-    fetchBatches();
-    fetchVpnAccounts();
-    fetchSyncStatus();
-  }, [router, activeTab]);
-
-  const fetchEvents = useCallback(async () => {
-    try {
-      const response = await fetch('/api/admin/events');
-      if (response.status === 401 || response.status === 403) {
-        router.push('`/login?redirect=`' + encodeURIComponent('/admin'));
-        return;
-      }
-      if (!response.ok) throw new Error('Failed to fetch events');
-      const data = await response.json();
-      setEvents(data.events);
-    } catch (error) {
-      console.error('Error fetching events:', error);
-    } finally {
-      setEventsLoading(false);
-    }
-  }, [router]);
 
   const fetchSupportTickets = useCallback(async () => {
     try {
@@ -406,8 +210,6 @@ export default function AdminDashboard() {
       setSupportTickets(data.tickets || []);
     } catch (error) {
       console.error('Error fetching support tickets:', error);
-    } finally {
-      setSupportTicketsLoading(false);
     }
   }, [router]);
 
@@ -423,50 +225,51 @@ export default function AdminDashboard() {
       setBatches(data.batches || []);
     } catch (error) {
       console.error('Error fetching batches:', error);
-    } finally {
-      setBatchesLoading(false);
     }
   }, [router]);
 
-  const fetchVpnAccounts = useCallback(async () => {
+  const fetchUsers = useCallback(async () => {
     try {
-      const response = await fetch('/api/admin/vpn-accounts');
+      setUsersLoading(true);
+      const response = await fetch('/api/admin/users');
       if (response.status === 401 || response.status === 403) {
         router.push('/login?redirect=' + encodeURIComponent('/admin'));
         return;
       }
-      if (!response.ok) throw new Error('Failed to fetch VPN accounts');
-      const data = await response.json();
-      setVpnAccounts(data.accounts || []);
-    } catch (error) {
-      console.error('Error fetching VPN accounts:', error);
-    } finally {
-      setVpnAccountsLoading(false);
-    }
-  }, [router]);
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+        const errorMsg = errorData.details || errorData.error || 'Unknown error';
 
-  const fetchSyncStatus = useCallback(async () => {
-    try {
-      setSyncStatusLoading(true);
-      const response = await fetch('/api/admin/sync-status');
-      if (response.status === 401 || response.status === 403) {
-        router.push('/login?redirect=' + encodeURIComponent('/admin'));
-        return;
+        if (errorMsg.includes('0x4') || errorMsg.includes('0x2c')) {
+          console.warn('LDAP query size limit exceeded. Some users may not be displayed.');
+          setUsers([]);
+          return;
+        }
+
+        throw new Error('Failed to fetch users: ' + errorMsg);
       }
-      if (!response.ok) throw new Error('Failed to fetch sync status');
       const data = await response.json();
-      setSyncStatusAccounts(data.accounts || []);
-      setLatestSync(data.latestSync || null);
+      setUsers(data.users || []);
     } catch (error) {
-      console.error('Error fetching sync status:', error);
+      console.error('Error fetching users:', error);
+      if (error instanceof Error && !error.message.includes('0x')) {
+        console.error('Unexpected error loading users:', error.message);
+      }
     } finally {
-      setSyncStatusLoading(false);
+      setUsersLoading(false);
     }
   }, [router]);
 
-  if (isLoading) {
-    return (<div className="min-h-screen bg-linear-to-b from-white to-gray-100 flex items-center justify-center"><div className="text-gray-900 text-xl font-semibold">Loading...</div></div>);
-  }
+  useEffect(() => {
+    if (activeTab === 'batch') {
+      fetchBatches();
+      fetchSupportTickets();
+    }
+
+    if (activeTab === 'offboard-campaigns') {
+      fetchUsers();
+    }
+  }, [activeTab, fetchBatches, fetchSupportTickets, fetchUsers]);
 
   return (
     <div className="min-h-screen bg-gray-50/50 text-gray-900">
@@ -506,6 +309,9 @@ export default function AdminDashboard() {
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => setActiveTab('events')} className="gap-2">
                   <Calendar className="h-4 w-4" /> Events
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setActiveTab('offboard-campaigns')} className="gap-2">
+                  <ShieldAlert className="h-4 w-4" /> Offboard Campaigns
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -567,8 +373,17 @@ export default function AdminDashboard() {
                 <DropdownMenuItem onClick={() => setActiveTab('sessions')} className="gap-2">
                   <Users className="h-4 w-4" /> Active Sessions
                 </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setActiveTab('password-expiration')} className="gap-2">
+                  <KeyRound className="h-4 w-4" /> Password Expiration
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setActiveTab('ratelimits')} className="gap-2">
+                  <Gauge className="h-4 w-4" /> Rate Limiting
+                </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => setActiveTab('logs')} className="gap-2">
                   <FileText className="h-4 w-4" /> Audit Logs
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setActiveTab('action-history')} className="gap-2">
+                  <Activity className="h-4 w-4" /> Action History
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -578,6 +393,7 @@ export default function AdminDashboard() {
               {activeTab === 'support' && 'Support Tickets'}
               {activeTab === 'batch' && 'Batch Accounts'}
               {activeTab === 'events' && 'Events'}
+              {activeTab === 'offboard-campaigns' && 'Offboard Campaigns'}
               {activeTab === 'users' && 'Active Directory'}
               {activeTab === 'vpn' && 'VPN Management'}
               {activeTab === 'lifecycle' && 'Account Lifecycle'}
@@ -585,7 +401,10 @@ export default function AdminDashboard() {
               {activeTab === 'settings' && 'System Settings'}
               {activeTab === 'blocklist' && 'Blocklist'}
               {activeTab === 'sessions' && 'Active Sessions'}
+              {activeTab === 'password-expiration' && 'Password Expiration'}
+              {activeTab === 'ratelimits' && 'Rate Limiting'}
               {activeTab === 'logs' && 'Audit Logs'}
+              {activeTab === 'action-history' && 'Action History'}
               {activeTab === 'communications' && 'Communications'}
             </div>
           </div>
@@ -593,7 +412,7 @@ export default function AdminDashboard() {
 
         <Card className="shadow-sm">
           <CardContent className="p-6">
-            {activeTab === 'requests' && <AccessRequestsTab requests={requests} />}
+            {activeTab === 'requests' && <AccessRequestsTab />}
             {activeTab === 'batch' && (
               <BatchAccountsTab
                 batches={batches}
@@ -601,17 +420,21 @@ export default function AdminDashboard() {
                 onBatchCreated={fetchBatches}
               />
             )}
-            {activeTab === 'vpn' && <VPNManagementTab accounts={vpnAccounts} isLoading={vpnAccountsLoading} onRefresh={fetchVpnAccounts} />}
+            {activeTab === 'vpn' && <VPNManagementTab />}
             {activeTab === 'lifecycle' && <AccountLifecycleTab />}
-            {activeTab === 'sync-status' && <AccountSyncStatusTab accounts={syncStatusAccounts} isLoading={syncStatusLoading} onRefresh={fetchSyncStatus} latestSync={latestSync} />}
+            {activeTab === 'sync-status' && <AccountSyncStatusTab />}
             {activeTab === 'communications' && <CommunicationsTab />}
-            {activeTab === 'support' && <SupportTicketsTab tickets={supportTickets} isLoading={supportTicketsLoading} onRefresh={fetchSupportTickets} />}
+            {activeTab === 'offboard-campaigns' && <OffboardCampaignsPanel accounts={users} accountsLoading={usersLoading} />}
+            {activeTab === 'support' && <SupportTicketsTab />}
             {activeTab === 'blocklist' && <BlocklistTab />}
-            {activeTab === 'events' && <EventManagementTab events={events} isLoading={eventsLoading} onRefresh={fetchEvents} />}
-            {activeTab === 'users' && <UserManagementTab users={users} isLoading={usersLoading} />}
+            {activeTab === 'events' && <EventManagementTab />}
+            {activeTab === 'users' && <UserManagementTab />}
             {activeTab === 'sessions' && <SessionManagementTab />}
+            {activeTab === 'password-expiration' && <PasswordExpirationTab />}
+            {activeTab === 'ratelimits' && <RateLimitManagementTab />}
             {activeTab === 'settings' && <SystemSettingsTab isLoading={false} onRefresh={() => { }} />}
             {activeTab === 'logs' && <LogsTab isLoading={false} />}
+            {activeTab === 'action-history' && <ActionHistoryMonitoringTab />}
           </CardContent>
         </Card>
       </div>

@@ -1,9 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
-import { searchLDAPUser } from '@/lib/ldap';
+import { searchLDAPUserForProvisioning } from '@/lib/ldap';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { checkRateLimitAsync, getClientIp } from '@/lib/ratelimit';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { findReusableOffboardedRequest } from '@/lib/offboard-reenrollment';
+import { isJsonBodyError, parseAdminJson } from '@/lib/admin-json-parser';
+
+type CheckUsernameBody = {
+  username?: string;
+  requestId?: string;
+};
 
 export async function POST(
   request: NextRequest
@@ -15,7 +23,7 @@ export async function POST(
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const body = await request.json();
+    const body = await parseAdminJson<CheckUsernameBody>(request);
     const { username, requestId } = body;
 
     if (!username) {
@@ -51,31 +59,51 @@ export async function POST(
     let available = true;
     let source = '';
     let existingRequestId = '';
+    let reactivationRequestId = '';
+    const currentRequest = requestId
+      ? await prisma.accessRequest.findUnique({
+          where: { id: requestId },
+          select: { email: true },
+        })
+      : null;
     
     try {
-      const ldapUser = await searchLDAPUser(username);
+      const ldapUser = await searchLDAPUserForProvisioning(username);
       
       if (ldapUser) {
-        available = false;
-        source = 'ldap';
+        const reusableRequest = await findReusableOffboardedRequest({
+          username,
+          email: currentRequest?.email,
+        });
+
+        if (reusableRequest) {
+          source = 'offboarded';
+          reactivationRequestId = reusableRequest.id;
+        } else {
+          available = false;
+          source = 'ldap';
+        }
       }
     } catch (ldapError) {
       console.error('LDAP search error:', ldapError);
-      // Continue to database check even if LDAP search fails
+      return NextResponse.json(
+        { error: 'Failed to verify LDAP username availability. Please try again.' },
+        { status: 503 }
+      );
     }
 
     // Check if username exists in database for active/pending requests
     // This checks both ldapUsername (domain account) and vpnUsername fields
     // to prevent conflicts across all account types
-    // NOTE: We exclude 'rejected' requests to allow username reuse after denial
+    // NOTE: We exclude reusable terminal requests so usernames can be reused after denial or campaign offboarding.
     if (available) {
-      const whereClause: any = {
+      const whereClause: Prisma.AccessRequestWhereInput = {
         OR: [
           { ldapUsername: username },
           { vpnUsername: username }
         ],
         status: {
-          notIn: ['rejected'] // Exclude rejected requests - usernames can be reused
+          notIn: ['rejected', 'offboarded']
         }
       };
       if (requestId) {
@@ -102,6 +130,7 @@ export async function POST(
         available,
         source,
         existingRequestId: existingRequestId || undefined,
+        reactivationRequestId: reactivationRequestId || undefined,
       },
       ipAddress: getIpAddress(request),
       userAgent: getUserAgent(request),
@@ -110,7 +139,11 @@ export async function POST(
     if (available) {
       return NextResponse.json({ 
         available: true,
-        message: `Username "${username}" is available`
+        message: source === 'offboarded'
+          ? `Username "${username}" is available for reactivation from a campaign-offboarded account`
+          : `Username "${username}" is available`,
+        reactivationRequestId: reactivationRequestId || undefined,
+        source: source || 'available',
       });
     } else {
       return NextResponse.json({ 
@@ -123,6 +156,10 @@ export async function POST(
       });
     }
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
     console.error('Error checking username:', error);
     return NextResponse.json(
       { error: 'Failed to check username availability' },

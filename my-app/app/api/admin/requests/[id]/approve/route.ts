@@ -1,17 +1,142 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
+import { randomBytes, createHash } from 'crypto';
 import { sendAccountReadyEmail, sendAccountActivationEmail } from '@/lib/email';
-import { enableLDAPUser } from '@/lib/ldap';
+import { disableLDAPUser, enableLDAPUser, setLDAPUserExpiration } from '@/lib/ldap';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { decryptPassword } from '@/lib/encryption';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
-import { extractBronconame } from '@/lib/validation';
-import { randomBytes, createHash } from 'crypto';
+import { extractBronconame, isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit } from '@/lib/validation';
+
+const APPROVAL_STATE_IN_PROGRESS = 'approval_in_progress';
+const APPROVAL_STATE_FAILED = 'approval_failed';
+const APPROVAL_EMAIL_SENDING = 'approval_email_sending';
+const ACTIVATION_EMAIL_PENDING = 'activation_email_pending';
+const CREDENTIALS_EMAIL_PENDING = 'credentials_email_pending';
+const REJECTION_STATE_IN_PROGRESS = 'rejection_in_progress';
+const ACCOUNT_CREATION_IN_PROGRESS = 'in_progress';
+
+class HttpError extends Error {
+  status: number;
+
+  constructor(message: string, status = 400) {
+    super(message);
+    this.name = 'HttpError';
+    this.status = status;
+  }
+}
+
+interface ApproveRequestBody {
+  message?: unknown;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Unknown error';
+}
+
+async function rollbackExternalEnablement(accessRequest: {
+  isInternal: boolean;
+  ldapUsername: string | null;
+  vpnUsername: string | null;
+}) {
+  if (accessRequest.isInternal) {
+    return;
+  }
+
+  const usernames = Array.from(new Set([
+    accessRequest.ldapUsername,
+    accessRequest.vpnUsername,
+  ].filter((username): username is string => !!username)));
+
+  for (const username of usernames) {
+    try {
+      await disableLDAPUser(username);
+      await setLDAPUserExpiration(username, new Date());
+    } catch (rollbackError) {
+      console.error('Failed to roll back externally enabled LDAP account:', {
+        username,
+        error: errorMessage(rollbackError),
+      });
+    }
+  }
+}
+
+async function markApprovalState(
+  requestId: string,
+  state: string | null,
+  error?: unknown
+) {
+  await prisma.accessRequest.update({
+    where: { id: requestId },
+    data: {
+      provisioningState: state,
+      provisioningCompletedAt: new Date(),
+      provisioningError: error ? errorMessage(error) : null,
+    },
+  });
+}
+
+async function activateVpnAccount(
+  accessRequest: {
+    id: string;
+    email: string;
+    isInternal: boolean;
+    ldapUsername: string | null;
+    vpnUsername: string | null;
+  },
+  adminUsername: string
+) {
+  let vpnAccountUsername: string;
+  if (accessRequest.isInternal) {
+    vpnAccountUsername = extractBronconame(accessRequest.email) || accessRequest.ldapUsername!;
+  } else {
+    vpnAccountUsername = accessRequest.vpnUsername || accessRequest.ldapUsername!;
+  }
+
+  try {
+    const vpnAccount = await prisma.vPNAccount.findUnique({
+      where: { username: vpnAccountUsername },
+    });
+
+    if (!vpnAccount) {
+      if (!accessRequest.isInternal) {
+        throw new Error(`VPN account record not found for external username ${vpnAccountUsername}`);
+      }
+      return;
+    }
+
+    await prisma.vPNAccount.update({
+      where: { id: vpnAccount.id },
+      data: {
+        status: 'active',
+        createdByFaculty: true,
+        facultyCreatedAt: new Date(),
+      },
+    });
+
+    await prisma.vPNAccountStatusLog.create({
+      data: {
+        accountId: vpnAccount.id,
+        oldStatus: vpnAccount.status,
+        newStatus: 'active',
+        changedBy: adminUsername,
+        reason: 'Faculty approved request',
+      },
+    });
+  } catch (vpnError) {
+    console.error('Error updating VPN account status:', vpnError);
+    throw vpnError;
+  }
+}
 
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  let requestId: string | null = null;
+  let adminUsername: string | null = null;
+
   try {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
 
@@ -19,88 +144,192 @@ export async function POST(
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
+    adminUsername = admin.username;
     const resolvedParams = await params;
-    const body = await request.json();
-    const { message } = body;
+    requestId = resolvedParams.id;
 
-    const accessRequest = await prisma.accessRequest.findUnique({
-      where: { id: resolvedParams.id },
+    const body = await parseJsonWithLimit<ApproveRequestBody>(request, MAX_REQUEST_BODY_SIZE.SMALL);
+    if (body.message !== undefined && typeof body.message !== 'string') {
+      return NextResponse.json({ error: 'Approval message must be a string' }, { status: 400 });
+    }
+    const approvalMessage = typeof body.message === 'string' ? body.message.trim() : '';
+
+      const { accessRequest, lockedVersion } = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const requestRecord = await tx.accessRequest.findUnique({
+        where: { id: resolvedParams.id },
+      });
+
+      if (!requestRecord) {
+        throw new HttpError('Request not found', 404);
+      }
+
+      if (!requestRecord.isVerified) {
+        throw new HttpError('Cannot approve unverified request');
+      }
+
+      if (requestRecord.status !== 'pending_faculty') {
+        throw new HttpError(
+          `Request status is ${requestRecord.status}, expected pending_faculty`,
+          409
+        );
+      }
+
+      if (!requestRecord.ldapUsername) {
+        throw new HttpError('LDAP username must be set by Student Directors before approval');
+      }
+
+      if (!requestRecord.isInternal && !requestRecord.accountPassword) {
+        throw new HttpError('Account credentials must be set by Student Directors before approval for external users');
+      }
+
+      if (!requestRecord.isInternal && !requestRecord.vpnUsername) {
+        throw new HttpError('VPN Username must be set for external users before approval');
+      }
+
+      const claim = await tx.accessRequest.updateMany({
+        where: {
+          id: resolvedParams.id,
+          version: requestRecord.version,
+          status: 'pending_faculty',
+          isVerified: true,
+          OR: [
+            { provisioningState: null },
+            {
+              provisioningState: {
+                notIn: [
+                  APPROVAL_STATE_IN_PROGRESS,
+                  REJECTION_STATE_IN_PROGRESS,
+                  ACCOUNT_CREATION_IN_PROGRESS,
+                ],
+              },
+            },
+          ],
+        },
+        data: {
+          provisioningState: APPROVAL_STATE_IN_PROGRESS,
+          provisioningStartedAt: new Date(),
+          provisioningCompletedAt: null,
+          provisioningError: null,
+          version: { increment: 1 },
+        },
+      });
+
+      if (claim.count !== 1) {
+        throw new HttpError(
+          'Another administrator is currently processing this request. Please refresh and try again.',
+          409
+        );
+      }
+
+      return {
+        accessRequest: requestRecord,
+        lockedVersion: requestRecord.version + 1,
+      };
+    }, {
+      isolationLevel: 'Serializable',
+      timeout: 10000,
     });
 
-    if (!accessRequest) {
-      return NextResponse.json({ error: 'Request not found' }, { status: 404 });
+    const ldapUsername = accessRequest.ldapUsername;
+    if (!ldapUsername) {
+      throw new HttpError('LDAP username must be set by Student Directors before approval');
     }
 
-    if (!accessRequest.isVerified) {
-      return NextResponse.json(
-        { error: 'Cannot approve unverified request' },
-        { status: 400 }
-      );
-    }
-
-    // Check required credentials based on account type
-    if (!accessRequest.ldapUsername) {
-      return NextResponse.json(
-        { error: 'LDAP username must be set by Student Directors before approval' },
-        { status: 400 }
-      );
-    }
-
-    // External users need password set by Student Directors
-    if (!accessRequest.isInternal && !accessRequest.accountPassword) {
-      return NextResponse.json(
-        { error: 'Account credentials must be set by Student Directors before approval for external users' },
-        { status: 400 }
-      );
-    }
-
-    // External users also need VPN Username
-    if (!accessRequest.isInternal && !accessRequest.vpnUsername) {
-      return NextResponse.json(
-        { error: 'VPN Username must be set for external users before approval' },
-        { status: 400 }
-      );
-    }
-
-    // enable the user bc we disable them incase we reject the request
     try {
-      await enableLDAPUser(accessRequest.ldapUsername);
-      
-      // Enable account if it's different from LDAP username
-      if (!accessRequest.isInternal && accessRequest.vpnUsername && accessRequest.vpnUsername !== accessRequest.ldapUsername) {
+      await enableLDAPUser(ldapUsername);
+
+      if (
+        !accessRequest.isInternal &&
+        accessRequest.vpnUsername &&
+        accessRequest.vpnUsername !== ldapUsername
+      ) {
         await enableLDAPUser(accessRequest.vpnUsername);
       }
     } catch (ldapError) {
       console.error('Error enabling LDAP accounts:', ldapError);
+      await prisma.accessRequest.updateMany({
+        where: {
+          id: resolvedParams.id,
+          version: lockedVersion,
+          provisioningState: APPROVAL_STATE_IN_PROGRESS,
+        },
+        data: {
+          provisioningState: APPROVAL_STATE_FAILED,
+          provisioningCompletedAt: new Date(),
+          provisioningError: errorMessage(ldapError),
+          version: { increment: 1 },
+        },
+      });
+
       return NextResponse.json(
         { error: 'Failed to enable account(s) in Active Directory' },
         { status: 500 }
       );
     }
 
-    const result = await prisma.accessRequest.updateMany({
-      where: { 
-        id: resolvedParams.id,
-        status: 'pending_faculty'
-      },
-      data: {
-        status: 'approved',
-        approvedAt: new Date(),
-        approvedBy: admin.username,
-        approvalMessage: message || null,
-        accountCreatedAt: new Date(),
-      },
-    });
+    const approvalTime = new Date();
+    let approvalResult: { count: number };
 
-    if (result.count === 0) {
-      const current = await prisma.accessRequest.findUnique({
-        where: { id: resolvedParams.id },
-        select: { status: true }
+    try {
+      approvalResult = await prisma.accessRequest.updateMany({
+        where: {
+          id: resolvedParams.id,
+          version: lockedVersion,
+          status: 'pending_faculty',
+          provisioningState: APPROVAL_STATE_IN_PROGRESS,
+        },
+        data: {
+          status: 'approved',
+          approvedAt: approvalTime,
+          approvedBy: admin.username,
+          approvalMessage: approvalMessage || null,
+          accountCreatedAt: approvalTime,
+          provisioningState: APPROVAL_EMAIL_SENDING,
+          provisioningError: null,
+          version: { increment: 1 },
+        },
       });
-      
-      return NextResponse.json({ 
-        error: `Request status is ${current?.status}, expected pending_faculty` 
-      }, { status: 400 });
+    } catch (approvalUpdateError) {
+      await rollbackExternalEnablement(accessRequest);
+      await prisma.accessRequest.updateMany({
+        where: {
+          id: resolvedParams.id,
+          version: lockedVersion,
+          provisioningState: APPROVAL_STATE_IN_PROGRESS,
+        },
+        data: {
+          provisioningState: APPROVAL_STATE_FAILED,
+          provisioningCompletedAt: new Date(),
+          provisioningError: `Approval database update failed after LDAP enablement; external account enablement rollback attempted. Error: ${errorMessage(approvalUpdateError)}`,
+          version: { increment: 1 },
+        },
+      }).catch((markError: unknown) => {
+        console.error('Failed to mark approval failed after database update error:', markError);
+      });
+
+      throw approvalUpdateError;
+    }
+
+    if (approvalResult.count !== 1) {
+      await rollbackExternalEnablement(accessRequest);
+      await prisma.accessRequest.updateMany({
+        where: {
+          id: resolvedParams.id,
+          version: lockedVersion,
+          provisioningState: APPROVAL_STATE_IN_PROGRESS,
+        },
+        data: {
+          provisioningState: APPROVAL_STATE_FAILED,
+          provisioningCompletedAt: new Date(),
+          provisioningError: 'Approval state was moved after LDAP enablement; external account enablement rollback attempted.',
+          version: { increment: 1 },
+        },
+      });
+
+      throw new HttpError(
+        'Another administrator moved this request after it was claimed. Manual review may be required.',
+        409
+      );
     }
 
     const updatedRequest = await prisma.accessRequest.findUnique({
@@ -108,49 +337,77 @@ export async function POST(
     });
 
     if (!updatedRequest) {
-      return NextResponse.json({ error: 'Request not found after update' }, { status: 404 });
+      throw new HttpError('Request not found after update', 404);
     }
 
-    // Create an approval comment
-    let commentText: string;
-    if (updatedRequest.isInternal) {
-      commentText = `Request approved by ${admin.username}. LDAP account enabled in Active Directory. Activation link sent to ${updatedRequest.email}.`;
-    } else {
-      commentText = `Request approved by ${admin.username}. LDAP account(s) enabled in Active Directory. Credentials sent to ${updatedRequest.email}.`;
-    }
-    if (message && message.trim()) {
-      commentText += `\n\nFollow-up message: ${message}`;
-    }
-    
-    await prisma.requestComment.create({
-      data: {
-        requestId: resolvedParams.id,
-        comment: commentText,
-        author: admin.username,
-        type: 'system',
-      },
-    });
+    try {
+      await activateVpnAccount(updatedRequest, admin.username);
+    } catch (vpnError) {
+      await rollbackExternalEnablement(updatedRequest);
+      await markApprovalState(updatedRequest.id, APPROVAL_STATE_FAILED, vpnError);
 
-    // Send appropriate email based on user type
-    console.log('[Approval] Preparing to send email to:', updatedRequest.email);
-    console.log('[Approval] Request details:', {
-      id: updatedRequest.id,
-      name: updatedRequest.name,
-      email: updatedRequest.email,
-      ldapUsername: updatedRequest.ldapUsername,
-      isInternal: updatedRequest.isInternal,
-      hasPassword: !!updatedRequest.accountPassword
-    });
-    
+      await prisma.requestComment.create({
+        data: {
+          requestId: resolvedParams.id,
+          comment: `Request was marked approved, but VPN account activation failed before the user notification was sent. Manual review required. Error: ${errorMessage(vpnError)}`,
+          author: admin.username,
+          type: 'system',
+        },
+      });
+
+      await logAuditAction({
+        action: AuditActions.APPROVE_REQUEST,
+        category: AuditCategories.ACCESS_REQUEST,
+        username: admin.username,
+        actorType: 'admin',
+        targetId: resolvedParams.id,
+        targetType: 'AccessRequest',
+        subjectUsername: updatedRequest.ldapUsername || updatedRequest.vpnUsername,
+        subjectEmail: updatedRequest.email,
+        relatedRequestId: resolvedParams.id,
+        eventKind: 'write',
+        outcome: 'rollback',
+        success: false,
+        errorMessage: errorMessage(vpnError),
+        details: {
+          requestName: updatedRequest.name,
+          requestEmail: updatedRequest.email,
+          ldapUsername: updatedRequest.ldapUsername,
+          vpnUsername: updatedRequest.vpnUsername,
+          isInternal: updatedRequest.isInternal,
+          vpnActivationFailed: true,
+        },
+        ipAddress: getIpAddress(request),
+        userAgent: getUserAgent(request),
+      });
+
+      return NextResponse.json(
+        {
+          error: 'Request was approved, but VPN account activation failed. Manual review is required before notifying the user.',
+        },
+        { status: 500 }
+      );
+    }
+
     try {
       if (updatedRequest.isInternal) {
-        // Internal users: Generate activation token for password setting
         const activationToken = randomBytes(32).toString('hex');
         const tokenHash = createHash('sha256').update(activationToken).digest('hex');
-        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
-        await prisma.accountActivationToken.create({
-          data: {
+        await prisma.accountActivationToken.upsert({
+          where: { accessRequestId: updatedRequest.id },
+          update: {
+            tokenHash,
+            expiresAt,
+            used: false,
+            usedAt: null,
+            attempts: 0,
+            ipAddress: null,
+            userAgent: null,
+            createdAt: new Date(),
+          },
+          create: {
             accessRequestId: updatedRequest.id,
             tokenHash,
             expiresAt,
@@ -164,112 +421,159 @@ export async function POST(
           activationToken,
           expiresAt
         );
-        console.log('[Approval] ✅ Activation email sent successfully to:', updatedRequest.email);
       } else {
-        // External users: Send password via email (existing flow)
         const decryptedPassword = decryptPassword(updatedRequest.accountPassword!);
-        console.log('[Approval] Password decrypted successfully');
-        
+
         await sendAccountReadyEmail(
           updatedRequest.email,
           updatedRequest.name,
           updatedRequest.ldapUsername!,
           decryptedPassword,
-          !updatedRequest.isInternal,
-          message || undefined
+          true,
+          approvalMessage || undefined
         );
-        console.log('[Approval] ✅ Email sent successfully to:', updatedRequest.email);
       }
     } catch (emailError) {
-      console.error('[Approval] ❌ Failed to send email:', emailError);
-      // Re-throw to trigger outer error handling
-      throw new Error(`Failed to send email: ${emailError instanceof Error ? emailError.message : 'Unknown error'}`);
-    }
+      const pendingState = updatedRequest.isInternal
+        ? ACTIVATION_EMAIL_PENDING
+        : CREDENTIALS_EMAIL_PENDING;
 
-    // After successful email send, update VPN account status to 'active' in VPN Management tab
-    // For internal users with @cpp.edu email, extract bronconame from email for VPN username
-    let vpnAccountUsername: string;
-    if (accessRequest.isInternal) {
-      vpnAccountUsername = extractBronconame(accessRequest.email) || accessRequest.ldapUsername!;
-    } else {
-      vpnAccountUsername = accessRequest.vpnUsername || accessRequest.ldapUsername!;
-    }
-    
-    try {
-      const vpnAccount = await prisma.vPNAccount.findUnique({
-        where: { username: vpnAccountUsername },
+      await markApprovalState(updatedRequest.id, pendingState, emailError);
+
+      await prisma.requestComment.create({
+        data: {
+          requestId: resolvedParams.id,
+          comment: `Request approved by ${admin.username}, but the notification email failed. Use the resend action to recover. Error: ${errorMessage(emailError)}`,
+          author: admin.username,
+          type: 'system',
+        },
       });
 
-      if (vpnAccount) {
-        await prisma.vPNAccount.update({
-          where: { id: vpnAccount.id },
-          data: {
-            status: 'active',
-            createdByFaculty: true,
-            facultyCreatedAt: new Date(),
-          },
-        });
+      await logAuditAction({
+        action: AuditActions.APPROVE_REQUEST,
+        category: AuditCategories.ACCESS_REQUEST,
+        username: admin.username,
+        actorType: 'admin',
+        targetId: resolvedParams.id,
+        targetType: 'AccessRequest',
+        subjectUsername: updatedRequest.ldapUsername || updatedRequest.vpnUsername,
+        subjectEmail: updatedRequest.email,
+        relatedRequestId: resolvedParams.id,
+        eventKind: 'notification',
+        outcome: 'pending',
+        details: {
+          requestName: updatedRequest.name,
+          requestEmail: updatedRequest.email,
+          ldapUsername: updatedRequest.ldapUsername,
+          vpnUsername: updatedRequest.vpnUsername,
+          isInternal: updatedRequest.isInternal,
+          approvalMessage,
+          emailSent: false,
+          emailFailureState: pendingState,
+        },
+        ipAddress: getIpAddress(request),
+        userAgent: getUserAgent(request),
+      });
 
-        // Create status log for VPN account activation
-        await prisma.vPNAccountStatusLog.create({
-          data: {
-            accountId: vpnAccount.id,
-            oldStatus: 'pending_faculty',
-            newStatus: 'active',
-            changedBy: admin.username,
-            reason: 'Faculty approved and email sent successfully',
-          },
-        });
-      }
-    } catch (vpnError) {
-      console.error('Error updating VPN account status:', vpnError);
-      // Continue even if VPN account update fails - the main approval and email are complete
+      const requestWithFailureState = await prisma.accessRequest.findUnique({
+        where: { id: resolvedParams.id },
+      });
+
+      return NextResponse.json(
+        {
+          success: true,
+          warning: 'Request approved, but the notification email failed. Use the resend action to recover.',
+          request: requestWithFailureState,
+        },
+        { status: 202 }
+      );
     }
 
-    // Log the approval action
+    await markApprovalState(updatedRequest.id, null);
+
+    let commentText: string;
+    if (updatedRequest.isInternal) {
+      commentText = `Request approved by ${admin.username}. LDAP account enabled in Active Directory. Activation link sent to ${updatedRequest.email}.`;
+    } else {
+      commentText = `Request approved by ${admin.username}. LDAP account(s) enabled in Active Directory. Credentials sent to ${updatedRequest.email}.`;
+    }
+    if (approvalMessage) {
+      commentText += `\n\nFollow-up message: ${approvalMessage}`;
+    }
+
+    await prisma.requestComment.create({
+      data: {
+        requestId: resolvedParams.id,
+        comment: commentText,
+        author: admin.username,
+        type: 'system',
+      },
+    });
+
     await logAuditAction({
       action: AuditActions.APPROVE_REQUEST,
       category: AuditCategories.ACCESS_REQUEST,
       username: admin.username,
+      actorType: 'admin',
       targetId: resolvedParams.id,
       targetType: 'AccessRequest',
+      subjectUsername: updatedRequest.ldapUsername || updatedRequest.vpnUsername,
+      subjectEmail: updatedRequest.email,
+      relatedRequestId: resolvedParams.id,
+      eventKind: 'write',
+      outcome: 'success',
       details: {
         requestName: updatedRequest.name,
         requestEmail: updatedRequest.email,
         ldapUsername: updatedRequest.ldapUsername,
         vpnUsername: updatedRequest.vpnUsername,
         isInternal: updatedRequest.isInternal,
-        approvalMessage: message,
+        approvalMessage,
         emailSent: true,
       },
       ipAddress: getIpAddress(request),
       userAgent: getUserAgent(request),
     });
 
-    return NextResponse.json({ 
-      success: true, 
-      request: updatedRequest 
+    const finalRequest = await prisma.accessRequest.findUnique({
+      where: { id: resolvedParams.id },
+    });
+
+    return NextResponse.json({
+      success: true,
+      request: finalRequest,
     });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
+    if (error instanceof HttpError) {
+      return NextResponse.json({ error: error.message }, { status: error.status });
+    }
+
     console.error('Error approving request:', error);
-    
-    // Log the failed approval attempt
-    const resolvedParams = await params;
-    const { admin } = await checkAdminAuthWithRateLimit(request);
-    if (admin) {
+
+    if (requestId && adminUsername) {
       await logAuditAction({
         action: AuditActions.APPROVE_REQUEST,
         category: AuditCategories.ACCESS_REQUEST,
-        username: admin.username,
-        targetId: resolvedParams.id,
+        username: adminUsername,
+        actorType: 'admin',
+        targetId: requestId,
         targetType: 'AccessRequest',
+        relatedRequestId: requestId,
+        eventKind: 'write',
+        outcome: 'failure',
         success: false,
-        errorMessage: error instanceof Error ? error.message : 'Unknown error',
+        errorMessage: errorMessage(error),
         ipAddress: getIpAddress(request),
         userAgent: getUserAgent(request),
+      }).catch((logError) => {
+        console.error('Failed to log approval failure:', logError);
       });
     }
-    
+
     return NextResponse.json(
       { error: 'Failed to approve request' },
       { status: 500 }

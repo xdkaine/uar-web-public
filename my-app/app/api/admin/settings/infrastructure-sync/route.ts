@@ -8,8 +8,13 @@ import {
 } from '@/lib/infrastructure-sync';
 import { appLogger } from '@/lib/logger';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { isJsonBodyError, parseAdminJson } from '@/lib/admin-json-parser';
 
 export const dynamic = 'force-dynamic';
+
+type InfrastructureSyncBody = {
+  dryRun?: boolean;
+};
 
 /**
  * POST - Run infrastructure sync
@@ -22,7 +27,7 @@ export async function POST(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
     
-    const body = await request.json();
+    const body = await parseAdminJson<InfrastructureSyncBody>(request);
     const { dryRun = false } = body;
 
     appLogger.info('Infrastructure sync triggered', { 
@@ -56,6 +61,10 @@ export async function POST(request: NextRequest) {
       data: result,
     });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ success: false, error: error.message }, { status: error.statusCode });
+    }
+
     appLogger.error('Infrastructure sync API error', error);
     
     // Log failed sync attempt

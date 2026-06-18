@@ -1,35 +1,19 @@
 'use client';
 
 import React from 'react';
-import { motion } from 'framer-motion';
 import Image from 'next/image';
 import Link from "next/link";
 
 const Footer: React.FC = () => {
   return (
-    <motion.footer
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      transition={{ duration: 0.8, ease: "easeOut", delay: 0.6 }}
-      className="bg-black text-white p-8 text-center shadow-lg"
-    >
+    <footer className="bg-black text-white p-8 text-center shadow-lg">
       <div className="container mx-auto">
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.8, delay: 0.8 }}
-          className="mb-6"
-        >
+        <div className="mb-6">
           <div className="w-24 h-12 relative mx-auto mb-4">
             <Image src="/logo3og.png" alt="SOC Logo" fill className="object-contain" />
           </div>
-        </motion.div>
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.8, delay: 1.0 }}
-          className="flex justify-center space-x-8 mb-4"
-        >
+        </div>
+        <div className="flex justify-center space-x-8 mb-4">
           <Link href="https://calpolysoc.org/contact" className="text-white hover:text-blue-400 transition duration-300 font-medium border-b border-transparent hover:border-blue-400 pb-1 flex items-center space-x-2">
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 4.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
@@ -54,19 +38,14 @@ const Footer: React.FC = () => {
             </svg>
             <span>GitHub</span>
           </a>
-        </motion.div>
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.8, delay: 1.2 }}
-          className="text-sm text-gray-400 flex items-center justify-center gap-2"
-        >
+        </div>
+        <div className="text-sm text-gray-400 flex items-center justify-center gap-2">
           <span>Made by</span>
           <a href="https://www.linkedin.com/in/thomasphao" target="_blank" rel="noopener noreferrer" className="hover:text-blue-400 transition-colors">Tommy</a>
           <Image src="/love_sticker.gif" unoptimized alt="Love" width={24} height={24} className="object-contain" />
-        </motion.div>
+        </div>
       </div>
-    </motion.footer>
+    </footer>
   );
 };
 

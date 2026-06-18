@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import {
-  searchLDAPUser,
+  searchLDAPUserForProvisioning,
   createLDAPUser,
   setLDAPUserPassword,
   setLDAPUserExpiration,
@@ -269,7 +270,7 @@ export async function POST(request: NextRequest) {
         const encryptedPassword = encryptPassword(accountInput.password);
 
         // Use transaction to prevent race condition: check for duplicates and create batch item atomically
-        const batchItem = await prisma.$transaction(async (tx: any) => {
+        const batchItem = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
           // Check for existing batch items with same username within transaction
           const existingItem = await tx.batchAccountItem.findFirst({
             where: {
@@ -308,7 +309,7 @@ export async function POST(request: NextRequest) {
         // Create AD account (outside transaction to avoid long-running transaction)
         try {
           // IDEMPOTENCY CHECK: Check if LDAP username already exists in Active Directory
-          const existingLdapUser = await searchLDAPUser(accountInput.ldapUsername);
+          const existingLdapUser = await searchLDAPUserForProvisioning(accountInput.ldapUsername);
           if (existingLdapUser) {
             // Check if this is from a previous failed attempt of THIS batch
             const descAttr = existingLdapUser.attributes.find((attr: { type: string }) => attr.type === 'description');

@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
+import {
+  CSRF_COOKIE_NAME,
+  CSRF_HEADER_NAME,
+  csrfCookieOptions,
+  shouldRefreshCsrfCookie,
+  validateCsrfTokenPair,
+} from './lib/csrf-cookie-policy';
 import { isCsrfExempt, requiresCsrfValidation } from './lib/csrf-config';
-import { timingSafeCompare } from './lib/timing-safe';
 
 // Winston is not compatible with Edge Runtime, so we define a lightweight 
 // console-based logger for middleware that mimics the JSON structure.
@@ -18,18 +24,6 @@ const edgeLogger = {
   }
 };
 
-function validateCsrfToken(token: string | null | undefined, cookieToken: string | null | undefined): boolean {
-  if (!token || !cookieToken) {
-    return false;
-  }
-
-  try {
-    return timingSafeCompare(token, cookieToken);
-  } catch {
-    return false;
-  }
-}
-
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
@@ -43,7 +37,7 @@ export async function middleware(request: NextRequest) {
     referer: request.headers.get('referer'),
   });
 
-  let response = NextResponse.next();
+  const response = NextResponse.next();
 
   // Protect admin pages - require session cookie to be present
   // Full session validation happens in API routes, but this prevents
@@ -65,10 +59,10 @@ export async function middleware(request: NextRequest) {
     // These are already protected by session authentication in checkAdminAuthWithRateLimit()
     // CSRF protection is unnecessary for operations that don't modify state
   } else if (requiresCsrfValidation(request.method)) {
-    const csrfTokenFromHeader = request.headers.get('x-csrf-token');
-    const csrfTokenFromCookie = request.cookies.get('csrf-token')?.value;
+    const csrfTokenFromHeader = request.headers.get(CSRF_HEADER_NAME);
+    const csrfTokenFromCookie = request.cookies.get(CSRF_COOKIE_NAME)?.value;
 
-    if (!validateCsrfToken(csrfTokenFromHeader, csrfTokenFromCookie)) {
+    if (!validateCsrfTokenPair(csrfTokenFromHeader, csrfTokenFromCookie)) {
       console.error('CSRF validation failed for:', pathname);
 
       if (process.env.NODE_ENV !== 'production') {
@@ -90,18 +84,10 @@ export async function middleware(request: NextRequest) {
 
   // Handle CSRF cookie rotation for GET requests
   // Skip for /api/csrf-token as it sets its own fresh cookie
-  if (request.method === 'GET' && pathname !== '/api/csrf-token') {
-    const csrfCookie = request.cookies.get('csrf-token');
+  if (shouldRefreshCsrfCookie(request.method, pathname)) {
+    const csrfCookie = request.cookies.get(CSRF_COOKIE_NAME);
     if (csrfCookie?.value) {
-      response.cookies.set({
-        name: 'csrf-token',
-        value: csrfCookie.value,
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'strict',
-        path: '/',
-        maxAge: 60 * 60 * 8
-      });
+      response.cookies.set(csrfCookieOptions(csrfCookie.value));
     }
   }
 

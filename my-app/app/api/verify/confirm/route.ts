@@ -1,21 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { sendAdminNotification } from '@/lib/email';
-import { checkRateLimitAsync, getClientIp, RateLimitPresets } from '@/lib/ratelimit';
+import { checkRateLimitAsync, getRequiredClientIp, isRateLimitUnavailable, RateLimitPresets } from '@/lib/ratelimit';
 import { markNotificationPending } from '@/lib/notification-queue';
 import { appLogger } from '@/lib/logger';
+import { logActionHistoryEvent } from '@/lib/action-history';
+import { AuditActions, AuditCategories, getUserAgent } from '@/lib/audit-log';
 
 export async function POST(request: NextRequest) {
   try {
     // Apply rate limiting: 10 attempts per hour per IP to prevent token enumeration
-    const clientIp = getClientIp(request);
+    const clientIp = getRequiredClientIp(request);
     const rateLimitIpResult = await checkRateLimitAsync(clientIp, RateLimitPresets.verification);
 
     const searchParams = request.nextUrl.searchParams;
     const token = searchParams.get('token');
 
     // Add per-token rate limiting: 3 attempts per token per hour
-    const rateLimitTokenResult = await checkRateLimitAsync(clientIp, {
+    const rateLimitTokenResult = await checkRateLimitAsync('verification-token', {
       maxRequests: 3,
       windowMs: 60 * 60 * 1000, // 1 hour
       identifier: token || 'no-token',
@@ -42,6 +44,18 @@ export async function POST(request: NextRequest) {
     });
 
     if (!accessRequest) {
+      await logActionHistoryEvent({
+        action: AuditActions.EMAIL_VERIFICATION_FAILED,
+        category: AuditCategories.ACCESS_REQUEST,
+        username: 'anonymous',
+        actorType: 'anonymous',
+        eventKind: 'security',
+        outcome: 'denied',
+        success: false,
+        details: { reason: 'invalid_or_expired_link', tokenPresent: Boolean(token) },
+        ipAddress: clientIp,
+        userAgent: getUserAgent(request),
+      });
       return NextResponse.json(
         { error: 'Invalid or expired verification link' },
         { status: 400 }
@@ -50,6 +64,22 @@ export async function POST(request: NextRequest) {
 
     // Check if too many verification attempts have been made
     if (accessRequest.verificationAttempts >= 5) {
+      await logActionHistoryEvent({
+        action: AuditActions.EMAIL_VERIFICATION_FAILED,
+        category: AuditCategories.ACCESS_REQUEST,
+        username: accessRequest.email,
+        actorType: 'user',
+        targetId: accessRequest.id,
+        targetType: 'AccessRequest',
+        subjectEmail: accessRequest.email,
+        relatedRequestId: accessRequest.id,
+        eventKind: 'security',
+        outcome: 'denied',
+        success: false,
+        details: { reason: 'too_many_attempts' },
+        ipAddress: clientIp,
+        userAgent: getUserAgent(request),
+      });
       return NextResponse.json(
         { error: 'This verification link has been used too many times' },
         { status: 400 }
@@ -57,6 +87,22 @@ export async function POST(request: NextRequest) {
     }
 
     if (accessRequest.isVerified) {
+      await logActionHistoryEvent({
+        action: AuditActions.EMAIL_VERIFICATION_FAILED,
+        category: AuditCategories.ACCESS_REQUEST,
+        username: accessRequest.email,
+        actorType: 'user',
+        targetId: accessRequest.id,
+        targetType: 'AccessRequest',
+        subjectEmail: accessRequest.email,
+        relatedRequestId: accessRequest.id,
+        eventKind: 'security',
+        outcome: 'skipped',
+        success: true,
+        details: { reason: 'already_verified' },
+        ipAddress: clientIp,
+        userAgent: getUserAgent(request),
+      });
       return NextResponse.json(
         { error: 'This email has already been verified' },
         { status: 400 }
@@ -70,18 +116,101 @@ export async function POST(request: NextRequest) {
 
     if (isExpired) {
       // Increment attempt counter even for expired tokens
-      await prisma.accessRequest.update({
-        where: { id: accessRequest.id },
-        data: { verificationAttempts: { increment: 1 } },
+      await prisma.accessRequest.updateMany({
+        where: {
+          id: accessRequest.id,
+          isVerified: false,
+          verificationAttempts: { lt: 5 },
+        },
+        data: {
+          verificationAttempts: { increment: 1 },
+        },
       }).catch(() => { /* ignore errors */ });
+      await logActionHistoryEvent({
+        action: AuditActions.EMAIL_VERIFICATION_FAILED,
+        category: AuditCategories.ACCESS_REQUEST,
+        username: accessRequest.email,
+        actorType: 'user',
+        targetId: accessRequest.id,
+        targetType: 'AccessRequest',
+        subjectEmail: accessRequest.email,
+        relatedRequestId: accessRequest.id,
+        eventKind: 'security',
+        outcome: 'denied',
+        success: false,
+        details: { reason: 'expired_link' },
+        ipAddress: clientIp,
+        userAgent: getUserAgent(request),
+      });
       return NextResponse.json(
         { error: 'This verification link has expired. Please submit a new request.' },
         { status: 400 }
       );
     }
 
-    // Send admin notification FIRST before updating database
-    // This ensures we only mark as verified if the notification succeeds
+    const verifiedAt = new Date();
+    const claimResult = await prisma.accessRequest.updateMany({
+      where: {
+        id: accessRequest.id,
+        verificationToken: token,
+        isVerified: false,
+        status: 'pending_verification',
+        verificationAttempts: { lt: 5 },
+        OR: [
+          { verificationTokenExpiresAt: null },
+          { verificationTokenExpiresAt: { gt: verifiedAt } },
+        ],
+      },
+      data: {
+        isVerified: true,
+        verifiedAt,
+        verificationAttempts: { increment: 1 },
+        status: 'pending_student_directors',
+        provisioningState: null,
+        provisioningError: null,
+      },
+    });
+
+    if (claimResult.count !== 1) {
+      await logActionHistoryEvent({
+        action: AuditActions.EMAIL_VERIFICATION_FAILED,
+        category: AuditCategories.ACCESS_REQUEST,
+        username: accessRequest.email,
+        actorType: 'user',
+        targetId: accessRequest.id,
+        targetType: 'AccessRequest',
+        subjectEmail: accessRequest.email,
+        relatedRequestId: accessRequest.id,
+        eventKind: 'security',
+        outcome: 'failure',
+        success: false,
+        details: { reason: 'claim_conflict' },
+        ipAddress: clientIp,
+        userAgent: getUserAgent(request),
+      });
+      return NextResponse.json(
+        { error: 'This email has already been verified' },
+        { status: 400 }
+      );
+    }
+
+    await logActionHistoryEvent({
+      action: AuditActions.EMAIL_VERIFICATION_COMPLETED,
+      category: AuditCategories.ACCESS_REQUEST,
+      username: accessRequest.email,
+      actorType: 'user',
+      targetId: accessRequest.id,
+      targetType: 'AccessRequest',
+      subjectEmail: accessRequest.email,
+      relatedRequestId: accessRequest.id,
+      eventKind: 'security',
+      outcome: 'success',
+      success: true,
+      details: { nextStatus: 'pending_student_directors' },
+      ipAddress: clientIp,
+      userAgent: getUserAgent(request),
+    });
+
     try {
       await sendAdminNotification(
         accessRequest.id,
@@ -102,14 +231,6 @@ export async function POST(request: NextRequest) {
       // Mark notification as pending for manual retry
       await markNotificationPending(accessRequest.id);
 
-      // Increment attempt counter for the failed verification
-      await prisma.accessRequest.update({
-        where: { id: accessRequest.id },
-        data: {
-          verificationAttempts: { increment: 1 },
-        },
-      }).catch(() => { /* ignore errors */ });
-
       // Return informative message to user
       return NextResponse.json(
         {
@@ -120,24 +241,18 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Successful verification - update status ONLY after notification succeeds
-    await prisma.accessRequest.update({
-      where: {
-        id: accessRequest.id,
-      },
-      data: {
-        isVerified: true,
-        verifiedAt: new Date(),
-        verificationAttempts: { increment: 1 }, // Track this attempt
-        status: 'pending_student_directors', // Move to next stage after verification
-      },
-    });
-
     return NextResponse.json(
       { message: 'Email verified successfully!' },
       { status: 200 }
     );
   } catch (error) {
+    if (isRateLimitUnavailable(error)) {
+      return NextResponse.json(
+        { error: 'This service is temporarily unavailable. Please try again later.' },
+        { status: 503 }
+      );
+    }
+
     console.error('Error verifying request:', error);
     return NextResponse.json(
       { error: 'Failed to process verification. Please try again.' },

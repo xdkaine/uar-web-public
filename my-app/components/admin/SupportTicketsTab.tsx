@@ -74,15 +74,14 @@ interface SupportTicket {
 }
 
 interface SupportTicketsTabProps {
-  tickets: SupportTicket[];
-  isLoading: boolean;
-  onRefresh: () => Promise<void>;
+  tickets?: SupportTicket[];
+  isLoading?: boolean;
 }
 
 type StatusFilter = 'all' | 'open' | 'in_progress' | 'closed';
 type SeverityFilter = 'all' | 'critical' | 'high' | 'medium' | 'low';
 
-export default function SupportTicketsTab({ tickets: initialTickets, isLoading: initialLoading, onRefresh: parentRefresh }: SupportTicketsTabProps) {
+export default function SupportTicketsTab({ tickets: initialTickets, isLoading: initialLoading = true }: SupportTicketsTabProps) {
   const router = useRouter();
   const [selectedTicket, setSelectedTicket] = useState<SupportTicket | null>(null);
   const [submittingResponse, setSubmittingResponse] = useState(false);
@@ -99,12 +98,14 @@ export default function SupportTicketsTab({ tickets: initialTickets, isLoading: 
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
 
-  const [tickets, setTickets] = useState<SupportTicket[]>(initialTickets);
+  const [tickets, setTickets] = useState<SupportTicket[]>(initialTickets ?? []);
   const [loading, setLoading] = useState(initialLoading);
   const { showToast } = useToast();
 
   useEffect(() => {
-    setTickets(initialTickets);
+    if (initialTickets !== undefined) {
+      setTickets(initialTickets);
+    }
   }, [initialTickets]);
 
   useEffect(() => {
@@ -753,7 +754,7 @@ export default function SupportTicketsTab({ tickets: initialTickets, isLoading: 
                 Previous
               </Button>
 
-              <div className="flex items-center gap-1 hidden sm:flex">
+              <div className="hidden items-center gap-1 sm:flex">
                 {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
                   let pageNum;
                   if (totalPages <= 5) {

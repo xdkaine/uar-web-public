@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
-import { logAuditAction } from '@/lib/audit-log';
+import { getIpAddress, logAuditAction } from '@/lib/audit-log';
 
 /**
  * Cleanup expired VPN imports
@@ -61,7 +61,7 @@ export async function DELETE(request: NextRequest) {
         deletedCount: result.count,
         force,
       },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
+      ipAddress: getIpAddress(request) || 'unknown',
       success: true,
     });
 

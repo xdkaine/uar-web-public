@@ -26,6 +26,22 @@ export const INPUT_LIMITS = {
   MESSAGE: 10000,
 } as const;
 
+export const INTERNAL_EMAIL_DOMAIN = '@cpp.edu';
+
+export class JsonBodyError extends Error {
+  statusCode: 400 | 413;
+
+  constructor(message: string, statusCode: 400 | 413) {
+    super(message);
+    this.name = 'JsonBodyError';
+    this.statusCode = statusCode;
+  }
+}
+
+export function isJsonBodyError(error: unknown): error is JsonBodyError {
+  return error instanceof JsonBodyError;
+}
+
 /**
  * Parse JSON request body with size limit enforcement
  * Prevents DoS attacks via extremely large payloads
@@ -43,7 +59,7 @@ export async function parseJsonWithLimit<T = unknown>(
   if (contentLength) {
     const size = parseInt(contentLength, 10);
     if (size > maxSizeBytes) {
-      throw new Error(`Request body too large: ${size} bytes (max: ${maxSizeBytes} bytes)`);
+      throw new JsonBodyError(`Request body too large: ${size} bytes (max: ${maxSizeBytes} bytes)`, 413);
     }
   }
 
@@ -54,14 +70,19 @@ export async function parseJsonWithLimit<T = unknown>(
     const actualSize = Buffer.byteLength(bodyString, 'utf8');
     
     if (actualSize > maxSizeBytes) {
-      throw new Error(`Request body too large: ${actualSize} bytes (max: ${maxSizeBytes} bytes)`);
+      throw new JsonBodyError(`Request body too large: ${actualSize} bytes (max: ${maxSizeBytes} bytes)`, 413);
     }
     
     return body as T;
   } catch (error) {
-    if (error instanceof SyntaxError) {
-      throw new Error('Invalid JSON in request body');
+    if (error instanceof JsonBodyError) {
+      throw error;
     }
+
+    if (error instanceof SyntaxError) {
+      throw new JsonBodyError('Invalid JSON in request body', 400);
+    }
+
     throw error;
   }
 }
@@ -226,7 +247,7 @@ export function extractBronconame(email: string): string | null {
   }
 
   // Must be a @cpp.edu email
-  if (!email.toLowerCase().endsWith('@cpp.edu')) {
+  if (!email.toLowerCase().endsWith(INTERNAL_EMAIL_DOMAIN)) {
     return null;
   }
 

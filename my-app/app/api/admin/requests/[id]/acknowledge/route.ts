@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { searchLDAPUser } from '@/lib/ldap';
+import { searchLDAPUserForProvisioning } from '@/lib/ldap';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { encryptPassword } from '@/lib/encryption';
@@ -7,6 +7,9 @@ import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAge
 import { sendVPNPendingFacultyNotification, sendStudentDirectorNotification } from '@/lib/email';
 import { getEmailConfig, getStudentDirectorEmails } from '@/lib/email-config';
 import { extractBronconame } from '@/lib/validation';
+import { findReusableOffboardedRequest } from '@/lib/offboard-reenrollment';
+
+type ReusableOffboardedRequest = { id: string } | null;
 
 export async function POST(
   request: NextRequest,
@@ -62,16 +65,25 @@ export async function POST(
     // funny logic time
     // check AD if account isnt done yet
     // If accountcreated is set, we're interacting with an existing account
+    let reusableAdRequest: ReusableOffboardedRequest = null;
+    let reusableVpnRequest: ReusableOffboardedRequest = null;
     if (!accessRequest.accountCreatedAt) {
       // Check if LDAP username already exists in Active Directory
       try {
-        const ldapUser = await searchLDAPUser(ldapUsername);
+        const ldapUser = await searchLDAPUserForProvisioning(ldapUsername);
         
         if (ldapUser) {
-          return NextResponse.json(
-            { error: `LDAP username "${ldapUsername}" already exists in Active Directory` },
-            { status: 400 }
-          );
+          reusableAdRequest = await findReusableOffboardedRequest({
+            username: ldapUsername,
+            email: accessRequest.email,
+          });
+
+          if (!reusableAdRequest) {
+            return NextResponse.json(
+              { error: `LDAP username "${ldapUsername}" already exists in Active Directory` },
+              { status: 400 }
+            );
+          }
         }
       } catch (ldapError) {
         console.error('LDAP search error during acknowledgment:', ldapError);
@@ -84,13 +96,20 @@ export async function POST(
       // Check if username already exists in Active Directory (for external users)
       if (!accessRequest.isInternal && vpnUsername) {
         try {
-          const vpnUser = await searchLDAPUser(vpnUsername);
+          const vpnUser = await searchLDAPUserForProvisioning(vpnUsername);
           
           if (vpnUser) {
-            return NextResponse.json(
-              { error: `username "${vpnUsername}" already exists in Active Directory` },
-              { status: 400 }
-            );
+            reusableVpnRequest = await findReusableOffboardedRequest({
+              username: vpnUsername,
+              email: accessRequest.email,
+            });
+
+            if (!reusableVpnRequest) {
+              return NextResponse.json(
+                { error: `username "${vpnUsername}" already exists in Active Directory` },
+                { status: 400 }
+              );
+            }
           }
         } catch (ldapError) {
           console.error('LDAP search error for username:', ldapError);
@@ -103,7 +122,7 @@ export async function POST(
     }
 
     // Check if LDAP username is already in use in database
-    // NOTE: We exclude 'rejected' requests to allow username reuse after denial
+    // NOTE: We exclude reusable terminal requests so usernames can be reused after denial or campaign offboarding.
     const usernameChecks: Array<{ ldapUsername?: string; vpnUsername?: string }> = [{ ldapUsername }];
     
     // Only check username for external users
@@ -115,7 +134,7 @@ export async function POST(
       where: {
         OR: usernameChecks,
         id: { not: resolvedParams.id },
-        status: { notIn: ['rejected'] }, // Exclude rejected requests
+        status: { notIn: ['rejected', 'offboarded'] },
       },
     });
 
@@ -136,6 +155,12 @@ export async function POST(
       expirationDate?: Date;
       vpnUsername?: string;
       accountExpiresAt?: Date;
+      linkedAdUsername?: string;
+      linkedVpnUsername?: string;
+      isManuallyAssigned?: boolean;
+      manuallyAssignedAt?: Date;
+      manuallyAssignedBy?: string;
+      manualAssignmentNotes?: string;
     } = {
       acknowledgedByDirector: true,
       acknowledgedAt: new Date(),
@@ -144,6 +169,17 @@ export async function POST(
       ldapUsername,
       accountPassword: encryptPassword(password),
     };
+
+    const reusableRequest = reusableAdRequest || reusableVpnRequest;
+
+    if (reusableRequest) {
+      updateData.linkedAdUsername = ldapUsername;
+      updateData.linkedVpnUsername = vpnUsername || ldapUsername;
+      updateData.isManuallyAssigned = true;
+      updateData.manuallyAssignedAt = new Date();
+      updateData.manuallyAssignedBy = admin.username;
+      updateData.manualAssignmentNotes = `Prepared for reactivation from campaign-offboarded request ${reusableRequest.id}`;
+    }
 
     // Only set VPN username for external users
     if (!accessRequest.isInternal) {
@@ -180,6 +216,17 @@ export async function POST(
 
     if (!updatedRequest) {
       return NextResponse.json({ error: 'Request not found after update' }, { status: 404 });
+    }
+
+    if (reusableRequest) {
+      await prisma.requestComment.create({
+        data: {
+          requestId: resolvedParams.id,
+          comment: `Prepared for reactivation from campaign-offboarded request ${reusableRequest.id}. The existing account remains disabled until faculty approval re-enables access.`,
+          author: admin.username,
+          type: 'system',
+        },
+      });
     }
 
     // Create or update VPN account entry for tracking in VPN Management tab

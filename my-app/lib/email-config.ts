@@ -1,4 +1,5 @@
 import { prisma } from './prisma';
+import { validateEmail } from './validation';
 
 /**
  * Email configuration with database-first approach
@@ -15,6 +16,24 @@ let cachedSettings: {
 let lastFetchTime = 0;
 const CACHE_TTL = 60000; // 1 minute cache
 
+function normalizeEmailValue(value?: string | null): string | null {
+  const normalized = value?.trim().toLowerCase();
+  return normalized || null;
+}
+
+function normalizeAddressValue(value?: string | null): string | null {
+  const normalized = value?.trim();
+  return normalized || null;
+}
+
+function resolveEmailValue(databaseValue?: string | null, envValue?: string): string | undefined {
+  return normalizeEmailValue(databaseValue) || normalizeEmailValue(envValue) || undefined;
+}
+
+function resolveAddressValue(databaseValue?: string | null, envValue?: string): string | undefined {
+  return normalizeAddressValue(databaseValue) || normalizeAddressValue(envValue) || undefined;
+}
+
 /**
  * Get email configuration from database with fallback to env vars
  * Uses caching to avoid repeated database queries
@@ -25,16 +44,17 @@ export async function getEmailConfig() {
   // Return cached settings if still valid
   if (cachedSettings && (now - lastFetchTime) < CACHE_TTL) {
     return {
-      emailFrom: cachedSettings.emailFrom || process.env.EMAIL_FROM,
-      adminEmail: cachedSettings.adminEmail || process.env.ADMIN_EMAIL,
-      facultyEmail: cachedSettings.facultyEmail || process.env.FACULTY_EMAIL,
-      studentDirectorEmails: cachedSettings.studentDirectorEmails || process.env.STUDENT_DIRECTOR_EMAILS,
+      emailFrom: resolveAddressValue(cachedSettings.emailFrom, process.env.EMAIL_FROM),
+      adminEmail: resolveEmailValue(cachedSettings.adminEmail, process.env.ADMIN_EMAIL),
+      facultyEmail: resolveEmailValue(cachedSettings.facultyEmail, process.env.FACULTY_EMAIL),
+      studentDirectorEmails: cachedSettings.studentDirectorEmails?.trim() || process.env.STUDENT_DIRECTOR_EMAILS?.trim(),
     };
   }
 
   try {
     // Fetch from database
     const settings = await prisma.systemSettings.findFirst({
+      orderBy: { createdAt: 'desc' },
       select: {
         emailFrom: true,
         adminEmail: true,
@@ -49,20 +69,20 @@ export async function getEmailConfig() {
 
     // Return with env fallback
     return {
-      emailFrom: settings?.emailFrom || process.env.EMAIL_FROM,
-      adminEmail: settings?.adminEmail || process.env.ADMIN_EMAIL,
-      facultyEmail: settings?.facultyEmail || process.env.FACULTY_EMAIL,
-      studentDirectorEmails: settings?.studentDirectorEmails || process.env.STUDENT_DIRECTOR_EMAILS,
+      emailFrom: resolveAddressValue(settings?.emailFrom, process.env.EMAIL_FROM),
+      adminEmail: resolveEmailValue(settings?.adminEmail, process.env.ADMIN_EMAIL),
+      facultyEmail: resolveEmailValue(settings?.facultyEmail, process.env.FACULTY_EMAIL),
+      studentDirectorEmails: settings?.studentDirectorEmails?.trim() || process.env.STUDENT_DIRECTOR_EMAILS?.trim(),
     };
   } catch (error) {
     console.error('[Email Config] Failed to fetch from database, using env vars:', error);
     
     // Fallback to environment variables if database fails
     return {
-      emailFrom: process.env.EMAIL_FROM,
-      adminEmail: process.env.ADMIN_EMAIL,
-      facultyEmail: process.env.FACULTY_EMAIL,
-      studentDirectorEmails: process.env.STUDENT_DIRECTOR_EMAILS,
+      emailFrom: resolveAddressValue(null, process.env.EMAIL_FROM),
+      adminEmail: resolveEmailValue(null, process.env.ADMIN_EMAIL),
+      facultyEmail: resolveEmailValue(null, process.env.FACULTY_EMAIL),
+      studentDirectorEmails: process.env.STUDENT_DIRECTOR_EMAILS?.trim(),
     };
   }
 }
@@ -82,5 +102,10 @@ export function clearEmailConfigCache() {
 export async function getStudentDirectorEmails(): Promise<string[]> {
   const config = await getEmailConfig();
   const emailsStr = config.studentDirectorEmails || '';
-  return emailsStr.split(',').map((e: string) => e.trim()).filter((e: string) => e);
+  return Array.from(new Set(
+    emailsStr
+      .split(',')
+      .map((email: string) => email.trim().toLowerCase())
+      .filter((email: string) => email && validateEmail(email))
+  ));
 }

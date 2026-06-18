@@ -145,7 +145,7 @@ export type SyncStatusType =
 export interface SyncStatusAccount {
   identifier: string;
   name: string;
-  email: string;
+  email: string | null;
   hasAdAccount: boolean;
   adUsername: string | null;
   adDisplayName: string | null;

@@ -28,14 +28,14 @@ import {
 } from "@/components/ui/dialog";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Search, RefreshCw, Download, Filter, X } from "lucide-react";
+import { Search, RefreshCw, Download, Filter } from "lucide-react";
 import { Label } from "@/components/ui/label";
 
-interface SyncStatusAccount {
+export interface SyncStatusAccount {
   // Core identity
   identifier: string; // Primary identifier (AD username, email, or VPN username)
   name: string;
-  email: string;
+  email: string | null;
   
   // AD Status
   hasAdAccount: boolean;
@@ -79,16 +79,32 @@ interface LatestSyncInfo {
 }
 
 interface SyncStatusTabProps {
-  accounts: SyncStatusAccount[];
-  isLoading: boolean;
-  onRefresh: () => void;
-  latestSync: LatestSyncInfo | null;
+  accounts?: SyncStatusAccount[];
+  isLoading?: boolean;
+  latestSync?: LatestSyncInfo | null;
 }
 
 type SyncFilter = 'all' | 'fully_synced' | 'partial_sync' | 'ad_only' | 'vpn_only' | 'request_only' | 'orphaned' | 'issues';
 type DataSourceFilter = 'all' | 'has_ad' | 'has_vpn' | 'has_request' | 'missing_ad' | 'missing_vpn' | 'missing_request';
 
-export default function AccountSyncStatusTab({ accounts, isLoading, onRefresh, latestSync }: SyncStatusTabProps) {
+function textMatches(value: string | null | undefined, query: string): boolean {
+  return (value ?? '').toLowerCase().includes(query);
+}
+
+export function matchesSyncStatusSearch(account: SyncStatusAccount, searchQuery: string): boolean {
+  const query = searchQuery.trim().toLowerCase();
+  if (!query) return true;
+
+  return [
+    account.identifier,
+    account.name,
+    account.email,
+    account.adUsername,
+    account.vpnUsername,
+  ].some(value => textMatches(value, query));
+}
+
+export default function AccountSyncStatusTab({ accounts, isLoading = false, latestSync = null }: SyncStatusTabProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [syncFilter, setSyncFilter] = useState<SyncFilter>('all');
   const [dataSourceFilter, setDataSourceFilter] = useState<DataSourceFilter>('all');
@@ -99,7 +115,7 @@ export default function AccountSyncStatusTab({ accounts, isLoading, onRefresh, l
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
   const [selectedAccount, setSelectedAccount] = useState<SyncStatusAccount | null>(null);
   const [showDetailModal, setShowDetailModal] = useState(false);
-  const [localAccounts, setLocalAccounts] = useState<SyncStatusAccount[]>(accounts);
+  const [localAccounts, setLocalAccounts] = useState<SyncStatusAccount[]>(accounts ?? []);
   const [localLatestSync, setLocalLatestSync] = useState<LatestSyncInfo | null>(latestSync);
   const { showToast } = useToast();
 
@@ -124,7 +140,9 @@ export default function AccountSyncStatusTab({ accounts, isLoading, onRefresh, l
   });
 
   useEffect(() => {
-    setLocalAccounts(accounts);
+    if (accounts !== undefined) {
+      setLocalAccounts(accounts);
+    }
   }, [accounts]);
 
   useEffect(() => {
@@ -153,15 +171,7 @@ export default function AccountSyncStatusTab({ accounts, isLoading, onRefresh, l
 
     // Search
     if (searchQuery.trim()) {
-      const query = searchQuery.toLowerCase();
-      filtered = filtered.filter(
-        a =>
-          a.identifier.toLowerCase().includes(query) ||
-          a.name.toLowerCase().includes(query) ||
-          a.email.toLowerCase().includes(query) ||
-          a.adUsername?.toLowerCase().includes(query) ||
-          a.vpnUsername?.toLowerCase().includes(query)
-      );
+      filtered = filtered.filter(a => matchesSyncStatusSearch(a, searchQuery));
     }
 
     // Sync status filter
@@ -248,12 +258,6 @@ export default function AccountSyncStatusTab({ accounts, isLoading, onRefresh, l
   };
 
   const getSyncStatusBadge = (status: SyncStatusAccount['syncStatus']) => {
-    const variants: Record<string, "default" | "secondary" | "destructive" | "outline"> = {
-      fully_synced: 'default', // green-ish usually, default is black/white but we can style or use custom classes if needed. 
-      // Actually standard badge variants are limiting for multicolor. 
-      // Let's use className with Badge for custom colors to match existing logic
-    };
-    
     const styles = {
       fully_synced: 'bg-green-100 text-green-800 border-green-200 hover:bg-green-100',
       partial_sync: 'bg-yellow-100 text-yellow-800 border-yellow-200 hover:bg-yellow-100',
@@ -297,7 +301,7 @@ export default function AccountSyncStatusTab({ accounts, isLoading, onRefresh, l
     const csvData = sortedAccounts.map(acc => [
       acc.identifier,
       acc.name,
-      acc.email,
+      acc.email || '',
       acc.syncStatus,
       acc.hasAdAccount ? 'Yes' : 'No',
       acc.adUsername || 'N/A',
@@ -690,152 +694,152 @@ export default function AccountSyncStatusTab({ accounts, isLoading, onRefresh, l
 
           {selectedAccount && (
             <div className="space-y-6">
-              <div>
-                <h3 className="text-lg font-semibold text-gray-900 mb-3">Identity</h3>
-                <div className="bg-gray-50 rounded-lg p-4 space-y-2">
-                  <div className="flex justify-between">
-                    <span className="text-sm font-medium text-gray-500">Identifier:</span>
-                    <span className="text-sm text-gray-900 font-mono">{selectedAccount.identifier}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-sm font-medium text-gray-500">Name:</span>
-                    <span className="text-sm text-gray-900">{selectedAccount.name}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-sm font-medium text-gray-500">Email:</span>
-                    <span className="text-sm text-gray-900">{selectedAccount.email || <span className="text-gray-400">—</span>}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-sm font-medium text-gray-500">Sync Status:</span>
-                    {getSyncStatusBadge(selectedAccount.syncStatus)}
-                  </div>
-                </div>
-              </div>
-
-              <div>
-                <h3 className="text-lg font-semibold text-gray-900 mb-3">Active Directory</h3>
-                <div className="bg-gray-50 rounded-lg p-4 space-y-2">
-                  {selectedAccount.hasAdAccount ? (
-                    <>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Status:</span>
-                        <span className="text-sm text-green-600 font-medium">✓ Active</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Username:</span>
-                        <span className="text-sm text-gray-900 font-mono">{selectedAccount.adUsername}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Display Name:</span>
-                        <span className="text-sm text-gray-900">{selectedAccount.adDisplayName}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Email:</span>
-                        <span className="text-sm text-gray-900">{selectedAccount.adEmail || <span className="text-gray-400">—</span>}</span>
-                      </div>
-                      {selectedAccount.adSyncDate && (
-                        <div className="flex justify-between">
-                          <span className="text-sm font-medium text-gray-500">Last Synced:</span>
-                          <span className="text-sm text-gray-900">
-                            {new Date(selectedAccount.adSyncDate).toLocaleString()}
-                          </span>
-                        </div>
-                      )}
-                    </>
-                  ) : (
-                    <div className="text-sm text-red-600">No AD account found</div>
-                  )}
-                </div>
-              </div>
-
-              <div>
-                <h3 className="text-lg font-semibold text-gray-900 mb-3">VPN Access</h3>
-                <div className="bg-gray-50 rounded-lg p-4 space-y-2">
-                  {selectedAccount.hasVpnAccount ? (
-                    <>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Status:</span>
-                        <span className="text-sm text-green-600 font-medium">✓ Active</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Username:</span>
-                        <span className="text-sm text-gray-900 font-mono">{selectedAccount.vpnUsername}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Portal Type:</span>
-                        <span className="text-sm text-gray-900">{selectedAccount.vpnPortalType}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Account Status:</span>
-                        <span className="text-sm text-gray-900">{selectedAccount.vpnStatus}</span>
-                      </div>
-                      {selectedAccount.vpnCreatedAt && (
-                        <div className="flex justify-between">
-                          <span className="text-sm font-medium text-gray-500">Created:</span>
-                          <span className="text-sm text-gray-900">
-                            {new Date(selectedAccount.vpnCreatedAt).toLocaleString()}
-                          </span>
-                        </div>
-                      )}
-                    </>
-                  ) : (
-                    <div className="text-sm text-red-600">No VPN account found</div>
-                  )}
-                </div>
-              </div>
-
-              <div>
-                <h3 className="text-lg font-semibold text-gray-900 mb-3">Access Request</h3>
-                <div className="bg-gray-50 rounded-lg p-4 space-y-2">
-                  {selectedAccount.hasAccessRequest ? (
-                    <>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Status:</span>
-                        <span className="text-sm text-green-600 font-medium">✓ Exists</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Request ID:</span>
-                        <span className="text-sm text-gray-900 font-mono">{selectedAccount.requestId}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Request Status:</span>
-                        <span className="text-sm text-gray-900">{selectedAccount.requestStatus}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-sm font-medium text-gray-500">Manually Assigned:</span>
-                        <span className="text-sm text-gray-900">
-                          {selectedAccount.isManuallyAssigned ? 'Yes' : 'No'}
-                        </span>
-                      </div>
-                      {selectedAccount.requestCreatedAt && (
-                        <div className="flex justify-between">
-                          <span className="text-sm font-medium text-gray-500">Created:</span>
-                          <span className="text-sm text-gray-900">
-                            {new Date(selectedAccount.requestCreatedAt).toLocaleString()}
-                          </span>
-                        </div>
-                      )}
-                    </>
-                  ) : (
-                    <div className="text-sm text-red-600">No access request found</div>
-                  )}
-                </div>
-              </div>
-
-              {selectedAccount.syncIssues.length > 0 && (
                 <div>
-                  <h3 className="text-lg font-semibold text-red-900 mb-3">Sync Issues</h3>
-                  <div className="bg-red-50 rounded-lg p-4 border border-red-200">
-                    <ul className="list-disc list-inside space-y-1">
-                      {selectedAccount.syncIssues.map((issue, index) => (
-                        <li key={index} className="text-sm text-red-800">
-                          {issue}
-                        </li>
-                      ))}
-                    </ul>
+                  <h3 className="text-lg font-semibold text-gray-900 mb-3">Identity</h3>
+                  <div className="bg-gray-50 rounded-lg p-4 space-y-2">
+                    <div className="flex justify-between">
+                      <span className="text-sm font-medium text-gray-500">Identifier:</span>
+                      <span className="text-sm text-gray-900 font-mono">{selectedAccount.identifier}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-sm font-medium text-gray-500">Name:</span>
+                      <span className="text-sm text-gray-900">{selectedAccount.name}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-sm font-medium text-gray-500">Email:</span>
+                      <span className="text-sm text-gray-900">{selectedAccount.email || <span className="text-gray-400">—</span>}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-sm font-medium text-gray-500">Sync Status:</span>
+                      {getSyncStatusBadge(selectedAccount.syncStatus)}
+                    </div>
                   </div>
                 </div>
-              )}
+
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900 mb-3">Active Directory</h3>
+                  <div className="bg-gray-50 rounded-lg p-4 space-y-2">
+                    {selectedAccount.hasAdAccount ? (
+                      <>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Status:</span>
+                          <span className="text-sm text-green-600 font-medium">✓ Active</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Username:</span>
+                          <span className="text-sm text-gray-900 font-mono">{selectedAccount.adUsername}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Display Name:</span>
+                          <span className="text-sm text-gray-900">{selectedAccount.adDisplayName}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Email:</span>
+                          <span className="text-sm text-gray-900">{selectedAccount.adEmail || <span className="text-gray-400">—</span>}</span>
+                        </div>
+                        {selectedAccount.adSyncDate && (
+                          <div className="flex justify-between">
+                            <span className="text-sm font-medium text-gray-500">Last Synced:</span>
+                            <span className="text-sm text-gray-900">
+                              {new Date(selectedAccount.adSyncDate).toLocaleString()}
+                            </span>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div className="text-sm text-red-600">No AD account found</div>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900 mb-3">VPN Access</h3>
+                  <div className="bg-gray-50 rounded-lg p-4 space-y-2">
+                    {selectedAccount.hasVpnAccount ? (
+                      <>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Status:</span>
+                          <span className="text-sm text-green-600 font-medium">✓ Active</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Username:</span>
+                          <span className="text-sm text-gray-900 font-mono">{selectedAccount.vpnUsername}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Portal Type:</span>
+                          <span className="text-sm text-gray-900">{selectedAccount.vpnPortalType}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Account Status:</span>
+                          <span className="text-sm text-gray-900">{selectedAccount.vpnStatus}</span>
+                        </div>
+                        {selectedAccount.vpnCreatedAt && (
+                          <div className="flex justify-between">
+                            <span className="text-sm font-medium text-gray-500">Created:</span>
+                            <span className="text-sm text-gray-900">
+                              {new Date(selectedAccount.vpnCreatedAt).toLocaleString()}
+                            </span>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div className="text-sm text-red-600">No VPN account found</div>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900 mb-3">Access Request</h3>
+                  <div className="bg-gray-50 rounded-lg p-4 space-y-2">
+                    {selectedAccount.hasAccessRequest ? (
+                      <>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Status:</span>
+                          <span className="text-sm text-green-600 font-medium">✓ Exists</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Request ID:</span>
+                          <span className="text-sm text-gray-900 font-mono">{selectedAccount.requestId}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Request Status:</span>
+                          <span className="text-sm text-gray-900">{selectedAccount.requestStatus}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-sm font-medium text-gray-500">Manually Assigned:</span>
+                          <span className="text-sm text-gray-900">
+                            {selectedAccount.isManuallyAssigned ? 'Yes' : 'No'}
+                          </span>
+                        </div>
+                        {selectedAccount.requestCreatedAt && (
+                          <div className="flex justify-between">
+                            <span className="text-sm font-medium text-gray-500">Created:</span>
+                            <span className="text-sm text-gray-900">
+                              {new Date(selectedAccount.requestCreatedAt).toLocaleString()}
+                            </span>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div className="text-sm text-red-600">No access request found</div>
+                    )}
+                  </div>
+                </div>
+
+                {selectedAccount.syncIssues.length > 0 && (
+                  <div>
+                    <h3 className="text-lg font-semibold text-red-900 mb-3">Sync Issues</h3>
+                    <div className="bg-red-50 rounded-lg p-4 border border-red-200">
+                      <ul className="list-disc list-inside space-y-1">
+                        {selectedAccount.syncIssues.map((issue, index) => (
+                          <li key={index} className="text-sm text-red-800">
+                            {issue}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                )}
             </div>
           )}
         </DialogContent>

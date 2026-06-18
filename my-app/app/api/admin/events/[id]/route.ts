@@ -2,6 +2,14 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { isJsonBodyError, parseAdminJson } from '@/lib/admin-json-parser';
+
+type EventUpdateBody = {
+  name?: string;
+  description?: string | null;
+  endDate?: string | null;
+  isActive?: boolean;
+};
 
 // GET - Get specific event
 export async function GET(
@@ -69,7 +77,7 @@ export async function PATCH(
     }
 
     const { id } = await params;
-    const body = await request.json();
+    const body = await parseAdminJson<EventUpdateBody>(request);
     const { name, description, endDate, isActive } = body;
 
     const updateData: {
@@ -102,6 +110,10 @@ export async function PATCH(
 
     return NextResponse.json({ event });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
     console.error('Error updating event:', error);
     
     // Log the failure

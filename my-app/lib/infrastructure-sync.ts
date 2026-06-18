@@ -1,7 +1,10 @@
 import { formatRequestDescription, listUsersInOU, tagAccountWithAccessRequestId, updateUserAttributes } from './ldap';
+import type { Prisma } from '@prisma/client';
 import { extractBronconame } from './validation';
 import { prisma } from './prisma';
 import { appLogger } from './logger';
+import { logActionHistoryEvent } from '@/lib/action-history';
+import { AuditActions, AuditCategories } from '@/lib/audit-log';
 
 export interface InfrastructureSyncResult {
   syncId: string;
@@ -20,6 +23,7 @@ export interface InfrastructureSyncResult {
     action: 'created' | 'skipped_duplicate' | 'error';
     accessRequestId: string | null;
     vpnAccountId: string | null;
+    syncMatchId?: string | null;
     errorMessage?: string;
   }>;
   error?: string;
@@ -44,6 +48,21 @@ export async function syncInfrastructureAccounts(
       notes: dryRun ? 'Dry run - no records created' : 'Infrastructure sync - creating AccessRequest and VPNAccount records',
     },
   });
+  const correlationId = `infrastructure-sync:${syncRecord.id}`;
+
+  await logActionHistoryEvent({
+    action: AuditActions.SYNC_INFRASTRUCTURE,
+    category: AuditCategories.SYNC_STATUS,
+    username: triggeredBy,
+    actorType: triggeredBy === 'system' ? 'system' : 'admin',
+    targetId: syncRecord.id,
+    targetType: 'ADAccountSync',
+    eventKind: 'sync',
+    outcome: 'pending',
+    success: true,
+    details: { dryRun, status: 'running' },
+    correlationId,
+  });
 
   try {
     appLogger.info('Fetching all AD users with @cpp.edu emails');
@@ -65,6 +84,20 @@ export async function syncInfrastructureAccounts(
         },
       });
 
+      await logActionHistoryEvent({
+        action: AuditActions.SYNC_INFRASTRUCTURE,
+        category: AuditCategories.SYNC_STATUS,
+        username: triggeredBy,
+        actorType: triggeredBy === 'system' ? 'system' : 'admin',
+        targetId: syncRecord.id,
+        targetType: 'ADAccountSync',
+        eventKind: 'sync',
+        outcome: 'success',
+        success: true,
+        details: { dryRun, totalADAccounts: 0, note: 'No AD accounts found with @cpp.edu emails' },
+        correlationId,
+      });
+
       return {
         syncId: syncRecord.id,
         status: 'completed',
@@ -80,7 +113,7 @@ export async function syncInfrastructureAccounts(
     }
 
     const result = await prisma.$transaction(
-      async (tx: any) => {
+      async (tx: Prisma.TransactionClient) => {
         const records: InfrastructureSyncResult['records'] = [];
         let newAccessRequests = 0;
         let newVPNAccounts = 0;
@@ -114,6 +147,7 @@ export async function syncInfrastructureAccounts(
                   { vpnUsername: bronconame },
                   { linkedAdUsername: bronconame },
                 ],
+                status: { notIn: ['rejected', 'offboarded'] },
               },
             });
 
@@ -259,7 +293,7 @@ export async function syncInfrastructureAccounts(
               });
             }
 
-            await tx.aDAccountMatch.create({
+            const syncMatch = await tx.aDAccountMatch.create({
               data: {
                 syncId: syncRecord.id,
                 adUsername: bronconame,
@@ -284,6 +318,7 @@ export async function syncInfrastructureAccounts(
               action: 'created',
               accessRequestId,
               vpnAccountId,
+              syncMatchId: syncMatch.id,
             });
           } catch (error) {
             appLogger.error(`Error processing AD user ${adUser.email}`, error);
@@ -339,6 +374,52 @@ export async function syncInfrastructureAccounts(
       },
     });
 
+    await Promise.all(result.records.map((record) => logActionHistoryEvent({
+      action: AuditActions.SYNC_ACCOUNT_PROCESSED,
+      category: AuditCategories.SYNC_STATUS,
+      username: triggeredBy,
+      actorType: triggeredBy === 'system' ? 'system' : 'admin',
+      targetId: record.accessRequestId || record.vpnAccountId || syncRecord.id,
+      targetType: record.accessRequestId ? 'AccessRequest' : record.vpnAccountId ? 'VPNAccount' : 'ADAccountSync',
+      subjectUsername: record.adUsername === 'unknown' ? null : record.adUsername,
+      subjectEmail: record.adEmail,
+      relatedRequestId: record.accessRequestId,
+      relatedVpnAccountId: record.vpnAccountId,
+      eventKind: 'sync',
+      outcome: record.action === 'error' ? 'failure' : record.action === 'skipped_duplicate' ? 'skipped' : dryRun ? 'pending' : 'success',
+      success: record.action !== 'error',
+      errorMessage: record.errorMessage,
+      details: {
+        syncId: syncRecord.id,
+        syncMatchId: record.syncMatchId,
+        action: record.action,
+        adDisplayName: record.adDisplayName,
+        dryRun,
+      },
+      correlationId,
+    })));
+
+    await logActionHistoryEvent({
+      action: AuditActions.SYNC_INFRASTRUCTURE,
+      category: AuditCategories.SYNC_STATUS,
+      username: triggeredBy,
+      actorType: triggeredBy === 'system' ? 'system' : 'admin',
+      targetId: syncRecord.id,
+      targetType: 'ADAccountSync',
+      eventKind: 'sync',
+      outcome: result.errors === 0 ? 'success' : 'failure',
+      success: result.errors === 0,
+      details: {
+        dryRun,
+        totalADAccounts: cppAdUsers.length,
+        newAccessRequests: result.newAccessRequests,
+        newVPNAccounts: result.newVPNAccounts,
+        skippedDuplicates: result.skippedDuplicates,
+        errors: result.errors,
+      },
+      correlationId,
+    });
+
     return {
       syncId: syncRecord.id,
       status: result.errors === 0 ? 'completed' : 'partial',
@@ -369,6 +450,21 @@ export async function syncInfrastructureAccounts(
     } catch (updateError) {
       appLogger.error('Failed to update sync record with error', updateError);
     }
+
+    await logActionHistoryEvent({
+      action: AuditActions.SYNC_INFRASTRUCTURE,
+      category: AuditCategories.SYNC_STATUS,
+      username: triggeredBy,
+      actorType: triggeredBy === 'system' ? 'system' : 'admin',
+      targetId: syncRecord.id,
+      targetType: 'ADAccountSync',
+      eventKind: 'sync',
+      outcome: 'rollback',
+      success: false,
+      errorMessage,
+      details: { dryRun, note: 'Transaction failed - no changes were persisted to database' },
+      correlationId,
+    });
 
     return {
       syncId: syncRecord.id,

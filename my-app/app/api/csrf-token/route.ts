@@ -1,12 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
+import { CSRF_HEADER_NAME, csrfCookieOptions } from '@/lib/csrf-cookie-policy';
 import { getSessionFromRequest } from '@/lib/session';
 import { checkRateLimitAsync, getClientIp } from '@/lib/ratelimit';
 
 export const dynamic = 'force-dynamic';
-
-const CSRF_COOKIE_NAME = 'csrf-token';
-const CSRF_MAX_AGE_SECONDS = 60 * 60 * 8;
 
 function generateCsrfToken(sessionId: string): string {
   const secret = process.env.NEXTAUTH_SECRET || process.env.ENCRYPTION_SECRET;
@@ -44,17 +42,9 @@ export async function GET(request: NextRequest) {
     const genericToken = crypto.randomBytes(32).toString('hex');
     const response = NextResponse.json({ csrfToken: genericToken });
 
-    response.cookies.set({
-      name: CSRF_COOKIE_NAME,
-      value: genericToken,
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      path: '/',
-      maxAge: CSRF_MAX_AGE_SECONDS,
-    });
+    response.cookies.set(csrfCookieOptions(genericToken));
 
-    response.headers.set('x-csrf-token', genericToken);
+    response.headers.set(CSRF_HEADER_NAME, genericToken);
     return response;
   }
 
@@ -62,17 +52,9 @@ export async function GET(request: NextRequest) {
 
   const response = NextResponse.json({ csrfToken });
 
-  response.cookies.set({
-    name: CSRF_COOKIE_NAME,
-    value: csrfToken,
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict',
-    path: '/',
-    maxAge: CSRF_MAX_AGE_SECONDS,
-  });
+  response.cookies.set(csrfCookieOptions(csrfToken));
 
-  response.headers.set('x-csrf-token', csrfToken);
+  response.headers.set(CSRF_HEADER_NAME, csrfToken);
 
   return response;
 }

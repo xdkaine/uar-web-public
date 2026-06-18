@@ -3,8 +3,111 @@ import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import logger from '@/lib/logger';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit, validateEmail, validateStringLength } from '@/lib/validation';
 
 export const dynamic = 'force-dynamic';
+
+interface SettingsUpdateBody {
+  loginDisabled?: unknown;
+  internalRegistrationDisabled?: unknown;
+  externalRegistrationDisabled?: unknown;
+  globalNotificationBanner?: unknown;
+  notificationBannerType?: unknown;
+  manualOverride?: unknown;
+  emailFrom?: unknown;
+  adminEmail?: unknown;
+  facultyEmail?: unknown;
+  studentDirectorEmails?: unknown;
+}
+
+type SettingsUpdateData = {
+  lastModifiedBy: string;
+  loginDisabled?: boolean;
+  internalRegistrationDisabled?: boolean;
+  externalRegistrationDisabled?: boolean;
+  globalNotificationBanner?: string | null;
+  notificationBannerType?: string | null;
+  manualOverride?: boolean;
+  emailFrom?: string | null;
+  adminEmail?: string | null;
+  facultyEmail?: string | null;
+  studentDirectorEmails?: string | null;
+};
+
+function isValidEmailAddress(value: string, allowDisplayName = false): boolean {
+  if (validateEmail(value.toLowerCase())) {
+    return true;
+  }
+
+  if (!allowDisplayName) {
+    return false;
+  }
+
+  const displayNameMatch = value.match(/^.+<([^<>]+)>$/);
+  return !!displayNameMatch && validateEmail(displayNameMatch[1].trim().toLowerCase());
+}
+
+function normalizeOptionalEmail(
+  value: unknown,
+  fieldName: string,
+  options: { allowDisplayName?: boolean } = {}
+): { value?: string | null; error?: string } {
+  if (value === undefined) {
+    return {};
+  }
+
+  if (value === null) {
+    return { value: null };
+  }
+
+  if (typeof value !== 'string') {
+    return { error: `${fieldName} must be an email address` };
+  }
+
+  const normalized = options.allowDisplayName ? value.trim() : value.trim().toLowerCase();
+  if (!normalized) {
+    return { value: null };
+  }
+
+  if (!isValidEmailAddress(normalized, options.allowDisplayName)) {
+    return { error: `${fieldName} must be a valid email address` };
+  }
+
+  return { value: normalized };
+}
+
+function normalizeStudentDirectorEmails(value: unknown): { value?: string | null; error?: string } {
+  if (value === undefined) {
+    return {};
+  }
+
+  if (value === null) {
+    return { value: null };
+  }
+
+  if (typeof value !== 'string') {
+    return { error: 'Student director emails must be a comma-separated list' };
+  }
+
+  const lengthValidation = validateStringLength(value, 'Student director emails', 2000);
+  if (!lengthValidation.valid) {
+    return { error: lengthValidation.error };
+  }
+
+  const emails = Array.from(new Set(
+    value
+      .split(',')
+      .map((email) => email.trim().toLowerCase())
+      .filter(Boolean)
+  ));
+
+  const invalidEmail = emails.find((email) => !validateEmail(email));
+  if (invalidEmail) {
+    return { error: `Student director email is invalid: ${invalidEmail}` };
+  }
+
+  return { value: emails.length > 0 ? emails.join(', ') : null };
+}
 
 // GET /api/admin/settings - Get system settings
 export async function GET(request: NextRequest) {
@@ -39,7 +142,15 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    return NextResponse.json({ settings });
+    return NextResponse.json({
+      settings: {
+        ...settings,
+        emailFrom: settings.emailFrom || process.env.EMAIL_FROM || null,
+        adminEmail: settings.adminEmail || process.env.ADMIN_EMAIL || null,
+        facultyEmail: settings.facultyEmail || process.env.FACULTY_EMAIL || null,
+        studentDirectorEmails: settings.studentDirectorEmails || process.env.STUDENT_DIRECTOR_EMAILS || null,
+      },
+    });
   } catch (error) {
     logger.error('Error fetching system settings', {
       action: 'fetch_settings',
@@ -60,7 +171,7 @@ export async function PATCH(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const body = await request.json();
+    const body = await parseJsonWithLimit<SettingsUpdateBody>(request, MAX_REQUEST_BODY_SIZE.SMALL);
     const {
       loginDisabled,
       internalRegistrationDisabled,
@@ -76,11 +187,28 @@ export async function PATCH(request: NextRequest) {
 
     // Validate notification banner type
     const validBannerTypes = ['info', 'warning', 'error', 'success', null];
-    if (notificationBannerType !== undefined && !validBannerTypes.includes(notificationBannerType)) {
+    if (
+      notificationBannerType !== undefined &&
+      !(notificationBannerType === null || (typeof notificationBannerType === 'string' && validBannerTypes.includes(notificationBannerType)))
+    ) {
       return NextResponse.json(
         { error: 'Invalid notification banner type' },
         { status: 400 }
       );
+    }
+
+    for (const [fieldName, fieldValue] of Object.entries({
+      loginDisabled,
+      internalRegistrationDisabled,
+      externalRegistrationDisabled,
+      manualOverride,
+    })) {
+      if (fieldValue !== undefined && typeof fieldValue !== 'boolean') {
+        return NextResponse.json(
+          { error: `${fieldName} must be a boolean` },
+          { status: 400 }
+        );
+      }
     }
 
     // Get current settings
@@ -111,26 +239,52 @@ export async function PATCH(request: NextRequest) {
     }
 
     // Prepare update data
-    const updateData: any = {
+    const updateData: SettingsUpdateData = {
       lastModifiedBy: admin.username,
     };
 
-    if (loginDisabled !== undefined) updateData.loginDisabled = loginDisabled;
-    if (internalRegistrationDisabled !== undefined) updateData.internalRegistrationDisabled = internalRegistrationDisabled;
-    if (externalRegistrationDisabled !== undefined) updateData.externalRegistrationDisabled = externalRegistrationDisabled;
-    if (globalNotificationBanner !== undefined) updateData.globalNotificationBanner = globalNotificationBanner;
-    if (notificationBannerType !== undefined) updateData.notificationBannerType = notificationBannerType;
+    if (loginDisabled !== undefined) updateData.loginDisabled = loginDisabled as boolean;
+    if (internalRegistrationDisabled !== undefined) updateData.internalRegistrationDisabled = internalRegistrationDisabled as boolean;
+    if (externalRegistrationDisabled !== undefined) updateData.externalRegistrationDisabled = externalRegistrationDisabled as boolean;
+    if (globalNotificationBanner !== undefined) {
+      if (globalNotificationBanner !== null && typeof globalNotificationBanner !== 'string') {
+        return NextResponse.json({ error: 'Notification banner must be text' }, { status: 400 });
+      }
+      updateData.globalNotificationBanner = typeof globalNotificationBanner === 'string'
+        ? globalNotificationBanner.trim() || null
+        : null;
+    }
+    if (notificationBannerType !== undefined) updateData.notificationBannerType = notificationBannerType as string | null;
     
     // Update manualOverride if login is being disabled
     if (manualOverride !== undefined) {
-      updateData.manualOverride = manualOverride;
+      updateData.manualOverride = manualOverride as boolean;
     }
 
     // Update email configuration
-    if (emailFrom !== undefined) updateData.emailFrom = emailFrom;
-    if (adminEmail !== undefined) updateData.adminEmail = adminEmail;
-    if (facultyEmail !== undefined) updateData.facultyEmail = facultyEmail;
-    if (studentDirectorEmails !== undefined) updateData.studentDirectorEmails = studentDirectorEmails;
+    const normalizedEmailFrom = normalizeOptionalEmail(emailFrom, 'From address', { allowDisplayName: true });
+    if (normalizedEmailFrom.error) {
+      return NextResponse.json({ error: normalizedEmailFrom.error }, { status: 400 });
+    }
+    if (emailFrom !== undefined) updateData.emailFrom = normalizedEmailFrom.value ?? null;
+
+    const normalizedAdminEmail = normalizeOptionalEmail(adminEmail, 'Admin email');
+    if (normalizedAdminEmail.error) {
+      return NextResponse.json({ error: normalizedAdminEmail.error }, { status: 400 });
+    }
+    if (adminEmail !== undefined) updateData.adminEmail = normalizedAdminEmail.value ?? null;
+
+    const normalizedFacultyEmail = normalizeOptionalEmail(facultyEmail, 'Faculty email');
+    if (normalizedFacultyEmail.error) {
+      return NextResponse.json({ error: normalizedFacultyEmail.error }, { status: 400 });
+    }
+    if (facultyEmail !== undefined) updateData.facultyEmail = normalizedFacultyEmail.value ?? null;
+
+    const normalizedDirectorEmails = normalizeStudentDirectorEmails(studentDirectorEmails);
+    if (normalizedDirectorEmails.error) {
+      return NextResponse.json({ error: normalizedDirectorEmails.error }, { status: 400 });
+    }
+    if (studentDirectorEmails !== undefined) updateData.studentDirectorEmails = normalizedDirectorEmails.value ?? null;
 
     const updatedSettings = await prisma.systemSettings.update({
       where: { id: currentSettings.id },
@@ -147,7 +301,7 @@ export async function PATCH(request: NextRequest) {
       action: 'update_settings',
       settingsId: updatedSettings.id,
       updatedBy: admin.username,
-      changes: updateData,
+      changedFields: Object.keys(updateData).filter((key) => key !== 'lastModifiedBy'),
     });
 
     // Log the settings update to audit log
@@ -158,7 +312,7 @@ export async function PATCH(request: NextRequest) {
       targetId: updatedSettings.id,
       targetType: 'SystemSettings',
       details: {
-        changes: updateData,
+        changedFields: Object.keys(updateData).filter((key) => key !== 'lastModifiedBy'),
         loginDisabled: updatedSettings.loginDisabled,
         internalRegistrationDisabled: updatedSettings.internalRegistrationDisabled,
         externalRegistrationDisabled: updatedSettings.externalRegistrationDisabled,
@@ -173,6 +327,10 @@ export async function PATCH(request: NextRequest) {
       message: 'Settings updated successfully',
     });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
     logger.error('Error updating system settings', {
       action: 'update_settings',
       error: error instanceof Error ? error.message : 'Unknown error',

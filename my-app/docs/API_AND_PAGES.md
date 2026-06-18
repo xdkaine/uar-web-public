@@ -2,7 +2,7 @@
 
 This document maps the application's user-facing pages, administrative surfaces, and API domains. The goal is not just to list routes, but to show how users and administrators move through the system.
 
-## Pages
+## 📄 Pages
 
 ### Page Surface Map
 
@@ -95,7 +95,7 @@ flowchart TB
 | `/request/internal` | **Internal Request Form**. Internal requester flow for `@cpp.edu` users. |
 | `/request/external` | **External Request Form**. External requester flow for visitors and event users. |
 | `/request/success` | **Request Success**. Confirmation page shown after request submission. |
-| `/login` | **Admin Login**. LDAP-backed sign-in page protected by Turnstile. |
+| `/login` | **Login**. LDAP-backed sign-in page protected by Turnstile; can complete AD-required password changes when the directory blocks logon until a new password is set. |
 | `/forgot-password` | **Forgot Password**. Public password reset request form. |
 | `/reset-password` | **Reset Password**. Password reset form for token-based recovery. |
 | `/instructions` | **Instructions**. VPN and onboarding instructions for authenticated users. |
@@ -213,7 +213,13 @@ flowchart LR
 flowchart TB
     Credentials["Username + password + Turnstile"] --> Login["POST /api/auth/login"]
     Login --> Ldap["LDAP credential validation"]
-    Ldap --> Role["Admin group evaluation"]
+    Ldap --> ChangeRequired{"AD requires new password?"}
+    ChangeRequired -->|Yes| Challenge["Create password-change challenge"]
+    Challenge --> CompleteChange["POST /api/auth/complete-required-password-change"]
+    CompleteChange --> LdapReset["Change LDAP password"]
+    CompleteChange --> Role
+    ChangeRequired -->|No| Role
+    Role["Admin group evaluation"]
     Role --> Session["Create database-backed session"]
     Session --> Cookie["Set secure session cookie"]
     Cookie --> Me["GET /api/auth/session"]
@@ -229,7 +235,8 @@ flowchart TB
 
 | Method | Path | Description |
 | :--- | :--- | :--- |
-| `POST` | `/api/auth/login` | Authenticate a user against LDAP and establish a portal session. |
+| `POST` | `/api/auth/login` | Authenticate a user against LDAP and establish a portal session, or issue a short-lived password-change challenge when AD returns a required-change state. |
+| `POST` | `/api/auth/complete-required-password-change` | Complete an AD-required password change from the login page, clear the forced-change marker, and establish the normal portal session. |
 | `POST` | `/api/auth/logout` | Destroy the current session cookie and invalidate the session row. |
 | `GET` | `/api/auth/session` | Return the current session state for the browser. |
 | `GET` | `/api/auth/check-admin` | Verify whether the current session has administrative privileges. |
@@ -312,6 +319,7 @@ flowchart TB
 | `/api/admin/account-lifecycle/[id]*` | Inspect, retry, cancel, or update a specific lifecycle action. |
 | `/api/admin/account-lifecycle/batch` | Submit grouped lifecycle operations. |
 | `/api/admin/account-lifecycle/process` | Manually trigger lifecycle processing. |
+| `/api/admin/mass-email*` | Preview, dry-run, create, activate, quick-send, test, cancel, inspect, and process administrator mass email campaigns. |
 | `/api/admin/sync-status` | View AD/VPN/request reconciliation status. |
 | `/api/admin/settings/infrastructure-sync` | Run or inspect infrastructure backfill/sync jobs. |
 
@@ -381,3 +389,5 @@ flowchart LR
 | :--- | :--- | :--- |
 | `GET` | `/api/cron/process-lifecycle-queue` | Scheduled processing of queued lifecycle actions. |
 | `POST` | `/api/cron/process-lifecycle-queue` | Manual or compatible alternate trigger for the same queue processor. |
+| `GET` | `/api/cron/process-mass-email` | Scheduled processing of active mass email campaign sends. |
+| `POST` | `/api/cron/process-mass-email` | Manual or compatible alternate trigger for mass email queue processing. |

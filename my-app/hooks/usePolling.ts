@@ -38,6 +38,7 @@ export function usePolling<T>(
   
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
   const mountedRef = useRef<boolean>(true);
+  const inFlightRef = useRef<Promise<void> | null>(null);
   
   // Use refs for fetcher and callbacks to avoid recreating fetchData
   const fetcherRef = useRef(fetcher);
@@ -59,26 +60,42 @@ export function usePolling<T>(
 
   // Function to fetch data - now with stable dependencies
   const fetchData = useCallback(async (silent = false) => {
-    if (!silent) setIsLoading(true);
-    
-    try {
-      const result = await fetcherRef.current();
-      
-      if (mountedRef.current) {
-        setData(result);
-        setError(null);
-        setLastUpdated(new Date());
-        if (!silent) setIsLoading(false);
-        onSuccessRef.current?.(result);
-      }
-    } catch (err) {
-      if (mountedRef.current) {
-        const errorObj = err instanceof Error ? err : new Error(String(err));
-        setError(errorObj);
-        if (!silent) setIsLoading(false);
-        onErrorRef.current?.(errorObj);
-      }
+    if (inFlightRef.current) {
+      return inFlightRef.current;
     }
+
+    if (!silent) setIsLoading(true);
+
+    const request = (async () => {
+      try {
+        const result = await fetcherRef.current();
+
+        if (mountedRef.current) {
+          setData(result);
+          setError(null);
+          setLastUpdated(new Date());
+          if (!silent) setIsLoading(false);
+          onSuccessRef.current?.(result);
+        }
+      } catch (err) {
+        if (mountedRef.current) {
+          const errorObj = err instanceof Error ? err : new Error(String(err));
+          setError(errorObj);
+          if (!silent) setIsLoading(false);
+          onErrorRef.current?.(errorObj);
+        }
+      }
+    })();
+
+    inFlightRef.current = request;
+    const clearInFlight = () => {
+      if (inFlightRef.current === request) {
+        inFlightRef.current = null;
+      }
+    };
+    request.then(clearInFlight, clearInFlight);
+
+    return request;
   }, []); // No dependencies - uses refs
 
   // Initial fetch - runs only once on mount

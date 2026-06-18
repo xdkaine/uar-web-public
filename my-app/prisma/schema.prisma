@@ -81,10 +81,10 @@ model AccessRequest {
   @@index([linkedVpnUsername])
   @@index([adAccountStatus])
   @@index([vpnAccountStatus])
-  // Removed global unique constraints - usernames can be reused after rejection
+  // Removed global unique constraints - usernames can be reused after rejection or campaign offboarding
   // @@unique([ldapUsername])
   // @@unique([vpnUsername])
-  @@unique([linkedAdUsername])
+  // @@unique([linkedAdUsername])
 }
 
 model RequestComment {
@@ -145,6 +145,24 @@ model AccountActivationToken {
   @@index([tokenHash])
   @@index([expiresAt])
   @@index([accessRequestId])
+}
+
+model PasswordChangeChallenge {
+  id        String    @id @default(cuid())
+  username  String
+  tokenHash String    @unique
+  reason    String
+  expiresAt DateTime
+  used      Boolean   @default(false)
+  usedAt    DateTime?
+  attempts  Int       @default(0)
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime  @default(now())
+
+  @@index([tokenHash])
+  @@index([username])
+  @@index([expiresAt])
 }
 
 model SupportTicket {
@@ -475,14 +493,101 @@ model NotificationBanner {
   @@index([endDate])
 }
 
+model MassEmailCampaign {
+  id                 String               @id @default(cuid())
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  name               String?
+  subject            String
+  html               String
+  text               String
+  createdBy          String
+  status             String               @default("draft") // "draft", "active", "completed", "cancelled"
+  quickSend          Boolean              @default(false)
+  dryRunAt           DateTime             @default(now())
+  activatedAt        DateTime?
+  activatedBy        String?
+  completedAt        DateTime?
+  cancelledAt        DateTime?
+  cancelledBy        String?
+  targetSnapshot     Json?
+  totalRecipients    Int                  @default(0)
+  eligibleRecipients Int                  @default(0)
+  skippedRecipients  Int                  @default(0)
+  sentCount          Int                  @default(0)
+  failedCount        Int                  @default(0)
+  recipients         MassEmailRecipient[]
+  logs               MassEmailLog[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([createdBy])
+}
+
+model MassEmailRecipient {
+  id             String            @id @default(cuid())
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  campaignId     String
+  campaign       MassEmailCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  email          String
+  displayName    String?
+  adUsername     String?
+  adDn           String?
+  accountEnabled Boolean?
+  status         String            @default("ready") // "ready", "pending_send", "sending", "sent", "failed"
+  sources        Json?
+  emailClaimedAt DateTime?
+  sentAt         DateTime?
+  messageId      String?
+  failedAt       DateTime?
+  lastError      String?
+  logs           MassEmailLog[]
+
+  @@unique([campaignId, email])
+  @@index([campaignId])
+  @@index([status])
+  @@index([email])
+  @@index([adUsername])
+}
+
+model MassEmailLog {
+  id          String              @id @default(cuid())
+  createdAt   DateTime            @default(now())
+  campaignId  String
+  campaign    MassEmailCampaign   @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  recipientId String?
+  recipient   MassEmailRecipient? @relation(fields: [recipientId], references: [id], onDelete: SetNull)
+  level       String              @default("info")
+  eventType   String
+  actor       String?
+  message     String
+  details     Json?
+
+  @@index([campaignId])
+  @@index([recipientId])
+  @@index([eventType])
+  @@index([level])
+  @@index([createdAt])
+}
+
 model AuditLog {
   id            String    @id @default(cuid())
   createdAt     DateTime  @default(now())
   action        String    // Action type: "view_page", "create", "update", "delete", "approve", "reject", etc.
   category      String    // Category: "access_request", "event", "user", "batch", "vpn", "support", "settings", "blocklist", "navigation"
   username      String    // Admin who performed the action
+  actorType     String?   // "admin", "user", "system", or "anonymous"
   targetId      String?   // ID of the affected resource (if applicable)
   targetType    String?   // Type of target: "AccessRequest", "Event", "User", "Batch", "VPNAccount", "SupportTicket", etc.
+  subjectUsername String? // User/account username this log entry is about
+  subjectEmail  String?   // User/account email this log entry is about
+  relatedRequestId String? // AccessRequest ID this action affected or was derived from
+  relatedVpnAccountId String? // VPNAccount ID this action affected or was derived from
+  relatedLifecycleActionId String? // AccountLifecycleAction ID this action affected or was derived from
+  eventKind     String?   // "read", "write", "notification", "security", "system", "lifecycle", "sync"
+  outcome       String?   // "success", "failure", "denied", "pending", "rollback", "skipped"
+  correlationId String?   // Groups multi-step operations across logs
   details       String?   // JSON string with additional details about the action
   ipAddress     String?   // IP address of the admin
   userAgent     String?   // Browser/user agent information
@@ -495,6 +600,15 @@ model AuditLog {
   @@index([createdAt])
   @@index([targetType])
   @@index([success])
+  @@index([actorType])
+  @@index([subjectUsername, createdAt])
+  @@index([subjectEmail, createdAt])
+  @@index([relatedRequestId, createdAt])
+  @@index([relatedVpnAccountId, createdAt])
+  @@index([relatedLifecycleActionId, createdAt])
+  @@index([eventKind])
+  @@index([outcome])
+  @@index([correlationId])
 }
 
 // Account Lifecycle Management - Track disable/enable operations for AD and VPN accounts
@@ -525,6 +639,10 @@ model AccountLifecycleAction {
   notes               String?                       // Additional notes
   batchId             String?                       // Link to AccountLifecycleBatch if part of batch
   batch               AccountLifecycleBatch?        @relation(fields: [batchId], references: [id])
+  offboardCampaignId  String?                       // Link to an offboard campaign if this action was created by campaign enforcement/rollback
+  offboardRecipientId String?                       // Link to the offboard campaign recipient that caused this action
+  offboardCampaign    OffboardCampaign?             @relation(fields: [offboardCampaignId], references: [id], onDelete: SetNull)
+  offboardRecipient   OffboardCampaignRecipient?    @relation(fields: [offboardRecipientId], references: [id], onDelete: SetNull)
   history             AccountLifecycleHistory[]
   adActivityLogs      ADAccountActivityLog[]
   vpnActivityLogs     VPNAccountActivityLog[]
@@ -539,6 +657,204 @@ model AccountLifecycleAction {
   @@index([relatedRequestId])
   @@index([relatedTicketId])
   @@index([targetUserId])
+  @@index([offboardCampaignId])
+  @@index([offboardRecipientId])
+}
+
+model OffboardCampaign {
+  id                        String                      @id @default(cuid())
+  createdAt                 DateTime                    @default(now())
+  updatedAt                 DateTime                    @updatedAt
+  name                      String
+  createdBy                 String
+  status                    String                      @default("dry_run") // "dry_run", "active", "completed", "cancelled"
+  dryRunAt                  DateTime                    @default(now())
+  activatedAt               DateTime?
+  activatedBy               String?
+  completedAt               DateTime?
+  cancelledAt               DateTime?
+  cancelledBy               String?
+  emergencyStoppedAt        DateTime?
+  emergencyStoppedBy        String?
+  activeLockKey             String?                     @unique
+  waveSize                  Int                         @default(25)
+  canarySize                Int                         @default(0)
+  currentWave               Int                         @default(0)
+  pauseAfterEachWave        Boolean                     @default(true)
+  sendingPaused             Boolean                     @default(true)
+  remindersPaused           Boolean                     @default(false)
+  enforcementPaused         Boolean                     @default(false)
+  sendingCompletedAt        DateTime?
+  rollbackState             String                      @default("none") // "none", "previewed", "processing", "completed", "failed"
+  rollbackStartedAt         DateTime?
+  rollbackStartedBy         String?
+  rollbackCompletedAt       DateTime?
+  manualExcludedUsernames   Json?
+  manualExcludedEmails      Json?
+  summaryJson               Json?
+  totalRecipients           Int                         @default(0)
+  eligibleRecipients        Int                         @default(0)
+  skippedRecipients         Int                         @default(0)
+  sentCount                 Int                         @default(0)
+  reminder3Count            Int                         @default(0)
+  reminder6Count            Int                         @default(0)
+  verifiedCount             Int                         @default(0)
+  enforcedCount             Int                         @default(0)
+  failedCount               Int                         @default(0)
+  rollbackSuccessCount      Int                         @default(0)
+  rollbackFailureCount      Int                         @default(0)
+  recipients                OffboardCampaignRecipient[]
+  logs                      OffboardCampaignLog[]
+  extensions                OffboardCampaignExtension[]
+  lifecycleActions          AccountLifecycleAction[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([activeLockKey])
+}
+
+model OffboardCampaignRecipient {
+  id                    String                   @id @default(cuid())
+  createdAt             DateTime                 @default(now())
+  updatedAt             DateTime                 @updatedAt
+  campaignId            String
+  campaign              OffboardCampaign         @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  email                 String
+  displayName           String?
+  adUsername            String
+  adDn                  String?
+  linkedVpnUsername     String?
+  accessRequestId       String?
+  vpnAccountId          String?
+  originalAdEnabled     Boolean?
+  originalAdStatus      String?
+  originalVpnStatus     String?
+  originalVpnPortalType String?
+  originalSnapshot      Json?
+  tokenHash             String?                  @unique
+  waveNumber            Int                      @default(0)
+  status                String                   @default("dry_run_ready")
+  skipReason            String?
+  projectedDeadlineAt   DateTime?
+  projectedAction       String?
+  emailClaimedAt        DateTime?
+  initialEmailSentAt    DateTime?
+  initialEmailMessageId String?
+  reminder3ClaimedAt    DateTime?
+  reminder3SentAt       DateTime?
+  reminder6ClaimedAt    DateTime?
+  reminder6SentAt       DateTime?
+  deadlineAt            DateTime?
+  verifiedAt            DateTime?
+  verifiedIpAddress     String?
+  verifiedUserAgent     String?
+  enforcementClaimedAt  DateTime?
+  enforcedAt            DateTime?
+  enforcementSkippedAt  DateTime?
+  enforcementError      String?
+  adLifecycleActionId   String?
+  vpnLifecycleActionId  String?
+  rollbackStatus        String?
+  rollbackClaimedAt     DateTime?
+  rollbackAdActionId    String?
+  rollbackVpnActionId   String?
+  rollbackError         String?
+  lastError             String?
+  tokens                OffboardCampaignRecipientToken[]
+  logs                  OffboardCampaignLog[]
+  extensions            OffboardCampaignExtension[]
+  lifecycleActions      AccountLifecycleAction[]
+
+  @@unique([campaignId, adUsername])
+  @@index([campaignId])
+  @@index([status])
+  @@index([email])
+  @@index([adUsername])
+  @@index([linkedVpnUsername])
+  @@index([waveNumber])
+  @@index([deadlineAt])
+  @@index([verifiedAt])
+  @@index([enforcedAt])
+}
+
+model OffboardCampaignRecipientToken {
+  id          String                    @id @default(cuid())
+  createdAt   DateTime                  @default(now())
+  recipientId String
+  recipient   OffboardCampaignRecipient @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  tokenHash   String                    @unique
+  purpose     String                    @default("initial")
+  expiresAt   DateTime?
+  usedAt      DateTime?
+
+  @@index([recipientId])
+  @@index([expiresAt])
+  @@index([usedAt])
+}
+
+model OffboardCampaignLog {
+  id          String                     @id @default(cuid())
+  createdAt   DateTime                   @default(now())
+  campaignId  String
+  campaign    OffboardCampaign           @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  recipientId String?
+  recipient   OffboardCampaignRecipient? @relation(fields: [recipientId], references: [id], onDelete: SetNull)
+  level       String                     @default("info")
+  eventType   String
+  actor       String?
+  message     String
+  details     Json?
+
+  @@index([campaignId])
+  @@index([recipientId])
+  @@index([eventType])
+  @@index([level])
+  @@index([createdAt])
+}
+
+model OffboardCampaignExtension {
+  id                       String                              @id @default(cuid())
+  createdAt                DateTime                            @default(now())
+  updatedAt                DateTime                            @updatedAt
+  campaignId               String
+  campaign                 OffboardCampaign                    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  recipientId              String
+  recipient                OffboardCampaignRecipient           @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  createdBy                String
+  note                     String?
+  previousDeadlineAt       DateTime?
+  newDeadlineAt            DateTime
+  previousStatus           String
+  status                   String                              @default("pending_notification")
+  reactivationRequired     Boolean                             @default(false)
+  reactivationAdActionId   String?
+  reactivationVpnActionId  String?
+  notificationSentAt       DateTime?
+  notificationMessageId    String?
+  notificationError        String?
+  reminders                OffboardCampaignExtensionReminder[]
+
+  @@index([campaignId])
+  @@index([recipientId])
+  @@index([status])
+  @@index([newDeadlineAt])
+}
+
+model OffboardCampaignExtensionReminder {
+  id            String                    @id @default(cuid())
+  createdAt     DateTime                  @default(now())
+  updatedAt     DateTime                  @updatedAt
+  extensionId   String
+  extension     OffboardCampaignExtension @relation(fields: [extensionId], references: [id], onDelete: Cascade)
+  scheduledFor  DateTime
+  claimedAt     DateTime?
+  sentAt        DateTime?
+  messageId     String?
+  lastError     String?
+
+  @@index([extensionId])
+  @@index([scheduledFor])
+  @@index([sentAt])
 }
 
 // Batch operations for account lifecycle (e.g., disable multiple accounts at once)

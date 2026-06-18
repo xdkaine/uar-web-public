@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getSessionFromRequest } from '@/lib/session';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { prisma } from '@/lib/prisma';
-import { logAuditAction } from '@/lib/audit-log';
+import { getIpAddress, logAuditAction } from '@/lib/audit-log';
 
 /**
  * GET /api/admin/sessions
@@ -48,7 +48,7 @@ export async function GET(request: NextRequest) {
       details: {
         totalActiveSessions: sessions.length
       },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || undefined,
+      ipAddress: getIpAddress(request),
       userAgent: request.headers.get('user-agent') || undefined
     });
 
@@ -134,7 +134,7 @@ export async function DELETE(request: NextRequest) {
         targetIsAdmin: targetSession.isAdmin,
         targetIpAddress: targetSession.ipAddress
       },
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || undefined,
+      ipAddress: getIpAddress(request),
       userAgent: request.headers.get('user-agent') || undefined
     });
 
@@ -151,7 +151,7 @@ export async function DELETE(request: NextRequest) {
       username: (await getSessionFromRequest(request))?.username || 'unknown',
       success: false,
       errorMessage: error instanceof Error ? error.message : 'Unknown error',
-      ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || undefined,
+      ipAddress: getIpAddress(request),
       userAgent: request.headers.get('user-agent') || undefined
     });
 

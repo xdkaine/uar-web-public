@@ -80,8 +80,17 @@ export interface AuditLogEntry {
   action: string;
   category: string;
   username: string;
+  actorType?: ActionHistoryActorType;
   targetId?: string;
   targetType?: string;
+  subjectUsername?: string;
+  subjectEmail?: string;
+  relatedRequestId?: string;
+  relatedVpnAccountId?: string;
+  relatedLifecycleActionId?: string;
+  eventKind?: ActionHistoryEventKind;
+  outcome?: ActionHistoryOutcome;
+  correlationId?: string;
   details?: Record<string, unknown>;
   ipAddress?: string;
   userAgent?: string;
@@ -93,4 +102,62 @@ export interface AuditLogsResponse {
   total: number;
   page: number;
   pageSize: number;
+}
+
+export type ActionHistoryActorType = 'admin' | 'user' | 'system' | 'anonymous';
+export type ActionHistoryEventKind = 'read' | 'write' | 'notification' | 'security' | 'system' | 'lifecycle' | 'sync';
+export type ActionHistoryOutcome = 'success' | 'failure' | 'denied' | 'pending' | 'rollback' | 'skipped';
+export type ActionHistorySource =
+  | 'audit_log'
+  | 'request_comment'
+  | 'request_state'
+  | 'lifecycle_history'
+  | 'ad_activity'
+  | 'vpn_status'
+  | 'vpn_activity'
+  | 'ad_sync'
+  | 'offboard_log'
+  | 'token_summary';
+
+export interface ActionHistoryItem {
+  id: string;
+  source: ActionHistorySource;
+  sourceId?: string;
+  createdAt: string;
+  title: string;
+  description?: string;
+  action?: string;
+  category?: string;
+  actor: string;
+  actorType: ActionHistoryActorType;
+  eventKind: ActionHistoryEventKind;
+  outcome: ActionHistoryOutcome;
+  targetId?: string;
+  targetType?: string;
+  subjectName?: string;
+  subjectUsername?: string;
+  subjectEmail?: string;
+  relatedRequestId?: string;
+  relatedVpnAccountId?: string;
+  relatedLifecycleActionId?: string;
+  correlationId?: string;
+  ipAddress?: string;
+  userAgent?: string;
+  details?: Record<string, unknown>;
+  isReadEvent?: boolean;
+  isDerived?: boolean;
+}
+
+export interface ActionHistoryResponse {
+  items: ActionHistoryItem[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+  subjects: {
+    requestIds: string[];
+    usernames: string[];
+    emails: string[];
+    vpnAccountIds: string[];
+  };
 }

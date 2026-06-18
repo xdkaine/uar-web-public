@@ -2,8 +2,10 @@
 
 import { useState, useCallback, useEffect } from 'react';
 import { useToast } from '@/hooks/useToast';
+import MassEmailComposer from '@/components/admin/MassEmailComposer';
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Search } from "lucide-react";
 import {
     AlertDialog,
@@ -15,24 +17,6 @@ import {
     AlertDialogHeader,
     AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-
-// Simple debounce implementation
-function useDebounce<T extends (...args: any[]) => any>(
-    func: T,
-    wait: number
-): (...args: Parameters<T>) => void {
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    const useCallbackRef = useCallback(func, []);
-    const [timer, setTimer] = useState<NodeJS.Timeout | null>(null);
-
-    return useCallback((...args: Parameters<T>) => {
-        if (timer) clearTimeout(timer);
-        const newTimer = setTimeout(() => {
-            useCallbackRef(...args);
-        }, wait);
-        setTimer(newTimer);
-    }, [timer, useCallbackRef, wait]);
-}
 
 interface SearchResult {
     id: string;
@@ -144,7 +128,7 @@ export default function CommunicationsTab() {
                     token = data.csrfToken;
                     setCsrfToken(data.csrfToken);
                 }
-            } catch (e) {
+            } catch {
                 console.error("Failed to recover CSRF token");
             }
         }
@@ -190,6 +174,17 @@ export default function CommunicationsTab() {
                 </p>
             </div>
 
+            <Tabs defaultValue="mass-email" className="space-y-6">
+                <TabsList>
+                    <TabsTrigger value="mass-email">Mass Email</TabsTrigger>
+                    <TabsTrigger value="manual-notifications">Manual Notifications</TabsTrigger>
+                </TabsList>
+
+                <TabsContent value="mass-email">
+                    <MassEmailComposer />
+                </TabsContent>
+
+                <TabsContent value="manual-notifications">
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <Card className="md:col-span-1 border-2 shadow-sm">
                     <CardContent className="p-4 space-y-4">
@@ -297,15 +292,15 @@ export default function CommunicationsTab() {
                                         </div>
 
                                         <div className={`p-4 rounded-lg border-2 ${selectedItem.status === 'approved' && selectedItem.username ? 'border-red-300 bg-red-50' : 'border-gray-100 bg-gray-50 opacity-50'}`}>
-                                            <h5 className="font-bold text-gray-900 mb-1">Send Password Reset</h5>
-                                            <p className="text-sm text-gray-600 mb-4">Trigger a password reset email for active accounts.</p>
+                                            <h5 className="font-bold text-gray-900 mb-1">Send Admin Reset Link</h5>
+                                            <p className="text-sm text-gray-600 mb-4">Email a one-time AD password reset link for active accounts.</p>
                                             <Button
                                                 className="w-full bg-red-600 hover:bg-red-700 text-white"
                                                 disabled={!(selectedItem.status === 'approved' && selectedItem.username) || actionLoading}
                                                 onClick={() => initiateAction(
                                                     `/api/admin/requests/${selectedItem.id}/reset-password`,
-                                                    'Send Password Reset?',
-                                                    'Are you sure you want to send a password reset link to this user?'
+                                                    'Send Admin Reset Link?',
+                                                    'Are you sure you want to send an administrator-issued one-time password reset link to this user?'
                                                 )}
                                             >
                                                 Send Reset Link
@@ -323,6 +318,8 @@ export default function CommunicationsTab() {
                     </CardContent>
                 </Card>
             </div>
+                </TabsContent>
+            </Tabs>
 
             <AlertDialog open={confirmDialog.isOpen} onOpenChange={(open) => setConfirmDialog(prev => ({ ...prev, isOpen: open }))}>
                 <AlertDialogContent>

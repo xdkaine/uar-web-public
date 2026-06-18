@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo, useCallback, useEffect } from 'react';
+import { useState, useMemo, useCallback } from 'react';
 import UserDetailModal from './UserDetailModal';
 import { usePolling } from '@/hooks/usePolling';
 import { Button } from "@/components/ui/button";
@@ -22,7 +22,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Card, CardContent } from "@/components/ui/card";
 import { Search, Download, Filter, X, RefreshCw, Play, Pause, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from "lucide-react";
 
 interface LDAPUser {
@@ -35,21 +34,28 @@ interface LDAPUser {
   accountExpires: string | null;
   whenCreated: string;
   memberOf: string[];
+  lastVerifiedAt?: string | null;
+  lastVerifiedSource?: string | null;
+  originalRegistrationAt?: string | null;
 }
 
 interface UserManagementTabProps {
-  users: LDAPUser[];
-  isLoading: boolean;
+  users?: LDAPUser[];
+  isLoading?: boolean;
+}
+
+function isDirectoryUser(user: LDAPUser): boolean {
+  return Boolean(user.dn?.trim());
 }
 
 type StatusFilter = 'all' | 'enabled' | 'disabled';
 type ExpirationFilter = 'all' | 'active' | 'expired' | 'expiring-soon';
 
-export default function UserManagementTab({ users, isLoading }: UserManagementTabProps) {
-  const [localUsers, setLocalUsers] = useState<LDAPUser[]>(users);
+export default function UserManagementTab({ users, isLoading = false }: UserManagementTabProps) {
+  const [localUsers, setLocalUsers] = useState<LDAPUser[]>([]);
 
   const fetchUsers = useCallback(async () => {
-    const response = await fetch('/api/admin/users');
+    const response = await fetch('/api/admin/users?includeVpnOnly=false');
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
       // Handle LDAP size limit errors
@@ -59,7 +65,7 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
       throw new Error('Failed to fetch users');
     }
     const data = await response.json();
-    return data.users || [];
+    return (data.users || []).filter(isDirectoryUser);
   }, []);
 
   const {
@@ -75,9 +81,10 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
     }
   });
 
-  useEffect(() => {
-    setLocalUsers(users);
-  }, [users]);
+  const directoryUsers = useMemo(
+    () => (users !== undefined ? users : localUsers).filter(isDirectoryUser),
+    [localUsers, users]
+  );
 
   const [selectedUser, setSelectedUser] = useState<LDAPUser | null>(null);
   const [userSearchQuery, setUserSearchQuery] = useState('');
@@ -87,13 +94,13 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
   const [expirationFilter, setExpirationFilter] = useState<ExpirationFilter>('all');
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
-  const [sortField, setSortField] = useState<'username' | 'displayName' | 'email' | 'accountEnabled' | 'whenCreated'>('username');
+  const [sortField, setSortField] = useState<'username' | 'displayName' | 'email' | 'accountEnabled' | 'whenCreated' | 'lastVerifiedAt'>('username');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
 
   // Export filtered users to CSV
   const exportToCSV = () => {
-    const headers = ['Username', 'Display Name', 'Email', 'Description', 'Status', 'Expires', 'Created', 'Groups', 'OU'];
+    const headers = ['Username', 'Display Name', 'Email', 'Description', 'Status', 'Expires', 'Created', 'Last Verified', 'Last Verified Source', 'Groups', 'OU'];
     const csvData = filteredUsers.map(user => {
       const ou = (user.dn || '').split(',').find(part => part.trim().toUpperCase().startsWith('OU='))?.split('=')[1] || '';
       return [
@@ -104,6 +111,8 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
         user.accountEnabled ? 'Enabled' : 'Disabled',
         user.accountExpires ? new Date(user.accountExpires).toLocaleDateString() : 'Never',
         user.whenCreated ? new Date(user.whenCreated).toLocaleDateString() : '',
+        user.lastVerifiedAt ? new Date(user.lastVerifiedAt).toLocaleDateString() : 'N/A',
+        formatVerificationSource(user.lastVerifiedSource),
         (user.memberOf || []).length.toString(),
         ou
       ];
@@ -138,7 +147,7 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
   // Extract unique OUs from users with counts
   const availableOUs = useMemo(() => {
     const ouMap = new Map<string, number>();
-    localUsers.forEach(user => {
+    directoryUsers.forEach(user => {
       const dnParts = (user.dn || '').split(',');
       dnParts.forEach(part => {
         if (part.trim().toUpperCase().startsWith('OU=')) {
@@ -150,12 +159,12 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
     return Array.from(ouMap.entries())
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => a.name.localeCompare(b.name));
-  }, [localUsers]);
+  }, [directoryUsers]);
 
   // Extract unique groups from users with counts
   const availableGroups = useMemo(() => {
     const groupMap = new Map<string, number>();
-    localUsers.forEach(user => {
+    directoryUsers.forEach(user => {
       (user.memberOf || []).forEach(group => {
         const cnMatch = group.match(/CN=([^,]+)/);
         if (cnMatch) {
@@ -167,7 +176,7 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
     return Array.from(groupMap.entries())
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => a.name.localeCompare(b.name));
-  }, [localUsers]);
+  }, [directoryUsers]);
 
   // Helper function to check if account is expired
   const isExpired = (accountExpires: string | null): boolean => {
@@ -184,8 +193,21 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
     return expiryDate > now && expiryDate <= thirtyDaysFromNow;
   };
 
+  function formatVerificationSource(source: string | null | undefined) {
+    switch (source) {
+      case 'offboard_campaign':
+        return 'Campaign';
+      case 'registration_verified':
+        return 'Registration verified';
+      case 'registration':
+        return 'Registration';
+      default:
+        return 'No record';
+    }
+  }
+
   // Filter, sort, and paginate users
-  const filteredUsers = localUsers.filter(user => {
+  const filteredUsers = directoryUsers.filter(user => {
     // Text search filter
     const searchLower = userSearchQuery.toLowerCase();
     const matchesSearch = !userSearchQuery || (
@@ -247,6 +269,10 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
       case 'whenCreated':
         aValue = a.whenCreated;
         bValue = b.whenCreated;
+        break;
+      case 'lastVerifiedAt':
+        aValue = a.lastVerifiedAt || '';
+        bValue = b.lastVerifiedAt || '';
         break;
     }
 
@@ -329,9 +355,9 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
         </div>
       </div>
 
-      {isLoading && !localUsers.length ? (
+      {(isLoading || isPollingLoading) && !directoryUsers.length ? (
         <div className="text-center py-8 text-gray-600">Loading users...</div>
-      ) : localUsers.length === 0 ? (
+      ) : directoryUsers.length === 0 ? (
         <div className="bg-white rounded-lg shadow-xl border-2 border-gray-200 p-8 text-center">
           <div className="text-yellow-600 mb-4">
             <svg className="w-12 h-12 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -344,7 +370,7 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
         </div>
       ) : (
         <div>
-          {localUsers.length === 1000 && (
+          {directoryUsers.length === 1000 && (
             <div className="bg-yellow-50 border-l-4 border-yellow-400 p-4 mb-4">
               <div className="flex">
                 <div className="shrink-0">
@@ -354,7 +380,7 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
                 </div>
                 <div className="ml-3">
                   <p className="text-sm text-yellow-700">
-                    <span className="font-medium">Size limit reached:</span> Displaying {users.length} users (maximum). There may be additional users not shown.
+                    <span className="font-medium">Size limit reached:</span> Displaying {directoryUsers.length} users (maximum). There may be additional users not shown.
                   </p>
                 </div>
               </div>
@@ -365,7 +391,7 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
             <div className="flex flex-wrap gap-6 text-sm mb-6">
               <div>
                 <span className="font-semibold text-gray-700">Total:</span>
-                <span className="ml-2 text-gray-900 font-bold">{users.length}</span>
+                <span className="ml-2 text-gray-900 font-bold">{directoryUsers.length}</span>
               </div>
               <div>
                 <span className="font-semibold text-gray-700">Filtered:</span>
@@ -373,19 +399,19 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
               </div>
               <div>
                 <span className="font-semibold text-gray-700">Enabled:</span>
-                <span className="ml-2 text-green-600 font-bold">{users.filter(u => u.accountEnabled).length}</span>
+                <span className="ml-2 text-green-600 font-bold">{directoryUsers.filter(u => u.accountEnabled).length}</span>
               </div>
               <div>
                 <span className="font-semibold text-gray-700">Disabled:</span>
-                <span className="ml-2 text-red-600 font-bold">{users.filter(u => !u.accountEnabled).length}</span>
+                <span className="ml-2 text-red-600 font-bold">{directoryUsers.filter(u => !u.accountEnabled).length}</span>
               </div>
               <div>
                 <span className="font-semibold text-gray-700">Expired:</span>
-                <span className="ml-2 text-orange-600 font-bold">{users.filter(u => isExpired(u.accountExpires)).length}</span>
+                <span className="ml-2 text-orange-600 font-bold">{directoryUsers.filter(u => isExpired(u.accountExpires)).length}</span>
               </div>
               <div>
                 <span className="font-semibold text-gray-700">Expiring Soon:</span>
-                <span className="ml-2 text-yellow-600 font-bold">{users.filter(u => isExpiringSoon(u.accountExpires)).length}</span>
+                <span className="ml-2 text-yellow-600 font-bold">{directoryUsers.filter(u => isExpiringSoon(u.accountExpires)).length}</span>
               </div>
             </div>
 
@@ -691,13 +717,24 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
                       )}
                     </div>
                   </TableHead>
+                  <TableHead
+                    className="cursor-pointer hover:bg-muted/50 select-none"
+                    onClick={() => handleSort('lastVerifiedAt')}
+                  >
+                    <div className="flex items-center gap-2">
+                      Last Verified
+                      {sortField === 'lastVerifiedAt' && (
+                        <span>{sortDirection === 'asc' ? '↑' : '↓'}</span>
+                      )}
+                    </div>
+                  </TableHead>
                   <TableHead>Groups</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {paginatedUsers.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={8} className="h-24 text-center">
+                    <TableCell colSpan={9} className="h-24 text-center">
                       No users found matching your search.
                     </TableCell>
                   </TableRow>
@@ -767,6 +804,16 @@ export default function UserManagementTab({ users, isLoading }: UserManagementTa
                             new Date(user.whenCreated).toLocaleDateString()
                           ) : (
                             <span className="text-muted-foreground">—</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="whitespace-nowrap">
+                          {user.lastVerifiedAt ? (
+                            <div>
+                              <div>{new Date(user.lastVerifiedAt).toLocaleDateString()}</div>
+                              <div className="text-xs text-muted-foreground">{formatVerificationSource(user.lastVerifiedSource)}</div>
+                            </div>
+                          ) : (
+                            <span className="text-muted-foreground">N/A</span>
                           )}
                         </TableCell>
                         <TableCell>

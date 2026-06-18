@@ -1039,6 +1039,7 @@ graph TD
 - Search users by username, email, displayName
 - Create new AD accounts
 - Disable/enable accounts (userAccountControl)
+- Enabled accounts follow the Active Directory domain password-expiration policy
 - Reset passwords
 - Set account expiration
 - Add/remove group memberships

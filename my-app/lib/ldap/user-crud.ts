@@ -13,6 +13,35 @@ import {
   parseLDAPDate
 } from './utils';
 
+type CreateLDAPUserStage =
+  | 'connect'
+  | 'bind'
+  | 'add_user'
+  | 'set_initial_uac'
+  | 'set_description'
+  | 'tag_request'
+  | 'add_default_group'
+  | 'add_kamino_group';
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Unknown error';
+}
+
+function wrapCreateLDAPUserError(error: unknown, stage: CreateLDAPUserStage): Error {
+  const wrapped = new Error(`LDAP user creation failed during ${stage}: ${getErrorMessage(error)}`);
+  const code = (error as { code?: unknown })?.code;
+  if (code !== undefined) {
+    (wrapped as { code?: unknown }).code = code;
+  }
+  return wrapped;
+}
+
+function isWillNotPerformError(error: unknown): boolean {
+  const ldapError = error as { code?: number | string; message?: string };
+  const message = ldapError.message || '';
+  return ldapError.code === 53 || ldapError.code === '53' || message.includes('WILL_NOT_PERFORM');
+}
+
 /**
  * Create a new LDAP user account
  */
@@ -25,6 +54,11 @@ export async function createLDAPUser(
   expirationDate?: Date
 ): Promise<boolean> {
   let client: Client | null = null;
+  let userDN: string | null = null;
+  let createdUser = false;
+  let stage: CreateLDAPUserStage = 'connect';
+  void expirationDate;
+
   try {
     client = createLDAPClient();
 
@@ -33,14 +67,15 @@ export async function createLDAPUser(
     const searchBase = getRequiredEnv('LDAP_SEARCH_BASE');
     const ldapDomain = getRequiredEnv('LDAP_DOMAIN');
 
+    stage = 'bind';
     await withTimeout(client.bind(bindDN, bindPassword), LDAP_TIMEOUT);
 
     const sanitizedUsername = escapeLDAPDN(username);
-    const userDN = `CN=${sanitizedUsername},${searchBase}`;
+    userDN = `CN=${sanitizedUsername},${searchBase}`;
 
     const description = formatRequestDescription(requestId);
 
-    const entry: any = {
+    const entry: Record<string, string | string[]> = {
       cn: sanitizedUsername,
       sn: fullName.split(' ').pop() || fullName,
       givenName: fullName.split(' ')[0] || fullName,
@@ -55,10 +90,41 @@ export async function createLDAPUser(
       entry.mail = email;
     }
 
-    await withTimeout(client.add(userDN, entry), LDAP_TIMEOUT);
+    stage = 'add_user';
+    try {
+      await withTimeout(client.add(userDN, entry), LDAP_TIMEOUT);
+      createdUser = true;
+    } catch (addError) {
+      if (!isWillNotPerformError(addError)) {
+        throw addError;
+      }
+
+      ldapLogger.warn('AD refused user add with initial userAccountControl; retrying add without it', {
+        username,
+        error: sanitizeLdapError(addError),
+      });
+
+      const entryWithoutInitialUac = Object.fromEntries(
+        Object.entries(entry).filter(([key]) => key !== 'userAccountControl')
+      ) as Record<string, string | string[]>;
+
+      await withTimeout(client.add(userDN, entryWithoutInitialUac), LDAP_TIMEOUT);
+    createdUser = true;
+
+      stage = 'set_initial_uac';
+      const initialUacChange = new Change({
+        operation: 'replace',
+        modification: new Attribute({
+          type: 'userAccountControl',
+          values: ['514']
+        })
+      });
+      await withTimeout(client.modify(userDN, initialUacChange), LDAP_TIMEOUT);
+    }
 
     // Set description AFTER account creation
     try {
+      stage = 'set_description';
       const descriptionChange = new Change({
         operation: 'replace',
         modification: new Attribute({
@@ -78,6 +144,7 @@ export async function createLDAPUser(
     // Tag account with Access Request ID if provided
     if (requestId) {
       try {
+        stage = 'tag_request';
         const requestIdChange = new Change({
           operation: 'replace',
           modification: new Attribute({
@@ -105,10 +172,12 @@ export async function createLDAPUser(
       })
     });
 
+    stage = 'add_default_group';
     await withTimeout(client.modify(groupDN, groupChange), LDAP_TIMEOUT);
 
     // Add to Kamino Groups (Internal vs External)
     try {
+      stage = 'add_kamino_group';
       const kaminoInternalGroup = getRequiredEnv('LDAP_KAMINO_INTERNAL_GROUP');
       const kaminoExternalGroup = getRequiredEnv('LDAP_KAMINO_EXTERNAL_GROUP');
 
@@ -135,8 +204,29 @@ export async function createLDAPUser(
 
     return true;
   } catch (err) {
-    ldapLogger.error('Error creating user', sanitizeLdapError(err));
-    throw err;
+    ldapLogger.error('Error creating user', {
+      username,
+      stage,
+      error: sanitizeLdapError(err),
+    });
+
+    if (createdUser && userDN && client) {
+      try {
+        await withTimeout(client.del(userDN), LDAP_TIMEOUT);
+        ldapLogger.warn('Rolled back partially created LDAP user after create failure', {
+          username,
+          failedStage: stage,
+        });
+      } catch (cleanupError) {
+        ldapLogger.error('Failed to roll back partially created LDAP user', {
+          username,
+          failedStage: stage,
+          error: sanitizeLdapError(cleanupError),
+        });
+      }
+    }
+
+    throw wrapCreateLDAPUserError(err, stage);
   } finally {
     if (client) {
       try {
@@ -175,7 +265,7 @@ export async function enableLDAPUser(username: string): Promise<boolean> {
       operation: 'replace',
       modification: new Attribute({
         type: 'userAccountControl',
-        values: ['66048']
+        values: ['512']
       })
     });
 

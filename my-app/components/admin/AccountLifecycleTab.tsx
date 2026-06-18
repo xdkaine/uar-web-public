@@ -84,7 +84,7 @@ interface LifecycleAction {
   relatedRequestId: string | null;
   relatedTicketId: string | null;
   notes: string | null;
-  batch: any | null;
+   batch: unknown | null;
   history: Array<{
     id: string;
     createdAt: string;
@@ -808,18 +808,18 @@ export default function AccountLifecycleTab() {
                                      <span className="text-muted-foreground">Account Type:</span>
                                      <span className="font-medium">{action.targetAccountType}</span>
                                      <span className="text-muted-foreground">Notes:</span>
-                                     <span className="font-medium">{action.notes || '-'}</span>
+                                     <span className="font-medium whitespace-pre-wrap wrap-break-word">{action.notes || '-'}</span>
                                      <span className="text-muted-foreground">Related Request:</span>
-                                     <span className="font-medium">{action.relatedRequestId || '-'}</span>
+                                     <span className="font-medium wrap-break-word">{action.relatedRequestId || '-'}</span>
                                      <span className="text-muted-foreground">Related Ticket:</span>
-                                     <span className="font-medium">{action.relatedTicketId || '-'}</span>
+                                     <span className="font-medium wrap-break-word">{action.relatedTicketId || '-'}</span>
                                   </div>
                                </div>
                                
                                {action.errorMessage && (
                                   <div>
                                      <h4 className="text-xs font-bold uppercase text-red-500 mb-2">Error Details</h4>
-                                     <div className="p-3 bg-red-50 border border-red-100 rounded-lg text-sm text-red-700">
+                                     <div className="p-3 bg-red-50 border border-red-100 rounded-lg text-sm text-red-700 whitespace-pre-wrap wrap-break-word">
                                         <AlertTriangle className="w-4 h-4 mb-1 inline mr-2" />
                                         {action.errorMessage}
                                      </div>
@@ -838,8 +838,8 @@ export default function AccountLifecycleTab() {
                                               <span className="font-semibold text-gray-700">{hist.event}</span>
                                               <span className="text-xs text-muted-foreground">{new Date(hist.createdAt).toLocaleString()}</span>
                                            </div>
-                                           {hist.details && <p className="text-gray-600 text-xs mt-1">{hist.details}</p>}
-                                           {hist.performedBy && <p className="text-xs text-muted-foreground mt-0.5">By: {hist.performedBy}</p>}
+                                           {hist.details && <p className="text-gray-600 text-xs mt-1 whitespace-pre-wrap wrap-break-word">{hist.details}</p>}
+                                           {hist.performedBy && <p className="text-xs text-muted-foreground mt-0.5 wrap-break-word">By: {hist.performedBy}</p>}
                                         </div>
                                      ))
                                   ) : (

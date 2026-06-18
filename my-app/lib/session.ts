@@ -2,39 +2,18 @@ import crypto from 'crypto';
 import { cookies } from 'next/headers';
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from './prisma';
+import {
+  clearSessionCookiesOnResponse,
+  getSessionMaxAgeSeconds,
+  SESSION_COOKIE_NAME,
+  SESSION_TIMEOUTS,
+  setSessionCookieOnResponse,
+} from './session-cookie-policy';
 
-const SESSION_COOKIE_NAME = 'session_token';
-
-const SESSION_TIMEOUTS = {
-  admin: 30 * 60,
-  user: 60 * 60,
-  maxIdle: 15 * 60
-};
-
-const SESSION_COOKIE_SAMESITE = 'strict' as const;
-
-let insecureCookieOverrideWarningLogged = false;
-
-function shouldUseSecureCookies(): boolean {
-  const allowInsecure =
-    process.env.SESSION_COOKIE_ALLOW_INSECURE === 'true';
-
-  if (process.env.NODE_ENV === 'production') {
-    if (allowInsecure && !insecureCookieOverrideWarningLogged) {
-      console.warn(
-        '[Session] SESSION_COOKIE_ALLOW_INSECURE is ignored outside development environments.'
-      );
-      insecureCookieOverrideWarningLogged = true;
-    }
-    return true;
-  }
-
-  if (allowInsecure) {
-    return false;
-  }
-
-  return true;
-}
+type PrismaTransactionClient = Omit<
+  typeof prisma,
+  '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'
+>;
 
 export interface SessionInfo {
   id: string;
@@ -42,24 +21,6 @@ export interface SessionInfo {
   isAdmin: boolean;
   expiresAt: Date;
   lastActivity: Date;
-}
-
-function getSessionMaxAgeSeconds(isAdmin: boolean = false): number {
-  const defaultTimeout = isAdmin ? SESSION_TIMEOUTS.admin : SESSION_TIMEOUTS.user;
-  
-  const fromEnv = process.env.AUTH_SESSION_MAX_AGE;
-
-  if (!fromEnv) {
-    return defaultTimeout;
-  }
-
-  const parsed = Number(fromEnv);
-
-  if (Number.isFinite(parsed) && parsed > 0) {
-    return Math.floor(parsed);
-  }
-
-  return defaultTimeout;
 }
 
 function hashSessionToken(token: string): string {
@@ -134,61 +95,11 @@ function attachSessionCookie(
   token: string,
   expiresAt: Date
 ) {
-  const maxAgeSeconds = Math.max(
-    0,
-    Math.floor((expiresAt.getTime() - Date.now()) / 1000)
-  );
-  const secure = shouldUseSecureCookies();
-
-  response.cookies.set(SESSION_COOKIE_NAME, token, {
-    httpOnly: true,
-    secure,
-    sameSite: SESSION_COOKIE_SAMESITE,
-    maxAge: maxAgeSeconds,
-    path: '/',
-  });
-
-  response.cookies.set('admin_session', '', {
-    httpOnly: true,
-    secure,
-    sameSite: SESSION_COOKIE_SAMESITE,
-    maxAge: 0,
-    path: '/',
-  });
-  response.cookies.set('user_session', '', {
-    httpOnly: true,
-    secure,
-    sameSite: SESSION_COOKIE_SAMESITE,
-    maxAge: 0,
-    path: '/',
-  });
+  setSessionCookieOnResponse(response, token, expiresAt);
 }
 
 function clearSessionCookie(response: NextResponse) {
-  const secure = shouldUseSecureCookies();
-
-  response.cookies.set(SESSION_COOKIE_NAME, '', {
-    httpOnly: true,
-    secure,
-    sameSite: SESSION_COOKIE_SAMESITE,
-    maxAge: 0,
-    path: '/',
-  });
-
-  response.cookies.set('admin_session', '', {
-    httpOnly: true,
-    secure,
-    sameSite: SESSION_COOKIE_SAMESITE,
-    maxAge: 0,
-    path: '/',
-  });
-  response.cookies.set('user_session', '', {
-    httpOnly: true,
-    secure,
-    sameSite: SESSION_COOKIE_SAMESITE,
-    maxAge: 0,
-    path: '/',
-  });
+  clearSessionCookiesOnResponse(response);
 }
 
 export async function createUserSession(
@@ -201,7 +112,7 @@ export async function createUserSession(
   const now = new Date();
   const expiresAt = calculateExpiryDate(isAdmin);
 
-  const record = await prisma.$transaction(async (tx: any) => {
+  const record = await prisma.$transaction(async (tx: PrismaTransactionClient) => {
     await tx.session.deleteMany({
       where: { username },
     });

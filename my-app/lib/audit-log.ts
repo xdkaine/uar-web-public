@@ -1,17 +1,95 @@
 import { prisma } from '@/lib/prisma';
 import logger from '@/lib/logger';
+import { getClientIp } from '@/lib/ratelimit';
+
+export type AuditActorType = 'admin' | 'user' | 'system' | 'anonymous';
+export type AuditEventKind = 'read' | 'write' | 'notification' | 'security' | 'system' | 'lifecycle' | 'sync';
+export type AuditOutcome = 'success' | 'failure' | 'denied' | 'pending' | 'rollback' | 'skipped';
 
 export interface AuditLogEntry {
   action: string;
   category: string;
   username: string;
+  actorType?: AuditActorType;
   targetId?: string;
   targetType?: string;
-  details?: Record<string, any>;
+  subjectUsername?: string | null;
+  subjectEmail?: string | null;
+  relatedRequestId?: string | null;
+  relatedVpnAccountId?: string | null;
+  relatedLifecycleActionId?: string | null;
+  eventKind?: AuditEventKind;
+  outcome?: AuditOutcome;
+  correlationId?: string | null;
+  details?: Record<string, unknown>;
   ipAddress?: string;
   userAgent?: string;
   success?: boolean;
   errorMessage?: string;
+}
+
+const SENSITIVE_KEY_PATTERN = /(password|token|tokenHash|secret|credential|authorization|apiKey|api_key|distinguishedName|userDN|dn)$/i;
+const SENSITIVE_TEXT_PATTERN = /(password|token|secret|credential|authorization|bearer|distinguishedName|userDN|DN)\s*[:=]/i;
+
+export function sanitizeDatabaseText(value: string, maxLength = 5000): string {
+  return value
+    .replace(/\0/g, '')
+    .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '')
+    .substring(0, maxLength);
+}
+
+function redactString(value: string): string {
+  const safeValue = sanitizeDatabaseText(value);
+
+  if (SENSITIVE_TEXT_PATTERN.test(safeValue)) {
+    return '[REDACTED]';
+  }
+
+  return sanitizeDatabaseText(safeValue
+    .replace(/password["\s:=]+[^\s,}]*/gi, 'password=[REDACTED]')
+    .replace(/token["\s:=]+[^\s,}]*/gi, 'token=[REDACTED]')
+    .replace(/secret["\s:=]+[^\s,}]*/gi, 'secret=[REDACTED]')
+    .replace(/credential[s]?["\s:=]+[^\s,}]*/gi, 'credential=[REDACTED]')
+    .replace(/authorization["\s:=]+[^\s,}]*/gi, 'authorization=[REDACTED]')
+    .replace(/bearer\s+[^\s,}]+/gi, 'bearer [REDACTED]')
+    .replace(/DN:\s*[^\s,}]*/gi, 'DN=[REDACTED]')
+    .replace(/distinguishedName["\s:=]+[^\s,}]*/gi, 'distinguishedName=[REDACTED]'));
+}
+
+export function sanitizeAuditDetails(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+
+  if (typeof value === 'string') {
+    return redactString(value);
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeAuditDetails(item));
+  }
+
+  if (typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        SENSITIVE_KEY_PATTERN.test(key) ? '[REDACTED]' : sanitizeAuditDetails(item),
+      ])
+    );
+  }
+
+  return '[UNSUPPORTED]';
+}
+
+function normalizeNullable(value: string | null | undefined): string | undefined {
+  const normalized = value ? sanitizeDatabaseText(value).trim() : undefined;
+  return normalized || undefined;
 }
 
 /**
@@ -19,27 +97,61 @@ export interface AuditLogEntry {
  * @param entry The audit log entry data
  */
 export async function logAuditAction(entry: AuditLogEntry): Promise<void> {
-  // Log to stdout/Splunk first
-  logger.info(entry.action, {
-    type: 'audit_log',
+  const safeDetails = entry.details
+    ? sanitizeAuditDetails(entry.details) as Record<string, unknown>
+    : undefined;
+
+  const normalizedEntry = {
     ...entry,
-    details: entry.details // Pass object directly for JSON logging
+    action: sanitizeDatabaseText(entry.action),
+    category: sanitizeDatabaseText(entry.category),
+    username: sanitizeDatabaseText(entry.username),
+    actorType: entry.actorType || 'admin',
+    targetId: normalizeNullable(entry.targetId),
+    targetType: normalizeNullable(entry.targetType),
+    subjectUsername: normalizeNullable(entry.subjectUsername),
+    subjectEmail: normalizeNullable(entry.subjectEmail)?.toLowerCase(),
+    relatedRequestId: normalizeNullable(entry.relatedRequestId),
+    relatedVpnAccountId: normalizeNullable(entry.relatedVpnAccountId),
+    relatedLifecycleActionId: normalizeNullable(entry.relatedLifecycleActionId),
+    correlationId: normalizeNullable(entry.correlationId),
+    ipAddress: normalizeNullable(entry.ipAddress),
+    userAgent: normalizeNullable(entry.userAgent),
+    errorMessage: normalizeNullable(entry.errorMessage),
+    outcome: entry.outcome || (entry.success === false ? 'failure' : 'success'),
+    details: safeDetails,
+  } satisfies AuditLogEntry;
+
+  // Log to stdout/Splunk first
+  logger.info(normalizedEntry.action, {
+    type: 'audit_log',
+    ...normalizedEntry,
+    details: normalizedEntry.details // Pass object directly for JSON logging
   });
 
   try {
     // Log to database
     await prisma.auditLog.create({
       data: {
-        action: entry.action,
-        category: entry.category,
-        username: entry.username,
-        targetId: entry.targetId,
-        targetType: entry.targetType,
-        details: entry.details ? JSON.stringify(entry.details) : null,
-        ipAddress: entry.ipAddress,
-        userAgent: entry.userAgent,
-        success: entry.success ?? true,
-        errorMessage: entry.errorMessage,
+        action: normalizedEntry.action,
+        category: normalizedEntry.category,
+        username: normalizedEntry.username,
+        actorType: normalizedEntry.actorType,
+        targetId: normalizedEntry.targetId,
+        targetType: normalizedEntry.targetType,
+        subjectUsername: normalizedEntry.subjectUsername,
+        subjectEmail: normalizedEntry.subjectEmail,
+        relatedRequestId: normalizedEntry.relatedRequestId,
+        relatedVpnAccountId: normalizedEntry.relatedVpnAccountId,
+        relatedLifecycleActionId: normalizedEntry.relatedLifecycleActionId,
+        eventKind: normalizedEntry.eventKind,
+        outcome: normalizedEntry.outcome,
+        correlationId: normalizedEntry.correlationId,
+        details: normalizedEntry.details ? JSON.stringify(normalizedEntry.details) : null,
+        ipAddress: normalizedEntry.ipAddress,
+        userAgent: normalizedEntry.userAgent,
+        success: normalizedEntry.success ?? true,
+        errorMessage: normalizedEntry.errorMessage,
       },
     });
   } catch (error) {
@@ -54,11 +166,8 @@ export async function logAuditAction(entry: AuditLogEntry): Promise<void> {
  * Helper to extract IP address from request headers
  */
 export function getIpAddress(request: Request): string | undefined {
-  const forwarded = request.headers.get('x-forwarded-for');
-  if (forwarded) {
-    return forwarded.split(',')[0].trim();
-  }
-  return request.headers.get('x-real-ip') || undefined;
+  const ipAddress = getClientIp(request);
+  return ipAddress === 'unknown' ? undefined : ipAddress;
 }
 
 /**
@@ -89,6 +198,7 @@ export const AuditActions = {
   RESEND_VERIFICATION_EMAIL: 'resend_verification_email',
   RESEND_ACTIVATION_EMAIL: 'resend_activation_email',
   ADMIN_TRIGGER_PASSWORD_RESET: 'admin_trigger_password_reset',
+  ACCOUNT_HISTORY_VIEW: 'account_history_view',
 
   // Events
   VIEW_EVENT_LIST: 'view_event_list',
@@ -107,6 +217,11 @@ export const AuditActions = {
   DELETE_USER: 'delete_user',
   DISABLE_USER: 'disable_user',
   ENABLE_USER: 'enable_user',
+  VIEW_PASSWORD_EXPIRATION_REPORT: 'view_password_expiration_report',
+  PASSWORD_EXPIRATION_EMAIL_SENT: 'password_expiration_email_sent',
+  PASSWORD_EXPIRATION_EMAIL_SKIPPED: 'password_expiration_email_skipped',
+  PASSWORD_EXPIRATION_EMAIL_FAILURE: 'password_expiration_email_failure',
+  PASSWORD_EXPIRATION_SCHEDULER_RUN: 'password_expiration_scheduler_run',
 
   // Batch Accounts
   CREATE_BATCH: 'create_batch',
@@ -149,6 +264,10 @@ export const AuditActions = {
   VIEW_AUDIT_LOGS: 'view_audit_logs',
   EXPORT_AUDIT_LOGS: 'export_audit_logs',
 
+  // Rate Limiting
+  VIEW_RATE_LIMITS: 'view_rate_limits',
+  RELEASE_RATE_LIMIT: 'release_rate_limit',
+
   // Search & Check Operations
   CHECK_USERNAME: 'check_username',
   SEARCH_AD: 'search_ad',
@@ -158,6 +277,7 @@ export const AuditActions = {
 
   // Infrastructure Operations
   SYNC_INFRASTRUCTURE: 'sync_infrastructure',
+  SYNC_ACCOUNT_PROCESSED: 'sync_account_processed',
   VIEW_SYNC_RESULTS: 'view_sync_results',
   VIEW_SYNC_STATUS: 'view_sync_status',
 
@@ -186,6 +306,48 @@ export const AuditActions = {
   VIEW_LIFECYCLE_ACTIONS: 'view_lifecycle_actions',
   VIEW_LIFECYCLE_HISTORY: 'view_lifecycle_history',
 
+  // Offboard Campaigns
+  CREATE_OFFBOARD_CAMPAIGN: 'create_offboard_campaign',
+  OFFBOARD_DRY_RUN: 'offboard_dry_run',
+  ACTIVATE_OFFBOARD_CAMPAIGN: 'activate_offboard_campaign',
+  PAUSE_OFFBOARD_CAMPAIGN: 'pause_offboard_campaign',
+  RESUME_OFFBOARD_CAMPAIGN: 'resume_offboard_campaign',
+  EMERGENCY_STOP_OFFBOARD_CAMPAIGN: 'emergency_stop_offboard_campaign',
+  CANCEL_OFFBOARD_CAMPAIGN: 'cancel_offboard_campaign',
+  DELETE_OFFBOARD_DRY_RUN: 'delete_offboard_dry_run',
+  OFFBOARD_EMAIL_FAILURE: 'offboard_email_failure',
+  OFFBOARD_EMAIL_SENT: 'offboard_email_sent',
+  OFFBOARD_REMINDER_SENT: 'offboard_reminder_sent',
+  OFFBOARD_ENFORCEMENT_FAILURE: 'offboard_enforcement_failure',
+  OFFBOARD_ENFORCEMENT_COMPLETED: 'offboard_enforcement_completed',
+  OFFBOARD_ENFORCEMENT_SKIPPED: 'offboard_enforcement_skipped',
+  OFFBOARD_RECIPIENT_VERIFIED: 'offboard_recipient_verified',
+  OFFBOARD_CAMPAIGN_COMPLETED: 'offboard_campaign_completed',
+  OFFBOARD_CAMPAIGN_EVENT: 'offboard_campaign_event',
+  OFFBOARD_ROLLBACK_START: 'offboard_rollback_start',
+  OFFBOARD_ROLLBACK_SUCCESS: 'offboard_rollback_success',
+  OFFBOARD_ROLLBACK_FAILURE: 'offboard_rollback_failure',
+  OFFBOARD_PROCESS_ALL: 'offboard_process_all',
+  OFFBOARD_DEADLINE_EXTENSION: 'offboard_deadline_extension',
+  OFFBOARD_EXTENSION_NOTIFICATION_RETRY: 'offboard_extension_notification_retry',
+  VIEW_OFFBOARD_CAMPAIGNS: 'view_offboard_campaigns',
+  EXPORT_OFFBOARD_CAMPAIGN: 'export_offboard_campaign',
+
+  // Mass Email Campaigns
+  VIEW_MASS_EMAIL_CAMPAIGNS: 'view_mass_email_campaigns',
+  PREVIEW_MASS_EMAIL: 'preview_mass_email',
+  RESOLVE_MASS_EMAIL_RECIPIENTS: 'resolve_mass_email_recipients',
+  CREATE_MASS_EMAIL_CAMPAIGN: 'create_mass_email_campaign',
+  UPDATE_MASS_EMAIL_CAMPAIGN: 'update_mass_email_campaign',
+  ACTIVATE_MASS_EMAIL_CAMPAIGN: 'activate_mass_email_campaign',
+  QUICK_SEND_MASS_EMAIL: 'quick_send_mass_email',
+  TEST_MASS_EMAIL: 'test_mass_email',
+  PROCESS_MASS_EMAIL_CAMPAIGN: 'process_mass_email_campaign',
+  CANCEL_MASS_EMAIL_CAMPAIGN: 'cancel_mass_email_campaign',
+  MASS_EMAIL_SENT: 'mass_email_sent',
+  MASS_EMAIL_FAILURE: 'mass_email_failure',
+  MASS_EMAIL_COMPLETED: 'mass_email_completed',
+
   // AD Account Comments
   CREATE_AD_COMMENT: 'create_ad_comment',
   UPDATE_AD_COMMENT: 'update_ad_comment',
@@ -203,6 +365,21 @@ export const AuditActions = {
 
   // Authentication
   LOGIN_SUCCESS: 'login_success',
+  PASSWORD_CHANGE_REQUIRED: 'password_change_required',
+  PASSWORD_CHANGE_SUCCESS: 'password_change_success',
+  PASSWORD_CHANGE_FAILURE: 'password_change_failure',
+  PASSWORD_RESET_REQUESTED: 'password_reset_requested',
+  PASSWORD_RESET_LINK_SENT: 'password_reset_link_sent',
+  PASSWORD_RESET_DENIED: 'password_reset_denied',
+  PASSWORD_RESET_TOKEN_INVALID: 'password_reset_token_invalid',
+  PASSWORD_RESET_COMPLETED: 'password_reset_completed',
+  PASSWORD_RESET_TOKEN_ROLLED_BACK: 'password_reset_token_rolled_back',
+  ACCOUNT_ACTIVATION_LINK_SENT: 'account_activation_link_sent',
+  ACCOUNT_ACTIVATION_FAILED: 'account_activation_failed',
+  ACCOUNT_ACTIVATION_COMPLETED: 'account_activation_completed',
+  ACCOUNT_ACTIVATION_TOKEN_ROLLED_BACK: 'account_activation_token_rolled_back',
+  EMAIL_VERIFICATION_COMPLETED: 'email_verification_completed',
+  EMAIL_VERIFICATION_FAILED: 'email_verification_failed',
 } as const;
 
 // Categories for organizing logs
@@ -219,8 +396,11 @@ export const AuditCategories = {
   SETTINGS: 'settings',
   LOGS: 'logs',
   LIFECYCLE: 'lifecycle',
+  OFFBOARD_CAMPAIGN: 'offboard_campaign',
+  MASS_EMAIL: 'mass_email',
   SYNC_STATUS: 'sync_status',
   SESSION: 'session',
+  RATE_LIMIT: 'rate_limit',
   SEARCH: 'search',
   AUTH: 'auth',
 } as const;
@@ -230,15 +410,19 @@ export const AuditCategories = {
  */
 export function categorizeRequest(pathname: string): string {
   if (pathname.includes('/requests')) return AuditCategories.ACCESS_REQUEST;
+  if (pathname.includes('/password-expiration')) return AuditCategories.USER;
   if (pathname.includes('/events')) return AuditCategories.EVENT;
   if (pathname.includes('/users')) return AuditCategories.USER;
   if (pathname.includes('/vpn')) return AuditCategories.VPN;
   if (pathname.includes('/support')) return AuditCategories.SUPPORT;
   if (pathname.includes('/batch')) return AuditCategories.BATCH;
   if (pathname.includes('/lifecycle')) return AuditCategories.LIFECYCLE;
+  if (pathname.includes('/offboard-campaigns')) return AuditCategories.OFFBOARD_CAMPAIGN;
+  if (pathname.includes('/mass-email')) return AuditCategories.MASS_EMAIL;
   if (pathname.includes('/settings')) return AuditCategories.SETTINGS;
   if (pathname.includes('/logs')) return AuditCategories.LOGS;
   if (pathname.includes('/sessions')) return AuditCategories.SESSION;
+  if (pathname.includes('/ratelimits')) return AuditCategories.RATE_LIMIT;
   if (pathname.includes('/sync-status')) return AuditCategories.SYNC_STATUS;
   if (pathname.includes('/search')) return AuditCategories.SEARCH;
   if (pathname.includes('/blocklist')) return AuditCategories.BLOCKLIST;

@@ -49,13 +49,12 @@ interface Event {
 }
 
 interface EventManagementTabProps {
-  events: Event[];
-  isLoading: boolean;
-  onRefresh: () => void;
+  events?: Event[];
+  isLoading?: boolean;
 }
 
-export default function EventManagementTab({ events, isLoading, onRefresh }: EventManagementTabProps) {
-  const [localEvents, setLocalEvents] = useState<Event[]>(events);
+export default function EventManagementTab({ events, isLoading = false }: EventManagementTabProps) {
+  const [localEvents, setLocalEvents] = useState<Event[]>(events ?? []);
 
   const fetchEvents = useCallback(async () => {
     const response = await fetch('/api/admin/events');
@@ -68,8 +67,7 @@ export default function EventManagementTab({ events, isLoading, onRefresh }: Eve
     isLoading: isPollingLoading, 
     isPolling, 
     togglePolling, 
-    refresh,
-    lastUpdated
+    refresh
   } = usePolling(fetchEvents, {
     interval: 30000,
     onSuccess: (data) => {
@@ -78,7 +76,9 @@ export default function EventManagementTab({ events, isLoading, onRefresh }: Eve
   });
 
   useEffect(() => {
-    setLocalEvents(events);
+    if (events !== undefined) {
+      setLocalEvents(events);
+    }
   }, [events]);
 
   const [showEventModal, setShowEventModal] = useState(false);
@@ -268,7 +268,7 @@ export default function EventManagementTab({ events, isLoading, onRefresh }: Eve
         </div>
       </div>
 
-      {isLoading && !localEvents.length ? (
+      {(isLoading || isPollingLoading) && !localEvents.length ? (
         <div className="text-center py-8 text-gray-600">Loading events...</div>
       ) : localEvents.length === 0 ? (
         <Card className="p-8 text-center">

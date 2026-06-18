@@ -3,6 +3,11 @@ import { prisma } from '@/lib/prisma';
 import { getSessionFromCookies } from '@/lib/session';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 import { searchLDAPUser } from '@/lib/ldap/user-search';
+import { isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit } from '@/lib/validation';
+
+interface UpdateTicketBody {
+  status?: unknown;
+}
 
 async function checkUserAuth() {
   const session = await getSessionFromCookies();
@@ -145,10 +150,10 @@ export async function PATCH(
     }
 
     const resolvedParams = await params;
-    const body = await request.json();
+    const body = await parseJsonWithLimit<UpdateTicketBody>(request, MAX_REQUEST_BODY_SIZE.SMALL);
     const { status } = body;
 
-    if (!status || !['open', 'in_progress', 'closed'].includes(status)) {
+    if (typeof status !== 'string' || !['open', 'in_progress', 'closed'].includes(status)) {
       return NextResponse.json(
         { error: 'Invalid status. Must be open, in_progress, or closed' },
         { status: 400 }
@@ -252,7 +257,14 @@ export async function PATCH(
       } else {
         // Try to find email from any access request with this username
         const accessRequest = await prisma.accessRequest.findFirst({
-          where: { ldapUsername: ticket.username },
+          where: {
+            OR: [
+              { ldapUsername: ticket.username },
+              { vpnUsername: ticket.username },
+              { linkedAdUsername: ticket.username },
+              { linkedVpnUsername: ticket.username },
+            ],
+          },
           select: { email: true, name: true },
           orderBy: { createdAt: 'desc' },
         });
@@ -280,6 +292,10 @@ export async function PATCH(
 
     return NextResponse.json({ ticket: updatedTicket });
   } catch (error) {
+    if (isJsonBodyError(error)) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    }
+
     console.error('Error updating support ticket:', error);
     return NextResponse.json(
       { error: 'Failed to update support ticket' },

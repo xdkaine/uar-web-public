@@ -21,6 +21,9 @@ interface LDAPUser {
   accountExpires: string | null;
   whenCreated: string;
   memberOf: string[];
+  lastVerifiedAt?: string | null;
+  lastVerifiedSource?: string | null;
+  originalRegistrationAt?: string | null;
 }
 
 interface UserDetailModalProps {
@@ -31,10 +34,22 @@ interface UserDetailModalProps {
 export default function UserDetailModal({ user, onClose }: UserDetailModalProps) {
   // If user is null, the Dialog open prop will be false, so it won't show.
   // However, we need to handle the content rendering only when user exists.
+  const formatVerificationSource = (source: string | null | undefined) => {
+    switch (source) {
+      case 'offboard_campaign':
+        return 'Campaign';
+      case 'registration_verified':
+        return 'Registration verified';
+      case 'registration':
+        return 'Registration';
+      default:
+        return 'No record';
+    }
+  };
   
   return (
     <Dialog open={!!user} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+      <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>User Details</DialogTitle>
         </DialogHeader>
@@ -91,6 +106,29 @@ export default function UserDetailModal({ user, onClose }: UserDetailModalProps)
                       new Date(user.whenCreated).toLocaleString()
                     ) : (
                       '—'
+                    )}
+                  </p>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-muted-foreground">Last Verified</Label>
+                  <p>
+                    {user.lastVerifiedAt ? (
+                      <>
+                        {new Date(user.lastVerifiedAt).toLocaleString()}
+                        <span className="block text-xs text-muted-foreground">{formatVerificationSource(user.lastVerifiedSource)}</span>
+                      </>
+                    ) : (
+                      'N/A'
+                    )}
+                  </p>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-muted-foreground">Original Registration</Label>
+                  <p>
+                    {user.originalRegistrationAt ? (
+                      new Date(user.originalRegistrationAt).toLocaleString()
+                    ) : (
+                      'N/A'
                     )}
                   </p>
                 </div>

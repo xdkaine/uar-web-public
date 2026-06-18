@@ -23,7 +23,6 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { 
-  Settings, 
   Mail, 
   Shield, 
   Bell, 
@@ -380,7 +379,7 @@ export default function SystemSettingsTab({ isLoading, onRefresh }: SystemSettin
                 <p className="text-sm text-muted-foreground">
                   Prevent all users from logging in. 
                   {settings?.manualOverride && loginDisabled && (
-                    <span className="block mt-1 text-orange-600 font-medium flex items-center gap-1">
+                    <span className="mt-1 inline-flex items-center gap-1 font-medium text-orange-600">
                       <AlertTriangle className="w-3 h-3" /> Manual override active - DB edit required
                     </span>
                   )}

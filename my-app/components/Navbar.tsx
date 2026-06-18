@@ -3,9 +3,9 @@
 import React from 'react';
 import Link from 'next/link';
 import Image from 'next/image';
-import { motion } from 'framer-motion';
 import { useState, useEffect, useCallback } from 'react';
 import { fetchWithCsrf, invalidateCsrfTokenCache } from '@/lib/csrf';
+import { publishClientSessionState, type ClientSessionState } from '@/lib/client-session-state';
 import { Button } from "@/components/ui/button";
 import { User, LogOut, Menu, ChevronDown, Cloud, Server, Network, MessageCircle } from "lucide-react";
 // ... existing code ...
@@ -18,6 +18,15 @@ const Navbar: React.FC = () => {
   const [displayName, setDisplayName] = useState('');
   const [userDropdownOpen, setUserDropdownOpen] = useState(false);
   const [servicesDropdownOpen, setServicesDropdownOpen] = useState(false);
+
+  const publishSession = useCallback((state: Partial<ClientSessionState>) => {
+    publishClientSessionState({
+      isAuthenticated: Boolean(state.isAuthenticated),
+      isAdmin: Boolean(state.isAdmin),
+      username: state.username || '',
+      displayName: state.displayName || state.username || '',
+    });
+  }, []);
 
   const fetchSession = useCallback(async () => {
     try {
@@ -33,18 +42,19 @@ const Navbar: React.FC = () => {
       setIsAdmin(data.isAdmin);
       setUsername(data.username || '');
       setDisplayName(data.displayName || data.username || '');
+      publishSession(data);
     } catch (error) {
       console.error('Failed to fetch session:', error);
       setIsAuthenticated(false);
       setIsAdmin(false);
       setUsername('');
       setDisplayName('');
+      publishSession({ isAuthenticated: false });
     }
-  }, []);
+  }, [publishSession]);
 
   useEffect(() => {
-    // Initial fetch
-    fetchSession();
+    const initialFetch = window.setTimeout(fetchSession, 0);
 
     // Listen for auth changes
     const handleAuthChange = () => {
@@ -66,6 +76,7 @@ const Navbar: React.FC = () => {
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
+      window.clearTimeout(initialFetch);
       window.removeEventListener('authStateChanged', handleAuthChange);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
@@ -80,6 +91,7 @@ const Navbar: React.FC = () => {
       setUsername('');
       setDisplayName('');
       setUserDropdownOpen(false);
+      publishSession({ isAuthenticated: false });
       window.location.href = '/';
     } catch (error) {
       console.error('Logout error:', error);
@@ -87,20 +99,10 @@ const Navbar: React.FC = () => {
   };
 
   return (
-    <motion.nav
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      transition={{ duration: 0.8, ease: "easeOut" }}
-      className="bg-black p-4 shadow-lg"
-    >
+    <nav className="bg-black p-4 shadow-lg">
       <link rel="icon" href="/favicon.ico" />
       <div className="container mx-auto flex justify-between items-center">
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.8, delay: 0.2 }}
-          className="text-white text-2xl font-bold"
-        >
+        <div className="text-white text-2xl font-bold">
           <Link href="/">
             <Image
               src="/logo3og.png"
@@ -110,14 +112,9 @@ const Navbar: React.FC = () => {
               className="hover:opacity-80 transition-opacity"
             />
           </Link>
-        </motion.div>
+        </div>
 
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.8, delay: 0.4 }}
-          className="hidden md:flex space-x-6"
-        >
+        <div className="hidden md:flex space-x-6">
           <Link href="/" className="text-white hover:bg-gray-700 px-4 py-2 rounded-lg transition duration-300 font-medium flex items-center space-x-2">
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path>
@@ -250,7 +247,7 @@ const Navbar: React.FC = () => {
               <span>Sign In</span>
             </Link>
           )}
-        </motion.div>
+        </div>
 
         <div className="md:hidden">
           <Button variant="ghost" size="icon" className="text-white hover:bg-gray-700 hover:text-white" onClick={() => setMobileMenuOpen(!mobileMenuOpen)}>
@@ -351,7 +348,7 @@ const Navbar: React.FC = () => {
           )}
         </div>
       )}
-    </motion.nav>
+    </nav>
   );
 };
 
