@@ -2,6 +2,8 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: uar-dev
 resources:
+- asset-data.yaml
+- clamav-data.yaml
 - asset-store.yaml
 - auth.yaml
 - clamav.yaml

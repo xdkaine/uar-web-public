@@ -2,8 +2,6 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: uar-dev
 resources:
-- asset-data.yaml
-- clamav-data.yaml
 - postgres-data.yaml
 - postgres-hba.yaml
 - postgres-service.yaml

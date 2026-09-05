@@ -24,8 +24,8 @@ spec:
         - sh
         - -ec
         - cp /source/tls.crt /tls/server.crt; cp /source/tls.key /tls/server.key;
-          chown 70:70 /tls/server.crt /tls/server.key; chmod 600 /tls/server.key;
-          chmod 644 /tls/server.crt
+          chmod 600 /tls/server.key; chmod 644 /tls/server.crt;
+          chown 70:70 /tls/server.crt /tls/server.key
         securityContext:
           runAsUser: 0
           allowPrivilegeEscalation: false

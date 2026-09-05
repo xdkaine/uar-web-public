@@ -3,6 +3,9 @@
 \getenv portal_password PORTAL_DATABASE_PASSWORD
 \getenv auth_password AUTH_DATABASE_PASSWORD
 BEGIN;
+-- Install the checked-in migration prerequisite with the administrator connection.
+-- The migration login remains unable to create arbitrary database extensions.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 SELECT 'CREATE ROLE uar_schema_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION'
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'uar_schema_owner')
 \gexec
