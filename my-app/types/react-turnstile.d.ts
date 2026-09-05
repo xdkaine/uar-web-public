@@ -4,7 +4,7 @@ declare module 'react-turnstile' {
   interface TurnstileProps {
     sitekey: string;
     onVerify: (token: string) => void;
-    onError?: (error?: any) => void;
+    onError?: (error?: unknown) => void;
     onExpire?: () => void;
     theme?: 'light' | 'dark' | 'auto';
     size?: 'normal' | 'compact' | 'invisible';

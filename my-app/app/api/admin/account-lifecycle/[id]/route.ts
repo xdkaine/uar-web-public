@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
-import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { prisma } from '@/lib/prisma';
 import { secureJsonResponse } from '@/lib/apiResponse';
+import { redactLifecycleExceptionEvidence } from '@/lib/lifecycle-evidence';
 
 /**
  * GET /api/admin/account-lifecycle/[id]
@@ -17,6 +18,10 @@ export async function GET(
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!actorHasPermission(admin, 'lifecycle.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const { id } = await params;
@@ -80,6 +85,7 @@ export async function GET(
 
     // Fetch target account details
     let targetAccount = null;
+    let deletedVpnEvidence = null;
     if (action.targetUserId) {
       if (action.targetAccountType === 'AD' || action.targetAccountType === 'BOTH') {
         targetAccount = await prisma.accessRequest.findUnique({
@@ -114,14 +120,37 @@ export async function GET(
             restoredBy: true,
           },
         });
+        if (!targetAccount && action.actionType === 'delete_vpn_record') {
+          const [statusLogs, comments] = await Promise.all([
+            prisma.vPNAccountStatusLog.findMany({
+              where: { accountId: action.targetUserId },
+              orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+              take: 25,
+            }),
+            prisma.vPNAccountComment.findMany({
+              where: { accountId: action.targetUserId },
+              orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+              take: 25,
+            }),
+          ]);
+          deletedVpnEvidence = { state: 'deleted_record', statusLogs, comments };
+        }
       }
     }
 
     return secureJsonResponse({
-      action,
+      action: redactLifecycleExceptionEvidence(
+        action,
+        action.actionType === 'delete_ad'
+          ? actorHasPermission(admin, 'lifecycle.delete')
+          : action.actionType === 'delete_vpn_record'
+            ? actorHasPermission(admin, 'vpn.delete')
+          : actorHasPermission(admin, 'lifecycle.override')
+      ),
       relatedAccessRequest,
       relatedTicket,
       targetAccount,
+      deletedVpnEvidence,
     });
   } catch (error) {
     console.error('Error fetching lifecycle action:', error);
@@ -132,116 +161,18 @@ export async function GET(
   }
 }
 
-/**
- * DELETE /api/admin/account-lifecycle/[id]
- * Delete a specific lifecycle action from the queue
- * Only pending, queued, failed, or cancelled actions can be deleted
- */
+/** Confirmed lifecycle evidence is immutable; queued work uses the cancel route. */
 export async function DELETE(
-  request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
+  request: NextRequest
 ) {
-  try {
-    const { admin, response } = await checkAdminAuthWithRateLimit(request);
-    if (!admin || response) {
-      return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
-
-    const { id } = await params;
-
-    if (!id) {
-      return NextResponse.json({ error: 'Action ID is required' }, { status: 400 });
-    }
-
-    // Find the action
-    const action = await prisma.accountLifecycleAction.findUnique({
-      where: { id },
-      include: {
-        history: true,
-      },
-    });
-
-    if (!action) {
-      return NextResponse.json({ error: 'Action not found' }, { status: 404 });
-    }
-
-    // Check if action can be deleted (only certain statuses)
-    const deletableStatuses = ['pending', 'queued', 'failed', 'cancelled'];
-    if (!deletableStatuses.includes(action.status)) {
-      return NextResponse.json(
-        { 
-          error: `Cannot delete action with status '${action.status}'. Only pending, queued, failed, or cancelled actions can be deleted.` 
-        },
-        { status: 400 }
-      );
-    }
-
-    // Store action details for audit log before deletion
-    const actionDetails = {
-      id: action.id,
-      actionType: action.actionType,
-      targetAccountType: action.targetAccountType,
-      targetUsername: action.targetUsername,
-      status: action.status,
-      reason: action.reason,
-      requestedBy: action.requestedBy,
-      createdAt: action.createdAt,
-    };
-
-    // Delete the action and its history (cascade should handle this, but be explicit)
-    await prisma.$transaction(async (tx: any) => {
-      // Delete history entries
-      await tx.accountLifecycleHistory.deleteMany({
-        where: { actionId: id },
-      });
-
-      // Delete the action
-      await tx.accountLifecycleAction.delete({
-        where: { id },
-      });
-    });
-
-    // Log audit action
-    await logAuditAction({
-      action: AuditActions.DELETE_LIFECYCLE_ACTION,
-      category: AuditCategories.USER,
-      username: admin.username,
-      targetId: id,
-      targetType: 'AccountLifecycleAction',
-      success: true,
-      details: {
-        deletedAction: actionDetails,
-        deletedBy: admin.username,
-      },
-      ipAddress: getIpAddress(request),
-      userAgent: getUserAgent(request),
-    });
-
-    return secureJsonResponse({
-      success: true,
-      message: 'Lifecycle action deleted successfully',
-      deletedAction: actionDetails,
-    });
-  } catch (error) {
-    console.error('Error deleting lifecycle action:', error);
-
-    const { admin } = await checkAdminAuthWithRateLimit(request);
-    if (admin) {
-      await logAuditAction({
-        action: AuditActions.DELETE_LIFECYCLE_ACTION,
-        category: AuditCategories.USER,
-        username: admin.username,
-        targetType: 'AccountLifecycleAction',
-        success: false,
-        errorMessage: error instanceof Error ? error.message : 'Unknown error',
-        ipAddress: getIpAddress(request),
-        userAgent: getUserAgent(request),
-      });
-    }
-
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to delete lifecycle action' },
-      { status: 500 }
-    );
+  const { admin, response } = await checkAdminAuthWithRateLimit(request);
+  if (!admin || response) {
+    return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
+  if (!actorHasPermission(admin, 'lifecycle.manage')) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+  }
+  return NextResponse.json({
+    error: 'Confirmed lifecycle evidence is immutable. Cancel queued work instead of deleting its history.',
+  }, { status: 405, headers: { Allow: 'GET' } });
 }

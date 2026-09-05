@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { generateStrongPassword } from '@/lib/password';
 import { secureJsonResponse } from '@/lib/apiResponse';
 
@@ -18,6 +19,10 @@ export async function GET(request: NextRequest) {
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!actorHasPermission(admin, 'users.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     // Generate a secure password

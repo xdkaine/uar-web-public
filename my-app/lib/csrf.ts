@@ -1,3 +1,5 @@
+import { isCsrfExempt } from './csrf-config';
+
 const CSRF_COOKIE_NAME = 'csrf-token';
 
 let cachedCsrfToken: string | null = null;
@@ -11,28 +13,27 @@ export function invalidateCsrfTokenCache() {
   cachedCsrfToken = null;
 }
 
-function readTokenFromDocument(): string | null {
-  if (typeof document === 'undefined') {
-    return null;
-  }
-
-  const match = document.cookie.match(
-    new RegExp(`(?:^|;\\s*)${CSRF_COOKIE_NAME}=([^;]*)`)
-  );
-  const value = match ? match[1] : null;
-
-  if (value) {
-    cacheToken(value);
-  }
-
-  return value;
-}
-
 /**
  * Utility function to get CSRF token from cookie or cache.
+ * The live cookie is authoritative when readable; the memory cache covers
+ * httpOnly deployments where document.cookie cannot expose the value.
  */
 export function getCsrfToken(): string | null {
-  return cachedCsrfToken || readTokenFromDocument();
+  if (typeof document !== 'undefined') {
+    const match = document.cookie.match(
+      new RegExp(`(?:^|;\\s*)${CSRF_COOKIE_NAME}=([^;]*)`)
+    );
+    const liveValue = match ? match[1] : null;
+    if (liveValue) {
+      if (cachedCsrfToken && cachedCsrfToken !== liveValue) {
+        // The server rotated the cookie (new session, re-issue): trust the
+        // freshest value and drop the stale memory copy silently.
+        cacheToken(liveValue);
+      }
+      return liveValue;
+    }
+  }
+  return cachedCsrfToken;
 }
 
 async function ensureCsrfToken(forceRefresh = false): Promise<string | null> {
@@ -99,7 +100,7 @@ async function ensureCsrfToken(forceRefresh = false): Promise<string | null> {
 /**
  * Enhanced fetch wrapper that automatically includes CSRF token.
  * Use this for all API requests that modify data (POST, PUT, DELETE, PATCH).
- * Automatically skips CSRF token for exempt paths (e.g., logout, login).
+ * Automatically skips CSRF token for exempt paths (e.g., logout).
  * Handles 401 Unauthorized responses by redirecting to login page.
  */
 export async function fetchWithCsrf(
@@ -108,8 +109,7 @@ export async function fetchWithCsrf(
 ): Promise<Response> {
   const method = options.method?.toUpperCase() || 'GET';
   
-  // Import csrf-config dynamically to avoid circular dependencies
-  // and check if the URL is exempt from CSRF validation
+  // Share the server's exemption policy so browser and middleware cannot drift.
   const needsCsrf = 
     ['POST', 'PUT', 'DELETE', 'PATCH'].includes(method) &&
     !isUrlCsrfExempt(url);
@@ -124,27 +124,22 @@ export async function fetchWithCsrf(
     }
   }
 
-  if (needsCsrf && csrfToken) {
-    let existingHeaders: Record<string, string> = {};
-    
-    if (options.headers instanceof Headers) {
-      // Convert Headers object to plain object
-      options.headers.forEach((value, key) => {
-        existingHeaders[key] = value;
-      });
-    } else if (Array.isArray(options.headers)) {
-      existingHeaders = Object.fromEntries(options.headers);
-    } else {
-      existingHeaders = { ...(options.headers ?? {}) };
+  const response = await sendWithCsrfHeader(url, options, csrfToken);
+
+  // Self-healing: a 403 CSRF rejection means our notion of the token drifted
+  // from the server's cookie (session change, expiry race, multi-tab).
+  // Refresh once and retry the mutation with the fresh token before giving up.
+  if (
+    needsCsrf &&
+    response.status === 403 &&
+    (await isInvalidCsrfRejection(response))
+  ) {
+    invalidateCsrfTokenCache();
+    const refreshed = await ensureCsrfToken(true);
+    if (refreshed) {
+      return sendWithCsrfHeader(url, options, refreshed);
     }
-
-    options.headers = {
-      ...existingHeaders,
-      'x-csrf-token': csrfToken,
-    };
   }
-
-  const response = await fetch(url, options);
 
   // Global 401 error handler - redirect to login with return URL
   if (response.status === 401 && typeof window !== 'undefined') {
@@ -167,6 +162,43 @@ export async function fetchWithCsrf(
   return response;
 }
 
+function sendWithCsrfHeader(
+  url: string,
+  options: RequestInit,
+  csrfToken: string | null
+): Promise<Response> {
+  let requestInit = options;
+  if (csrfToken) {
+    let existingHeaders: Record<string, string> = {};
+    if (options.headers instanceof Headers) {
+      options.headers.forEach((value, key) => {
+        existingHeaders[key] = value;
+      });
+    } else if (Array.isArray(options.headers)) {
+      existingHeaders = Object.fromEntries(options.headers);
+    } else {
+      existingHeaders = { ...(options.headers ?? {}) };
+    }
+    requestInit = {
+      ...options,
+      headers: {
+        ...existingHeaders,
+        'x-csrf-token': csrfToken,
+      },
+    };
+  }
+  return fetch(url, requestInit);
+}
+
+async function isInvalidCsrfRejection(response: Response): Promise<boolean> {
+  try {
+    const data = await response.clone().json();
+    return typeof data?.error === 'string' && /csrf/i.test(data.error);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Check if a URL is exempt from CSRF validation.
  * Handles both relative and absolute URLs.
@@ -185,24 +217,7 @@ function isUrlCsrfExempt(url: string): boolean {
       pathname = '/' + url.split('?')[0];
     }
 
-    // List of CSRF-exempt paths (synchronized with csrf-config.ts)
-    const CSRF_EXEMPT_PATHS = [
-      '/api/auth/login',
-      '/api/auth/logout',
-      '/api/admin/logout',
-      '/api/auth/check-admin',
-      '/api/auth/session',
-      '/api/csrf-token',
-      '/api/events/active',
-      '/api/cron',
-      '/api/admin/track-view',
-      '/api/request',
-      '/api/verify',
-      '/api/auth/request-password-reset',
-      '/api/auth/reset-password',
-    ];
-
-    return CSRF_EXEMPT_PATHS.some(path => pathname.startsWith(path));
+    return isCsrfExempt(pathname);
   } catch {
     // If URL parsing fails, assume it needs CSRF for safety
     return false;

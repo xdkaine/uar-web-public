@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { listOffboardCampaigns } from '@/lib/offboard-campaign';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 
@@ -8,6 +9,9 @@ export async function GET(request: NextRequest) {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!actorHasPermission(admin, 'offboard.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const campaignId = request.nextUrl.searchParams.get('id');

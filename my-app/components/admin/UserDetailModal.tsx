@@ -1,4 +1,4 @@
-'use client';
+"use client";
 
 import {
   Dialog,
@@ -6,10 +6,13 @@ import {
   DialogHeader,
   DialogTitle,
   DialogFooter,
-} from "@/components/ui/dialog"
-import { Button } from "@/components/ui/button"
-import { Badge } from "@/components/ui/badge"
-import { Label } from "@/components/ui/label"
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Label } from "@/components/ui/label";
+import type { AccountOwnershipSummary } from "@/lib/account-ownership";
+import { AccountOwnershipDetails } from "./AccountOwnershipDetails";
+import { ClientLocalDate } from "./ClientLocalDate";
 
 interface LDAPUser {
   dn: string;
@@ -24,6 +27,8 @@ interface LDAPUser {
   lastVerifiedAt?: string | null;
   lastVerifiedSource?: string | null;
   originalRegistrationAt?: string | null;
+  /** Omitted by legacy responses; ownership must remain unavailable rather than inferred. */
+  ownership?: AccountOwnershipSummary | null;
 }
 
 interface UserDetailModalProps {
@@ -31,22 +36,25 @@ interface UserDetailModalProps {
   onClose: () => void;
 }
 
-export default function UserDetailModal({ user, onClose }: UserDetailModalProps) {
+const formatVerificationSource = (source: string | null | undefined) => {
+  switch (source) {
+    case "offboard_campaign":
+      return "Campaign";
+    case "registration_verified":
+      return "Registration verified";
+    case "registration":
+      return "Registration";
+    default:
+      return "No record";
+  }
+};
+
+export default function UserDetailModal({
+  user,
+  onClose,
+}: UserDetailModalProps) {
   // If user is null, the Dialog open prop will be false, so it won't show.
   // However, we need to handle the content rendering only when user exists.
-  const formatVerificationSource = (source: string | null | undefined) => {
-    switch (source) {
-      case 'offboard_campaign':
-        return 'Campaign';
-      case 'registration_verified':
-        return 'Registration verified';
-      case 'registration':
-        return 'Registration';
-      default:
-        return 'No record';
-    }
-  };
-  
   return (
     <Dialog open={!!user} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
@@ -57,7 +65,9 @@ export default function UserDetailModal({ user, onClose }: UserDetailModalProps)
         {user && (
           <div className="space-y-6">
             <div>
-              <h4 className="text-lg font-semibold text-foreground mb-3">Basic Information</h4>
+              <h4 className="text-lg font-semibold text-foreground mb-3">
+                Basic Information
+              </h4>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1">
                   <Label className="text-muted-foreground">Username</Label>
@@ -65,37 +75,45 @@ export default function UserDetailModal({ user, onClose }: UserDetailModalProps)
                 </div>
                 <div className="space-y-1">
                   <Label className="text-muted-foreground">Display Name</Label>
-                  <p>{user.displayName || '—'}</p>
+                  <p>{user.displayName || "—"}</p>
                 </div>
                 <div className="col-span-2 space-y-1">
                   <Label className="text-muted-foreground">Email</Label>
-                  <p>{user.email || '—'}</p>
+                  <p>{user.email || "—"}</p>
                 </div>
                 <div className="col-span-2 space-y-1">
                   <Label className="text-muted-foreground">Description</Label>
-                  <p>{user.description || '—'}</p>
+                  <p>{user.description || "—"}</p>
                 </div>
               </div>
             </div>
 
+            <AccountOwnershipDetails ownership={user.ownership} />
+
             <div>
-              <h4 className="text-lg font-semibold text-foreground mb-3">Account Status</h4>
+              <h4 className="text-lg font-semibold text-foreground mb-3">
+                Account Status
+              </h4>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1">
                   <Label className="text-muted-foreground">Status</Label>
                   <div className="mt-1">
-                    <Badge variant={user.accountEnabled ? "default" : "destructive"}>
-                      {user.accountEnabled ? 'Enabled' : 'Disabled'}
+                    <Badge
+                      variant={user.accountEnabled ? "default" : "destructive"}
+                    >
+                      {user.accountEnabled ? "Enabled" : "Disabled"}
                     </Badge>
                   </div>
                 </div>
                 <div className="space-y-1">
-                  <Label className="text-muted-foreground">Account Expires</Label>
+                  <Label className="text-muted-foreground">
+                    Account Expires
+                  </Label>
                   <p>
                     {user.accountExpires ? (
-                      new Date(user.accountExpires).toLocaleString()
+                      <ClientLocalDate value={user.accountExpires} />
                     ) : (
-                      'Never'
+                      "Never"
                     )}
                   </p>
                 </div>
@@ -103,9 +121,9 @@ export default function UserDetailModal({ user, onClose }: UserDetailModalProps)
                   <Label className="text-muted-foreground">Created</Label>
                   <p>
                     {user.whenCreated ? (
-                      new Date(user.whenCreated).toLocaleString()
+                      <ClientLocalDate value={user.whenCreated} />
                     ) : (
-                      '—'
+                      "—"
                     )}
                   </p>
                 </div>
@@ -114,21 +132,25 @@ export default function UserDetailModal({ user, onClose }: UserDetailModalProps)
                   <p>
                     {user.lastVerifiedAt ? (
                       <>
-                        {new Date(user.lastVerifiedAt).toLocaleString()}
-                        <span className="block text-xs text-muted-foreground">{formatVerificationSource(user.lastVerifiedSource)}</span>
+                        <ClientLocalDate value={user.lastVerifiedAt} />
+                        <span className="block text-xs text-muted-foreground">
+                          {formatVerificationSource(user.lastVerifiedSource)}
+                        </span>
                       </>
                     ) : (
-                      'N/A'
+                      "N/A"
                     )}
                   </p>
                 </div>
                 <div className="space-y-1">
-                  <Label className="text-muted-foreground">Original Registration</Label>
+                  <Label className="text-muted-foreground">
+                    Original Registration
+                  </Label>
                   <p>
                     {user.originalRegistrationAt ? (
-                      new Date(user.originalRegistrationAt).toLocaleString()
+                      <ClientLocalDate value={user.originalRegistrationAt} />
                     ) : (
-                      'N/A'
+                      "N/A"
                     )}
                   </p>
                 </div>
@@ -142,14 +164,16 @@ export default function UserDetailModal({ user, onClose }: UserDetailModalProps)
               {(user.memberOf || []).length > 0 ? (
                 <div className="bg-muted/50 rounded-lg p-4 max-h-60 overflow-y-auto border">
                   <ul className="space-y-2">
-                    {(user.memberOf || []).map((group, index) => {
-                      const groupName = group.split(',')[0].replace('CN=', '');
+                    {(user.memberOf || []).map((group) => {
+                      const groupName = group.split(",")[0].replace("CN=", "");
                       return (
-                        <li key={index} className="flex items-start gap-2">
+                        <li key={group} className="flex items-start gap-2">
                           <span className="text-primary mt-0.5">•</span>
                           <div className="flex-1">
                             <p className="font-medium">{groupName}</p>
-                            <p className="text-xs text-muted-foreground break-all">{group}</p>
+                            <p className="text-xs text-muted-foreground break-all">
+                              {group}
+                            </p>
                           </div>
                         </li>
                       );
@@ -157,14 +181,20 @@ export default function UserDetailModal({ user, onClose }: UserDetailModalProps)
                   </ul>
                 </div>
               ) : (
-                <p className="text-muted-foreground italic">No group memberships</p>
+                <p className="text-muted-foreground italic">
+                  No group memberships
+                </p>
               )}
             </div>
 
             <div>
-              <h4 className="text-lg font-semibold text-foreground mb-3">Technical Details</h4>
+              <h4 className="text-lg font-semibold text-foreground mb-3">
+                Technical Details
+              </h4>
               <div className="space-y-1">
-                <Label className="text-muted-foreground">Distinguished Name (DN)</Label>
+                <Label className="text-muted-foreground">
+                  Distinguished Name (DN)
+                </Label>
                 <p className="text-xs font-mono bg-muted p-2 rounded break-all border">
                   {user.dn}
                 </p>

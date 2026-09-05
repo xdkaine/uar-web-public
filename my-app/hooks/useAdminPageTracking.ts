@@ -10,27 +10,11 @@ import { useEffect } from 'react';
  */
 export function useAdminPageTracking(pageName: string, category: string) {
   useEffect(() => {
-    // Track page view - fire and forget
-    const trackPageView = async () => {
-      try {
-        await fetch('/api/admin/track-view', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            pageName,
-            category,
-          }),
-        });
-      } catch (error) {
-        // Silently fail - tracking is non-critical and shouldn't interrupt user experience
-        if (process.env.NODE_ENV === 'development') {
-          console.debug('Failed to track page view:', error);
-        }
-      }
-    };
-
-    trackPageView();
+    // sendBeacon is designed for fire-and-forget telemetry and survives page
+    // transitions without leaving an in-flight fetch tied to this component.
+    navigator.sendBeacon(
+      '/api/admin/track-view',
+      new Blob([JSON.stringify({ pageName, category })], { type: 'application/json' })
+    );
   }, [pageName, category]);
 }

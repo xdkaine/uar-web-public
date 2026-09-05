@@ -1,5 +1,5 @@
 import { Client, Attribute, Change } from 'ldapts';
-import { getRequiredEnv } from '../env-validator';
+import { getConfigValue, getRequiredSecretValue } from '../config/resolver';
 import { ldapLogger } from '../logger';
 import { createLDAPClient } from './client';
 import { searchLDAPUser } from './user-search';
@@ -30,10 +30,10 @@ export async function updateUserAttribute(
     }
 
     const userDN = userInfo.objectName;
-    const bindDN = getRequiredEnv('LDAP_BIND_DN');
-    const bindPassword = getRequiredEnv('LDAP_BIND_PASSWORD');
+    const bindDN = await getConfigValue<string>('ldap.bindDn');
+    const bindPassword = (await getRequiredSecretValue('ldap.bindPassword'));
 
-    client = createLDAPClient();
+    client = await createLDAPClient();
 
     await withTimeout(client.bind(bindDN, bindPassword), LDAP_TIMEOUT);
 
@@ -90,10 +90,10 @@ export async function updateUserAttributes(
     }
 
     const userDN = userInfo.objectName;
-    const bindDN = getRequiredEnv('LDAP_BIND_DN');
-    const bindPassword = getRequiredEnv('LDAP_BIND_PASSWORD');
+    const bindDN = await getConfigValue<string>('ldap.bindDn');
+    const bindPassword = (await getRequiredSecretValue('ldap.bindPassword'));
 
-    client = createLDAPClient();
+    client = await createLDAPClient();
 
     await withTimeout(client.bind(bindDN, bindPassword), LDAP_TIMEOUT);
 
@@ -138,19 +138,19 @@ export async function updateUserAttributes(
  */
 export async function setLDAPUserExpiration(
   username: string,
-  expirationDate: Date
+  expirationDate: Date,
+  verifiedUserDn?: string
 ): Promise<boolean> {
   let client: Client | null = null;
   try {
-    client = createLDAPClient();
-    const bindDN = getRequiredEnv('LDAP_BIND_DN');
-    const bindPassword = getRequiredEnv('LDAP_BIND_PASSWORD');
-    const searchBase = getRequiredEnv('LDAP_SEARCH_BASE');
+    client = await createLDAPClient();
+    const bindDN = await getConfigValue<string>('ldap.bindDn');
+    const bindPassword = (await getRequiredSecretValue('ldap.bindPassword'));
+    const searchBase = await getConfigValue<string>('ldap.searchBase');
 
     await withTimeout(client.bind(bindDN, bindPassword), LDAP_TIMEOUT);
 
-    const sanitizedUsername = escapeLDAPDN(username);
-    const userDN = `CN=${sanitizedUsername},${searchBase}`;
+    const userDN = verifiedUserDn || `CN=${escapeLDAPDN(username)},${searchBase}`;
 
     const epoch = new Date('1601-01-01T00:00:00Z').getTime();
     const expirationTime = expirationDate.getTime();
@@ -177,60 +177,6 @@ export async function setLDAPUserExpiration(
         ldapLogger.error('Error unbinding connection', unbindErr);
       }
     }
-  }
-}
-
-/**
- * Tag an AD account with its Access Request ID
- */
-export async function tagAccountWithAccessRequestId(
-  username: string,
-  accessRequestId: string
-): Promise<boolean> {
-  try {
-    if (!username || !accessRequestId) {
-      ldapLogger.warn('Missing username or accessRequestId for tagging', { username, accessRequestId });
-      return false;
-    }
-
-    await updateUserAttribute(username, 'extensionAttribute15', accessRequestId);
-
-    ldapLogger.info('Tagged AD account with Access Request ID', {
-      username,
-      accessRequestId
-    });
-    return true;
-  } catch (error) {
-    ldapLogger.error('Error tagging AD account with Access Request ID', {
-      username,
-      accessRequestId,
-      error: sanitizeLdapError(error)
-    });
-    return false;
-  }
-}
-
-/**
- * Get the Access Request ID from an AD account
- */
-export async function getAccessRequestIdFromAccount(username: string): Promise<string | null> {
-  try {
-    const userInfo = await searchLDAPUser(username);
-    if (!userInfo) {
-      return null;
-    }
-
-    const extensionAttr = userInfo.attributes.find(
-      (attr: { type: string; values: string[] }) => attr.type === 'extensionAttribute15'
-    );
-
-    return extensionAttr?.values?.[0] || null;
-  } catch (error) {
-    ldapLogger.error('Error retrieving Access Request ID from AD account', {
-      username,
-      error: sanitizeLdapError(error)
-    });
-    return null;
   }
 }
 

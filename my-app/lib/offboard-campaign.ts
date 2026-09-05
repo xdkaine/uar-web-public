@@ -3,13 +3,22 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { listUsersInOU, searchLDAPUser } from '@/lib/ldap';
 import {
+  isMemberOfAdminGroup as matchesConfiguredAdminGroup,
+  parseAdminGroupDns,
+} from '@/lib/ldap/admin-groups';
+import {
   sendOffboardExtensionEmail,
   sendOffboardExtensionReminderEmail,
+  sendOffboardDirectCompletedEmail,
   sendOffboardInitialEmail,
   sendOffboardReminderEmail,
 } from '@/lib/email';
 import { processLifecycleAction } from '@/lib/lifecycle-processor';
+import { LIFECYCLE_READY_NON_NULL_PROVISIONING_STATES } from '@/lib/access-request-lifecycle-readiness';
+import { revokeUserSessionsEverywhere } from '@/lib/auth/provider-logout-audit';
+import { isModuleEnabled, isModuleEnabledStrict } from '@/lib/modules/core';
 import { appLogger } from '@/lib/logger';
+import { getConfigValue } from '@/lib/config/resolver';
 import { AuditActions, AuditCategories, sanitizeAuditDetails } from '@/lib/audit-log';
 import {
   isOffboardExtensionReminderScheduleValid,
@@ -20,11 +29,60 @@ export { validateOffboardExtensionSchedule } from '@/lib/offboard-extension-sche
 
 const ACTIVE_LOCK_KEY = 'global';
 const DAY_MS = 24 * 60 * 60 * 1000;
+const OPERATION_PREVIEW_TTL_MS = 15 * 60 * 1000;
+const OPERATION_CLAIM_MS = 30 * 60 * 1000;
 const ACTIVE_EXTENSION_STATUSES = ['active', 'notification_failed', 'pending_notification'];
 const EMAIL_CLAIM_STALE_MS = 30 * 60 * 1000;
+const ENFORCEMENT_CLAIM_MS = 30 * 60 * 1000;
+const FINAL_NOTICE_CLAIM_MS = 30 * 60 * 1000;
 const REUSABLE_REQUEST_STATUSES = ['rejected', 'offboarded'];
+const DIRECT_OFFBOARD_POLICY_VERSION = 'direct-offboard-v1';
+const VPN_IDENTITY_OFFBOARD_FENCE_LOCK_NAMESPACE = 904772;
+const DIRECTORY_EXECUTION_LOCK_NAMESPACE = 873211;
 
 type CampaignLogLevel = 'info' | 'warn' | 'error';
+
+export class OffboardOperationError extends Error {
+  constructor(
+    message: string,
+    public readonly code: 'PREVIEW_EXPIRED' | 'PREVIEW_STALE' | 'PREVIEW_CONFLICT' | 'PREVIEW_INVALID' | 'OPERATION_IN_PROGRESS' | 'RECONCILIATION_REQUIRED'
+  ) {
+    super(message);
+  }
+}
+
+type OperationKind = 'activation' | 'rollback';
+
+interface OperationPreviewItem {
+  recipientId: string;
+  adUsername: string;
+  linkedVpnUsername: string | null;
+  actions: string[];
+  conflicts: string[];
+  expectedState: Record<string, unknown>;
+  executable: boolean;
+}
+
+function canonicalOperationDigest(kind: OperationKind, campaignId: string, items: OperationPreviewItem[]) {
+  return crypto.createHash('sha256').update(JSON.stringify({
+    kind,
+    campaignId,
+    items: items.map(item => ({
+      recipientId: item.recipientId,
+      actions: [...item.actions].sort(),
+      conflicts: [...item.conflicts].sort(),
+      expectedState: item.expectedState,
+    })),
+  })).digest('hex');
+}
+
+function jsonArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+}
+
+function operationJson(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
 
 interface LdapUserSnapshot {
   dn: string;
@@ -39,8 +97,76 @@ interface LdapUserSnapshot {
   accessRequestId?: string;
 }
 
+interface OriginalAccessRequestSnapshot {
+  id?: string;
+  status?: string;
+  version?: number;
+  accountExpiresAt?: string | null;
+  accountPassword?: string | null;
+}
+
+interface OriginalVpnSnapshot {
+  id?: string;
+  username?: string;
+  name?: string | null;
+  email?: string | null;
+  status?: string;
+  portalType?: string;
+  isInternal?: boolean;
+  password?: string | null;
+  expiresAt?: string | null;
+  createdBy?: string | null;
+  createdByFaculty?: boolean;
+  facultyCreatedAt?: string | null;
+  disabledAt?: string | null;
+  disabledBy?: string | null;
+  disabledReason?: string | null;
+  revokedAt?: string | null;
+  revokedBy?: string | null;
+  revokedReason?: string | null;
+  restoredAt?: string | null;
+  restoredBy?: string | null;
+  canRestore?: boolean;
+  notes?: string | null;
+  batchId?: string | null;
+  accessRequestId?: string | null;
+  importId?: string | null;
+  adUsername?: string | null;
+}
+
+interface OriginalSnapshot {
+  ldap?: unknown;
+  vpn?: OriginalVpnSnapshot | null;
+  accessRequest?: OriginalAccessRequestSnapshot | null;
+  lastVerification?: unknown;
+}
+
+interface VpnAccountLookupEntry {
+  id: string;
+  username: string;
+  status: string;
+  portalType: string | null;
+  adUsername: string | null;
+}
+
+interface AccessRequestSummaryRow {
+  id: string;
+  status: string;
+  version: number;
+  accountExpiresAt: Date | null;
+  name: string;
+  email: string;
+  ldapUsername: string | null;
+  linkedAdUsername: string | null;
+  adAccountStatus: string | null;
+  vpnAccountStatus: string | null;
+}
+
 interface DryRunInput {
   name?: string;
+  workflowMode?: 'verification' | 'direct';
+  directOffboardReason?: string;
+  directOffboardReference?: string;
   waveSize?: number;
   canarySize?: number;
   pauseAfterEachWave?: boolean;
@@ -69,6 +195,7 @@ type AccountVerificationClient = Pick<typeof prisma, 'accessRequest' | 'offboard
 type CampaignRecipientWithCampaign = Prisma.OffboardCampaignRecipientGetPayload<{
   include: { campaign: true };
 }>;
+type OffboardCampaignRecipientRow = Prisma.OffboardCampaignRecipientGetPayload<Record<never, never>>;
 
 interface ProcessOptions {
   campaignId?: string;
@@ -79,15 +206,20 @@ interface ProcessOptions {
     endInclusive: Date;
   };
   processInitialEmails?: boolean;
+  allowDirect?: boolean;
 }
 
 export interface ProcessAllOffboardInput {
   initialEmails?: boolean;
   reminders?: boolean;
   enforcement?: boolean;
+  directOffboarding?: boolean;
   overrideSendingPause?: boolean;
   overrideRemindersPause?: boolean;
   overrideEnforcementPause?: boolean;
+  overrideExecutionPause?: boolean;
+  previewDigest?: string;
+  previewedAt?: string;
 }
 
 export interface ExtendOffboardCampaignInput {
@@ -134,25 +266,26 @@ function cleanList(values: string[] | undefined): string[] {
   return Array.from(new Set((values || []).map(v => v.trim()).filter(Boolean)));
 }
 
-function getOriginalSnapshot(recipient: any): any | null {
+function getOriginalSnapshot(recipient: { originalSnapshot?: unknown }): OriginalSnapshot | null {
   if (!recipient.originalSnapshot) {
     return null;
   }
 
   try {
-    return typeof recipient.originalSnapshot === 'string'
+    const snapshot = typeof recipient.originalSnapshot === 'string'
       ? JSON.parse(recipient.originalSnapshot)
       : recipient.originalSnapshot;
+    return snapshot as OriginalSnapshot;
   } catch {
     return null;
   }
 }
 
-function getOriginalAccessRequestSnapshot(recipient: any): any | null {
+function getOriginalAccessRequestSnapshot(recipient: { originalSnapshot?: unknown }): OriginalAccessRequestSnapshot | null {
   return getOriginalSnapshot(recipient)?.accessRequest || null;
 }
 
-function getOriginalVpnSnapshot(recipient: any): any | null {
+function getOriginalVpnSnapshot(recipient: { originalSnapshot?: unknown }): OriginalVpnSnapshot | null {
   return getOriginalSnapshot(recipient)?.vpn || null;
 }
 
@@ -169,22 +302,23 @@ function isUsableEmail(email: string | null | undefined): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((email || '').trim());
 }
 
-function adminGroupFragments(): string[] {
-  return (process.env.LDAP_ADMIN_GROUPS || '')
-    .split(',')
-    .map(group => group.trim())
-    .filter(Boolean);
-}
-
-function isAdminGroupMember(memberOf: string[]): boolean {
-  const fragments = adminGroupFragments();
-  if (fragments.length === 0) {
-    return false;
+async function adminGroupConfiguration(): Promise<string> {
+  const configuredGroups = await getConfigValue<string[]>('ldap.adminGroups');
+  if (!Array.isArray(configuredGroups) || configuredGroups.length === 0) {
+    throw new Error('LDAP_ADMIN_GROUPS requires at least one complete administrator-group DN to protect administrators from offboarding');
   }
 
-  return memberOf.some(group =>
-    fragments.some(fragment => group.toLowerCase().includes(fragment.toLowerCase()))
-  );
+  return JSON.stringify(configuredGroups);
+}
+
+async function validateAdminGroupConfiguration(): Promise<string> {
+  const configuration = await adminGroupConfiguration();
+  parseAdminGroupDns(configuration);
+  return configuration;
+}
+
+function isAdminGroupMember(memberOf: string[], configuration: string): boolean {
+  return matchesConfiguredAdminGroup(memberOf, configuration);
 }
 
 function serviceAccountPatterns(): string[] {
@@ -211,7 +345,8 @@ function isServiceOrSharedAccount(user: LdapUserSnapshot): boolean {
 function safetySkipReason(
   user: LdapUserSnapshot,
   excludedUsernames: Set<string>,
-  excludedEmails: Set<string>
+  excludedEmails: Set<string>,
+  adminGroups: string,
 ): string | null {
   const username = normalize(user.username);
   const email = normalize(user.email);
@@ -221,7 +356,7 @@ function safetySkipReason(
   if (email && excludedEmails.has(email)) return 'manually_excluded_email';
   if (!user.accountEnabled) return 'disabled_ad_account';
   if (!isUsableEmail(user.email)) return 'missing_usable_email';
-  if (isAdminGroupMember(user.memberOf || [])) return 'admin_group_member';
+  if (isAdminGroupMember(user.memberOf || [], adminGroups)) return 'admin_group_member';
   if (isServiceOrSharedAccount(user)) return 'service_or_shared_account';
 
   return null;
@@ -245,8 +380,8 @@ function isLdapAccountEnabledFromUac(userAccountControl: string | null): boolean
   return (parsed & 2) === 0;
 }
 
-function buildVpnLookup(vpnAccounts: any[]): Map<string, any> {
-  const byAdUsername = new Map<string, any>();
+function buildVpnLookup<T extends VpnAccountLookupEntry>(vpnAccounts: T[]): Map<string, T> {
+  const byAdUsername = new Map<string, T>();
 
   for (const vpn of vpnAccounts) {
     const adKey = normalize(vpn.adUsername);
@@ -263,7 +398,18 @@ function buildVpnLookup(vpnAccounts: any[]): Map<string, any> {
   return byAdUsername;
 }
 
-function projectedActionFor(user: LdapUserSnapshot, vpn: any | null): string {
+function ambiguousLiveVpnLinks<T extends VpnAccountLookupEntry>(vpnAccounts: T[]): Set<string> {
+  const liveCounts = new Map<string, number>();
+  for (const vpn of vpnAccounts) {
+    if (vpn.status === 'revoked' || vpn.status === 'disabled') continue;
+    const key = normalize(vpn.adUsername) || normalize(vpn.username);
+    if (!key) continue;
+    liveCounts.set(key, (liveCounts.get(key) || 0) + 1);
+  }
+  return new Set([...liveCounts.entries()].filter(([, count]) => count > 1).map(([key]) => key));
+}
+
+function projectedActionFor(user: LdapUserSnapshot, vpn: VpnAccountLookupEntry | null): string {
   return vpn?.username
     ? `Disable AD account ${user.username}; revoke linked VPN account ${vpn.username}`
     : `Disable AD account ${user.username}`;
@@ -280,7 +426,7 @@ function waveNumberForEligibleIndex(index: number, canarySize: number, waveSize:
 }
 
 async function createCampaignLog(
-  tx: any,
+  tx: Prisma.TransactionClient,
   params: {
     campaignId: string;
     recipientId?: string | null;
@@ -299,7 +445,7 @@ async function createCampaignLog(
       eventType: params.eventType,
       actor: params.actor || null,
       message: params.message,
-      details: params.details || undefined,
+      details: (params.details || undefined) as Prisma.InputJsonValue | undefined,
     },
   });
 
@@ -388,7 +534,7 @@ function offboardOutcome(level: CampaignLogLevel, eventType: string): 'success' 
   return 'success';
 }
 
-async function findAccessRequestsByUsername(usernames: string[]): Promise<Map<string, any>> {
+async function findAccessRequestsByUsername(usernames: string[]): Promise<Map<string, AccessRequestSummaryRow>> {
   if (usernames.length === 0) {
     return new Map();
   }
@@ -405,6 +551,7 @@ async function findAccessRequestsByUsername(usernames: string[]): Promise<Map<st
     select: {
       id: true,
       status: true,
+      version: true,
       accountExpiresAt: true,
       name: true,
       email: true,
@@ -415,7 +562,7 @@ async function findAccessRequestsByUsername(usernames: string[]): Promise<Map<st
     },
   });
 
-  const map = new Map<string, any>();
+  const map = new Map<string, AccessRequestSummaryRow>();
   for (const request of requests) {
     const ldapKey = normalize(request.ldapUsername);
     const linkedKey = normalize(request.linkedAdUsername);
@@ -523,23 +670,91 @@ export async function getAccountVerificationMap(
 }
 
 async function markAccessRequestOffboardedByCampaign(
-  tx: any,
-  recipient: any,
+  tx: Prisma.TransactionClient,
+  recipient: CampaignRecipientWithCampaign,
   actor: string,
-  enforcedAt: Date
+  enforcedAt: Date,
+  options: { confirmedAdDisabled?: boolean } = {}
 ): Promise<boolean> {
   if (!recipient.accessRequestId) {
     return false;
+  }
+
+  let disabledConfirmation: {
+    observedAt: Date;
+    directoryDn: string;
+    objectGuid: string;
+    username: string;
+    userAccountControl: string;
+  } | null = null;
+  let projectConfirmedDisabled = false;
+
+  if (recipient.campaign.workflowMode === 'direct' && options.confirmedAdDisabled) {
+    const canonicalUsername = normalize(recipient.adUsername);
+    await tx.$queryRaw<Array<{ lock_acquired: string }>>`
+      SELECT 'locked'::text AS lock_acquired
+      FROM pg_advisory_xact_lock(hashtextextended(${canonicalUsername}, ${DIRECTORY_EXECUTION_LOCK_NAMESPACE}))
+    `;
+
+    const userInfo = await searchLDAPUser(recipient.adUsername);
+    const liveUsername = userInfo ? getAttribute(userInfo.attributes, 'sAMAccountName') : null;
+    const liveObjectGuid = userInfo ? getAttribute(userInfo.attributes, 'objectGUID') : null;
+    const rawUac = userInfo ? getAttribute(userInfo.attributes, 'userAccountControl') : null;
+    if (
+      !userInfo
+      || normalize(liveUsername) !== canonicalUsername
+      || userInfo.objectName !== recipient.adDn
+      || !recipient.targetDirectoryObjectGuid
+      || liveObjectGuid !== recipient.targetDirectoryObjectGuid
+      || !rawUac
+      || !/^\d+$/.test(rawUac)
+      || !Number.isSafeInteger(Number(rawUac))
+      || isLdapAccountEnabledFromUac(rawUac)
+    ) {
+      throw new Error('The exact reviewed AD account is not confirmed disabled under the directory execution lock; reconciliation is required');
+    }
+    if (isAdminGroupMember(
+      getAttributeValues(userInfo.attributes, 'memberOf'),
+      await validateAdminGroupConfiguration(),
+    )) {
+      throw new Error('The exact reviewed AD account is now protected by administrator-group membership; reconciliation is required');
+    }
+
+    const requestProjection = await tx.accessRequest.findUnique({
+      where: { id: recipient.accessRequestId },
+      select: {
+        adAccountStatus: true,
+      },
+    });
+    if (requestProjection?.adAccountStatus === 'deleted') {
+      throw new Error('The portal AD projection is already deleted and cannot be downgraded to disabled');
+    }
+    projectConfirmedDisabled = requestProjection?.adAccountStatus !== 'disabled';
+    disabledConfirmation = {
+      observedAt: new Date(),
+      directoryDn: userInfo.objectName,
+      objectGuid: liveObjectGuid,
+      username: liveUsername!,
+      userAccountControl: rawUac!,
+    };
   }
 
   const result = await tx.accessRequest.updateMany({
     where: {
       id: recipient.accessRequestId,
       status: 'approved',
+      ...(recipient.campaign.workflowMode === 'direct'
+        ? { version: recipient.expectedRequestVersion ?? -1 }
+        : {}),
     },
     data: {
       status: 'offboarded',
       accountExpiresAt: enforcedAt,
+      ...(projectConfirmedDisabled
+        ? {
+            adAccountStatus: 'disabled',
+          }
+        : {}),
       version: { increment: 1 },
     },
   });
@@ -553,7 +768,9 @@ async function markAccessRequestOffboardedByCampaign(
       requestId: recipient.accessRequestId,
       author: actor,
       type: 'offboard_campaign',
-      comment: `Offboard campaign "${recipient.campaign.name}" completed for ${recipient.adUsername}. Access was disabled/revoked by the campaign, but this does not block future re-enrollment unless the email is on the block list.`,
+      comment: disabledConfirmation
+        ? `Offboard campaign "${recipient.campaign.name}" completed for ${recipient.adUsername}. No LDAP disable write was issued: the exact reviewed object was confirmed disabled at ${disabledConfirmation.observedAt.toISOString()} under the directory execution lock (username=${disabledConfirmation.username}, DN=${disabledConfirmation.directoryDn}, objectGUID=${disabledConfirmation.objectGuid}, userAccountControl=${disabledConfirmation.userAccountControl}). The original disable time and actor remain unknown unless already recorded. Access was revoked by the campaign, but this does not block future re-enrollment unless the email is on the block list.`
+        : `Offboard campaign "${recipient.campaign.name}" completed for ${recipient.adUsername}. Access was disabled/revoked by the campaign, but this does not block future re-enrollment unless the email is on the block list.`,
     },
   });
 
@@ -561,8 +778,8 @@ async function markAccessRequestOffboardedByCampaign(
 }
 
 async function restoreAccessRequestAfterCampaignRollback(
-  tx: any,
-  recipient: any,
+  tx: Prisma.TransactionClient,
+  recipient: CampaignRecipientWithCampaign,
   actor: string
 ): Promise<boolean> {
   if (!recipient.accessRequestId) {
@@ -603,6 +820,20 @@ async function restoreAccessRequestAfterCampaignRollback(
 }
 
 export async function createOffboardDryRun(input: DryRunInput, actor: string) {
+  const adminGroups = await validateAdminGroupConfiguration();
+  const ldapSearchBase = await getConfigValue<string>('ldap.searchBase');
+
+  const workflowMode = input.workflowMode === 'direct' ? 'direct' : 'verification';
+  const directOffboardReason = input.directOffboardReason?.trim() || '';
+  const directOffboardReference = input.directOffboardReference?.trim() || '';
+  if (workflowMode === 'direct') {
+    if (directOffboardReason.length < 10 || directOffboardReason.length > 2_000) {
+      throw new Error('Direct offboarding requires a substantive reason between 10 and 2,000 characters');
+    }
+    if (directOffboardReference.length < 3 || directOffboardReference.length > 200) {
+      throw new Error('Direct offboarding requires a ticket or change reference between 3 and 200 characters');
+    }
+  }
   const waveSize = Math.max(1, Math.min(Number(input.waveSize || 25), 500));
   const canarySize = Math.max(0, Math.min(Number(input.canarySize || 0), 500));
   const pauseAfterEachWave = input.pauseAfterEachWave ?? true;
@@ -680,8 +911,10 @@ export async function createOffboardDryRun(input: DryRunInput, actor: string) {
   const accessRequestMap = await findAccessRequestsByUsername(usernames);
   const verificationMap = await getAccountVerificationMap(usernames);
   const vpnByAd = buildVpnLookup(vpnAccounts);
+  const ambiguousVpnLinks = ambiguousLiveVpnLinks(vpnAccounts);
+  const vpnModuleEnabled = workflowMode === 'direct' ? await isModuleEnabledStrict('vpn.management') : true;
   const now = new Date();
-  const projectedDeadline = addDays(now, 7);
+  const projectedDeadline = workflowMode === 'verification' ? addDays(now, 7) : null;
 
   let eligibleIndex = 0;
   const recipientRows = targetUsers
@@ -691,7 +924,21 @@ export async function createOffboardDryRun(input: DryRunInput, actor: string) {
       const vpn = vpnByAd.get(usernameKey) || null;
       const accessRequest = accessRequestMap.get(usernameKey) || null;
       const verification = verificationMap.get(usernameKey) || emptyVerificationInfo();
-      const skipReason = safetySkipReason(user, excludedUsernameSet, excludedEmailSet);
+      let skipReason = safetySkipReason(
+        workflowMode === 'direct' ? { ...user, accountEnabled: true } : user,
+        excludedUsernameSet,
+        excludedEmailSet,
+        adminGroups,
+      );
+      if (!skipReason && workflowMode === 'direct' && (!accessRequest || accessRequest.status !== 'approved')) {
+        skipReason = 'direct_offboarding_requires_approved_portal_request';
+      }
+      if (!skipReason && workflowMode === 'direct' && ambiguousVpnLinks.has(usernameKey)) {
+        skipReason = 'multiple_live_vpn_accounts_linked_to_ad_username';
+      }
+      if (!skipReason && workflowMode === 'direct' && vpn && !vpnModuleEnabled) {
+        skipReason = 'vpn_module_disabled';
+      }
       const isSkipped = Boolean(skipReason);
       const waveNumber = isSkipped ? -1 : waveNumberForEligibleIndex(eligibleIndex++, canarySize, waveSize);
 
@@ -702,6 +949,7 @@ export async function createOffboardDryRun(input: DryRunInput, actor: string) {
         adDn: user.dn,
         linkedVpnUsername: vpn?.username || null,
         accessRequestId: accessRequest?.id || user.accessRequestId || null,
+        expectedRequestVersion: accessRequest?.version ?? null,
         vpnAccountId: vpn?.id || null,
         originalAdEnabled: user.accountEnabled,
         originalAdStatus: user.accountEnabled ? 'active' : 'disabled',
@@ -717,18 +965,21 @@ export async function createOffboardDryRun(input: DryRunInput, actor: string) {
         status: isSkipped ? 'skipped' : 'dry_run_ready',
         skipReason,
         projectedDeadlineAt: isSkipped ? null : projectedDeadline,
-        projectedAction: isSkipped ? null : projectedActionFor(user, vpn),
+        projectedAction: isSkipped ? null : workflowMode === 'direct'
+          ? `${projectedActionFor(user, vpn)}; revoke sessions; send completed-offboarding notice`
+          : projectedActionFor(user, vpn),
       };
     });
 
   const eligibleRecipients = recipientRows.filter(row => row.status === 'dry_run_ready').length;
   const skippedRecipients = recipientRows.filter(row => row.status === 'skipped').length;
 
-  return await prisma.$transaction(async (tx: any) => {
+  return await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const campaign = await tx.offboardCampaign.create({
       data: {
         name: input.name?.trim() || `Offboard dry run ${now.toISOString().slice(0, 10)}`,
         createdBy: actor,
+        workflowMode,
         status: 'dry_run',
         dryRunAt: now,
         waveSize,
@@ -736,15 +987,19 @@ export async function createOffboardDryRun(input: DryRunInput, actor: string) {
         currentWave: canarySize > 0 ? 0 : 0,
         pauseAfterEachWave,
         sendingPaused: true,
+        executionPaused: true,
+        directOffboardReason: workflowMode === 'direct' ? directOffboardReason : null,
+        directOffboardReference: workflowMode === 'direct' ? directOffboardReference : null,
         manualExcludedUsernames: excludedUsernames,
         manualExcludedEmails: excludedEmails,
         totalRecipients: recipientRows.length,
         eligibleRecipients,
         skippedRecipients,
         summaryJson: {
-          ldapSearchBase: process.env.LDAP_SEARCH_BASE || null,
+          ldapSearchBase: ldapSearchBase || null,
           vpnAccountsConsidered: vpnAccounts.length,
           scope: 'selected_accounts',
+          workflowMode,
           includedUsernames,
           missingIncludedUsernames,
           exclusions: { excludedUsernames, excludedEmails },
@@ -757,6 +1012,7 @@ export async function createOffboardDryRun(input: DryRunInput, actor: string) {
         data: recipientRows.map(row => ({
           ...row,
           campaignId: campaign.id,
+          originalSnapshot: row.originalSnapshot as unknown as Prisma.InputJsonValue,
         })),
       });
     }
@@ -775,6 +1031,8 @@ export async function createOffboardDryRun(input: DryRunInput, actor: string) {
         waveSize,
         canarySize,
         pauseAfterEachWave,
+        workflowMode,
+        directOffboardReference: workflowMode === 'direct' ? directOffboardReference : null,
       },
     });
 
@@ -782,13 +1040,12 @@ export async function createOffboardDryRun(input: DryRunInput, actor: string) {
   });
 }
 
-export async function getOffboardCampaign(campaignId: string, client: any = prisma) {
+export async function getOffboardCampaign(campaignId: string, client: Prisma.TransactionClient = prisma) {
   const campaign = await client.offboardCampaign.findUnique({
     where: { id: campaignId },
     include: {
       recipients: {
         orderBy: [{ waveNumber: 'asc' }, { adUsername: 'asc' }],
-        take: 250,
       },
     },
   });
@@ -894,6 +1151,7 @@ export async function listOffboardCampaigns(selectedCampaignId?: string | null) 
       id: true,
       name: true,
       status: true,
+      workflowMode: true,
       createdAt: true,
       dryRunAt: true,
       activatedAt: true,
@@ -913,6 +1171,11 @@ export async function listOffboardCampaigns(selectedCampaignId?: string | null) 
       sendingPaused: true,
       remindersPaused: true,
       enforcementPaused: true,
+      executionPaused: true,
+      directOffboardReason: true,
+      directOffboardReference: true,
+      finalNoticeSentCount: true,
+      finalNoticeFailureCount: true,
       currentWave: true,
     },
   });
@@ -943,7 +1206,7 @@ export async function deleteOffboardDryRun(campaignId: string, actor: string) {
     throw new Error('Only unactivated dry runs can be deleted');
   }
 
-  await prisma.$transaction(async (tx: any) => {
+  await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     await createCampaignLog(tx, {
       campaignId,
       eventType: 'dry_run_deleted',
@@ -959,7 +1222,478 @@ export async function deleteOffboardDryRun(campaignId: string, actor: string) {
   return campaign;
 }
 
-export async function activateOffboardCampaign(campaignId: string, actor: string) {
+async function buildActivationOperationItems(campaignId: string): Promise<OperationPreviewItem[]> {
+  const adminGroups = await validateAdminGroupConfiguration();
+  const campaign = await prisma.offboardCampaign.findUnique({
+    where: { id: campaignId },
+    include: { recipients: true },
+  });
+  if (!campaign) throw new Error('Campaign not found');
+
+  const [ldapUsersRaw, vpnAccounts] = await Promise.all([
+    listUsersInOU(),
+    prisma.vPNAccount.findMany({ select: { id: true, username: true, status: true, portalType: true, adUsername: true } }),
+  ]);
+  const liveUsers = new Map<string, LdapUserSnapshot>();
+  for (const user of ldapUsersRaw as LdapUserSnapshot[]) liveUsers.set(normalize(user.username), user);
+  const vpnByAd = buildVpnLookup(vpnAccounts);
+  const ambiguousVpnLinks = ambiguousLiveVpnLinks(vpnAccounts);
+  const excludedUsernameSet = new Set<string>((campaign.manualExcludedUsernames as string[] | null || []).map(normalize));
+  const excludedEmailSet = new Set<string>((campaign.manualExcludedEmails as string[] | null || []).map(normalize));
+  const directMode = campaign.workflowMode === 'direct';
+  const vpnModuleEnabled = directMode ? await isModuleEnabledStrict('vpn.management') : true;
+  const items: OperationPreviewItem[] = [];
+  for (const recipient of campaign.recipients) {
+    let conflict: string | null = null;
+    if (recipient.status === 'skipped') conflict = recipient.skipReason || 'already_skipped';
+    const live = liveUsers.get(normalize(recipient.adUsername));
+    const liveDirectory = directMode && !conflict ? await searchLDAPUser(recipient.adUsername) : null;
+    const liveObjectGuid = liveDirectory ? getAttribute(liveDirectory.attributes, 'objectGUID') : null;
+    const liveRequest = directMode && recipient.accessRequestId
+      ? await prisma.accessRequest.findUnique({
+          where: { id: recipient.accessRequestId },
+          select: { id: true, status: true, version: true },
+        })
+      : null;
+    if (!conflict && !live) conflict = 'no_longer_in_ldap_scope';
+    if (!conflict && directMode && ambiguousVpnLinks.has(normalize(recipient.adUsername))) {
+      conflict = 'multiple_live_vpn_accounts_linked_to_ad_username';
+    }
+    if (!conflict && live) {
+      conflict = safetySkipReason(
+        directMode ? { ...live, accountEnabled: true } : live,
+        excludedUsernameSet,
+        excludedEmailSet,
+        adminGroups,
+      );
+      if (!conflict && normalize(live.email) !== normalize(recipient.email)) conflict = 'email_changed_since_dry_run';
+      const liveVpn = vpnByAd.get(normalize(recipient.adUsername)) || null;
+      if (!conflict && normalize(liveVpn?.username) !== normalize(recipient.linkedVpnUsername)) conflict = 'vpn_link_changed_since_dry_run';
+      if (
+        !conflict
+        && liveVpn
+        && liveVpn.status !== recipient.originalVpnStatus
+        && !(directMode && ['revoked', 'disabled'].includes(liveVpn.status))
+      ) conflict = 'vpn_status_changed_since_dry_run';
+      if (!conflict && liveVpn && liveVpn.id !== recipient.vpnAccountId) conflict = 'vpn_identity_changed_since_dry_run';
+      if (!conflict && directMode && liveVpn && !vpnModuleEnabled) conflict = 'vpn_module_disabled';
+      if (!conflict && directMode && (!liveDirectory || liveDirectory.objectName !== recipient.adDn || !liveObjectGuid)) conflict = 'directory_identity_changed_since_dry_run';
+      if (!conflict && directMode && (!liveRequest || liveRequest.status !== 'approved' || liveRequest.version !== recipient.expectedRequestVersion)) conflict = 'request_state_changed_since_dry_run';
+    }
+    const liveVpn = vpnByAd.get(normalize(recipient.adUsername)) || null;
+    const actions = conflict
+      ? []
+      : directMode
+        ? [
+            ...(live?.accountEnabled ? ['disable_ad'] : []),
+            ...(liveVpn && !['revoked', 'disabled'].includes(liveVpn.status) ? ['revoke_vpn'] : []),
+            'revoke_sessions',
+            'mark_request_offboarded',
+            'send_final_notice',
+          ]
+        : ['queue_initial_email'];
+    items.push({
+      recipientId: recipient.id,
+      adUsername: recipient.adUsername,
+      linkedVpnUsername: recipient.linkedVpnUsername,
+      actions,
+      conflicts: conflict ? [conflict] : [],
+      expectedState: {
+        workflowMode: campaign.workflowMode,
+        campaignUpdatedAt: campaign.updatedAt.toISOString(),
+        campaignStatus: campaign.status,
+        campaignWaveSize: campaign.waveSize,
+        campaignCanarySize: campaign.canarySize,
+        campaignCurrentWave: campaign.currentWave,
+        campaignPauseAfterEachWave: campaign.pauseAfterEachWave,
+        campaignSendingPaused: campaign.sendingPaused,
+        recipientUpdatedAt: recipient.updatedAt.toISOString(),
+        recipientStatus: recipient.status,
+        recipientWaveNumber: recipient.waveNumber,
+        adUsername: recipient.adUsername,
+        email: recipient.email,
+        linkedVpnUsername: recipient.linkedVpnUsername,
+        originalVpnStatus: recipient.originalVpnStatus,
+        liveAdDn: live?.dn ?? null,
+        liveAdObjectGuid: liveObjectGuid,
+        liveAdEnabled: live?.accountEnabled ?? null,
+        liveAdExpires: live?.accountExpires ?? null,
+        liveVpnStatus: (vpnByAd.get(normalize(recipient.adUsername)) || null)?.status ?? null,
+        liveVpnId: (vpnByAd.get(normalize(recipient.adUsername)) || null)?.id ?? null,
+        liveVpnPortalType: (vpnByAd.get(normalize(recipient.adUsername)) || null)?.portalType ?? null,
+        liveRequestId: liveRequest?.id ?? null,
+        liveRequestStatus: liveRequest?.status ?? null,
+        liveRequestVersion: liveRequest?.version ?? null,
+      },
+      executable: !conflict,
+    });
+  }
+  return items;
+}
+
+async function buildRollbackOperationItems(campaignId: string): Promise<OperationPreviewItem[]> {
+  const preview = await previewOffboardRollback(campaignId);
+  return preview.items.map(item => ({
+    recipientId: item.recipientId,
+    adUsername: item.adUsername,
+    linkedVpnUsername: item.linkedVpnUsername,
+    actions: item.actions,
+    conflicts: item.conflicts,
+    expectedState: {
+      rollbackable: item.rollbackable,
+      actions: item.actions,
+      conflicts: item.conflicts,
+      recipientUpdatedAt: item.recipientUpdatedAt,
+      recipientStatus: item.recipientStatus,
+      rollbackStatus: item.rollbackStatus,
+      currentAdStatus: item.currentAdStatus,
+      currentRequestStatus: item.currentRequestStatus,
+      currentVpnStatus: item.currentVpnStatus,
+    },
+    executable: item.rollbackable,
+  }));
+}
+
+export async function createOffboardOperationPreview(campaignId: string, kind: OperationKind, actor: string) {
+  const campaign = await prisma.offboardCampaign.findUnique({
+    where: { id: campaignId },
+    select: { workflowMode: true },
+  });
+  if (!campaign) throw new Error('Campaign not found');
+  if (kind === 'rollback' && campaign.workflowMode === 'direct') {
+    throw new Error('Direct offboarding cannot be rolled back; future access requires a new account request');
+  }
+  const items = kind === 'activation'
+    ? await buildActivationOperationItems(campaignId)
+    : await buildRollbackOperationItems(campaignId);
+  const digest = canonicalOperationDigest(kind, campaignId, items);
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + OPERATION_PREVIEW_TTL_MS);
+  const summary = {
+    workflowMode: campaign.workflowMode,
+    total: items.length,
+    executable: items.filter(item => item.executable).length,
+    conflicts: items.filter(item => item.conflicts.length > 0).length,
+  };
+  const run = await prisma.offboardOperationRun.create({
+    data: {
+      campaignId,
+      actor,
+      kind,
+      digest,
+      expiresAt,
+      policyVersion: kind === 'activation' && campaign.workflowMode === 'direct'
+        ? DIRECT_OFFBOARD_POLICY_VERSION
+        : null,
+      summary,
+      items: {
+        create: items.map((item, position) => ({
+          recipientId: item.recipientId,
+          position,
+          expectedState: operationJson(item.expectedState),
+          actions: operationJson(item.actions),
+          conflicts: operationJson(item.conflicts),
+          status: item.executable ? 'previewed' : 'skipped',
+        })),
+      },
+    },
+    include: { items: { orderBy: { position: 'asc' } } },
+  });
+  return {
+    previewId: run.id,
+    digest,
+    expiresAt,
+    kind,
+    summary,
+    pageInfo: { page: 1, pageSize: Math.min(100, items.length), total: items.length, totalPages: Math.max(1, Math.ceil(items.length / 100)) },
+    downloadUrl: `/api/admin/offboard-campaigns/${campaignId}/operations/${run.id}?download=csv`,
+    items: run.items.slice(0, 100).map((item, index: number) => ({
+      ...items[index],
+      status: item.status,
+    })),
+  };
+}
+
+export async function getOffboardOperationPreview(runId: string, actor: string, campaignId: string, page = 1, pageSize = 100) {
+  const take = Math.min(Math.max(pageSize, 1), 5000);
+  const skip = Math.max(page - 1, 0) * take;
+  const run = await prisma.offboardOperationRun.findFirst({
+    where: { id: runId, actor, campaignId },
+    include: { items: { orderBy: { position: 'asc' }, skip, take }, _count: { select: { items: true } } },
+  });
+  if (!run) throw new Error('Operation preview not found');
+  return {
+    previewId: run.id,
+    digest: run.digest,
+    expiresAt: run.expiresAt,
+    kind: run.kind,
+    status: run.status,
+    summary: run.summary,
+    downloadUrl: `/api/admin/offboard-campaigns/${run.campaignId}/operations/${run.id}?download=csv`,
+    pageInfo: { page, pageSize: take, total: run._count.items, totalPages: Math.max(1, Math.ceil(run._count.items / take)) },
+    items: run.items.map(item => ({
+      recipientId: item.recipientId,
+      actions: jsonArray(item.actions),
+      conflicts: jsonArray(item.conflicts),
+      expectedState: item.expectedState,
+      status: item.status,
+      outcome: item.outcome,
+    })),
+  };
+}
+
+async function claimOffboardOperation(params: { campaignId: string; kind: OperationKind; actor: string; previewId: string; digest: string; idempotencyKey: string }) {
+  const existing = await prisma.offboardOperationRun.findUnique({ where: { idempotencyKey: params.idempotencyKey } });
+  if (existing) {
+    if (!sameOffboardOperationScope(existing, params)) {
+      throw new OffboardOperationError('Idempotency-Key was already used for a different operation', 'PREVIEW_CONFLICT');
+    }
+    if (existing.status === 'claimed') {
+      if (existing.claimedUntil && existing.claimedUntil <= new Date()) {
+        await prisma.offboardOperationRun.updateMany({
+          where: { id: existing.id, status: 'claimed', claimedUntil: { lte: new Date() } },
+          data: { status: 'reconciliation_required', claimedUntil: null },
+        });
+        throw new OffboardOperationError('The execution claim expired after work may have started; reconcile its outcomes before retrying', 'RECONCILIATION_REQUIRED');
+      }
+      throw new OffboardOperationError('This exact operation is still being processed', 'OPERATION_IN_PROGRESS');
+    }
+    return { run: existing, duplicate: true };
+  }
+  const now = new Date();
+  const claimId = crypto.randomUUID();
+  const claimed = await prisma.offboardOperationRun.updateMany({
+    where: { id: params.previewId, campaignId: params.campaignId, kind: params.kind, actor: params.actor, digest: params.digest, status: 'previewed', expiresAt: { gt: now }, idempotencyKey: null },
+    data: { status: 'claimed', claimId, claimedAt: now, claimedUntil: new Date(now.getTime() + OPERATION_CLAIM_MS), idempotencyKey: params.idempotencyKey },
+  });
+  if (claimed.count !== 1) {
+    const duplicate = await prisma.offboardOperationRun.findUnique({ where: { idempotencyKey: params.idempotencyKey } });
+    if (duplicate) {
+      if (!sameOffboardOperationScope(duplicate, params)) {
+        throw new OffboardOperationError('Idempotency-Key was already used for a different operation', 'PREVIEW_CONFLICT');
+      }
+      if (duplicate.status === 'claimed') {
+        if (duplicate.claimedUntil && duplicate.claimedUntil <= now) {
+          await prisma.offboardOperationRun.updateMany({
+            where: { id: duplicate.id, status: 'claimed', claimedUntil: { lte: now } },
+            data: { status: 'reconciliation_required', claimedUntil: null },
+          });
+          throw new OffboardOperationError('The execution claim expired after work may have started; reconcile its outcomes before retrying', 'RECONCILIATION_REQUIRED');
+        }
+        throw new OffboardOperationError('This exact operation is still being processed', 'OPERATION_IN_PROGRESS');
+      }
+      return { run: duplicate, duplicate: true };
+    }
+    const run = await prisma.offboardOperationRun.findUnique({ where: { id: params.previewId } });
+    if (run && run.expiresAt <= now) throw new OffboardOperationError('Preview expired; create a new exact preview', 'PREVIEW_EXPIRED');
+    throw new OffboardOperationError('Preview was already claimed or no longer matches this operation', 'PREVIEW_CONFLICT');
+  }
+  return { run: await prisma.offboardOperationRun.findUniqueOrThrow({ where: { id: params.previewId }, include: { items: { orderBy: { position: 'asc' } } } }), duplicate: false };
+}
+
+function sameOffboardOperationScope(
+  run: { id: string; campaignId: string; kind: string; actor: string; digest: string },
+  params: { campaignId: string; kind: OperationKind; actor: string; previewId: string; digest: string },
+): boolean {
+  return run.id === params.previewId
+    && run.campaignId === params.campaignId
+    && run.kind === params.kind
+    && run.actor === params.actor
+    && run.digest === params.digest;
+}
+
+export async function executeOffboardOperation(params: {
+  campaignId: string;
+  kind: OperationKind;
+  actor: string;
+  previewId: string;
+  digest: string;
+  idempotencyKey: string;
+  directAcknowledgement?: string;
+  irreversibleAcknowledgement?: boolean;
+  authorizationEvidence?: Record<string, unknown>;
+}) {
+  if (!params.idempotencyKey || params.idempotencyKey.length > 200) {
+    throw new OffboardOperationError('A valid Idempotency-Key is required', 'PREVIEW_INVALID');
+  }
+  const duplicate = await prisma.offboardOperationRun.findUnique({ where: { idempotencyKey: params.idempotencyKey } });
+  if (duplicate) {
+    if (!sameOffboardOperationScope(duplicate, params)) {
+      throw new OffboardOperationError('Idempotency-Key was already used for a different operation', 'PREVIEW_CONFLICT');
+    }
+    if (duplicate.status === 'claimed') {
+      if (duplicate.claimedUntil && duplicate.claimedUntil <= new Date()) {
+        await prisma.offboardOperationRun.updateMany({
+          where: { id: duplicate.id, status: 'claimed', claimedUntil: { lte: new Date() } },
+          data: { status: 'reconciliation_required', claimedUntil: null },
+        });
+        throw new OffboardOperationError('The execution claim expired after work may have started; reconcile its outcomes before retrying', 'RECONCILIATION_REQUIRED');
+      }
+      throw new OffboardOperationError('This exact operation is still being processed', 'OPERATION_IN_PROGRESS');
+    }
+    return { duplicate: true, run: duplicate, campaign: null };
+  }
+  const run = await prisma.offboardOperationRun.findFirst({ where: { id: params.previewId, campaignId: params.campaignId, kind: params.kind, actor: params.actor } });
+  if (!run || run.digest !== params.digest) throw new OffboardOperationError('Preview does not match this operation', 'PREVIEW_STALE');
+  if (run.expiresAt <= new Date()) throw new OffboardOperationError('Preview expired; create a new exact preview', 'PREVIEW_EXPIRED');
+  const campaignMode = await prisma.offboardCampaign.findUnique({
+    where: { id: params.campaignId },
+    select: { workflowMode: true },
+  });
+  if (!campaignMode) throw new OffboardOperationError('Campaign not found', 'PREVIEW_INVALID');
+  if (params.kind === 'rollback' && campaignMode.workflowMode === 'direct') {
+    throw new OffboardOperationError('Direct offboarding cannot be rolled back; future access requires a new account request', 'PREVIEW_INVALID');
+  }
+  const runSummary = run.summary && typeof run.summary === 'object' && !Array.isArray(run.summary)
+    ? run.summary as Record<string, unknown>
+    : {};
+  if (params.kind === 'activation' && campaignMode.workflowMode === 'direct') {
+    const executable = Number(runSummary.executable || 0);
+    const expectedAcknowledgement = `DIRECT OFFBOARD ${executable} ${executable === 1 ? 'ACCOUNT' : 'ACCOUNTS'}`;
+    if (run.policyVersion !== DIRECT_OFFBOARD_POLICY_VERSION) {
+      throw new OffboardOperationError('Direct-offboarding policy evidence is missing; create a new preview', 'PREVIEW_INVALID');
+    }
+    if (!params.irreversibleAcknowledgement || params.directAcknowledgement !== expectedAcknowledgement) {
+      throw new OffboardOperationError(`Type ${expectedAcknowledgement} and acknowledge the immediate access changes`, 'PREVIEW_INVALID');
+    }
+  }
+  const freshItems = params.kind === 'activation'
+    ? await buildActivationOperationItems(params.campaignId)
+    : await buildRollbackOperationItems(params.campaignId);
+  if (canonicalOperationDigest(params.kind, params.campaignId, freshItems) !== params.digest) {
+    await prisma.offboardOperationRun.update({ where: { id: run.id }, data: { status: 'stale' } });
+    throw new OffboardOperationError('Live state changed since preview; create a new exact preview', 'PREVIEW_STALE');
+  }
+  const claimed = await claimOffboardOperation(params);
+  if (claimed.duplicate) return { duplicate: true, run: claimed.run, campaign: null };
+  if (params.kind === 'activation' && campaignMode.workflowMode === 'direct') {
+    await prisma.offboardOperationRun.update({
+      where: { id: params.previewId },
+      data: {
+        authorizationEvidence: operationJson({
+          policyVersion: DIRECT_OFFBOARD_POLICY_VERSION,
+          acknowledgedAt: new Date().toISOString(),
+          acknowledgement: params.directAcknowledgement,
+          irreversibleAcknowledgement: true,
+          ...(params.authorizationEvidence || {}),
+        }),
+      },
+    });
+  }
+  try {
+    let campaign;
+    let finalRunStatus = 'completed';
+    if (params.kind === 'activation') {
+      campaign = await activateOffboardCampaign(params.campaignId, params.actor, params.previewId);
+      const activatedCampaign = campaign!;
+      if (activatedCampaign.workflowMode === 'direct') {
+        const waveCount = await prisma.offboardCampaignRecipient.count({
+          where: { campaignId: params.campaignId, status: 'direct_pending', waveNumber: activatedCampaign.currentWave },
+        });
+        if (waveCount > 0) await processDirectOffboarding(params.campaignId, params.actor, waveCount);
+      } else {
+        const waveCount = await prisma.offboardCampaignRecipient.count({
+          where: { campaignId: params.campaignId, status: 'pending_send', waveNumber: activatedCampaign.currentWave },
+        });
+        if (waveCount > 0) await processCampaignSending(params.campaignId, params.actor, waveCount);
+      }
+      campaign = await getOffboardCampaign(params.campaignId);
+      const outcomes = await prisma.offboardCampaignRecipient.findMany({
+        where: { campaignId: params.campaignId },
+        select: {
+          id: true,
+          status: true,
+          waveNumber: true,
+          initialEmailSentAt: true,
+          enforcedAt: true,
+          finalNoticeStatus: true,
+          finalNoticeSentAt: true,
+          lastError: true,
+        },
+      });
+      const outcomeById = new Map(outcomes.map((outcome) => [outcome.id, outcome]));
+      const claimedItems = await prisma.offboardOperationRunItem.findMany({ where: { runId: params.previewId } });
+      const outcomeUpdates = claimedItems.map((item) => {
+        const outcome = item.recipientId ? outcomeById.get(item.recipientId) : null;
+        const directPending = campaignMode.workflowMode === 'direct' && Boolean(outcome) && (
+          ['direct_pending', 'enforcement_processing'].includes(outcome!.status)
+          || (outcome!.status === 'enforced' && ['pending', 'sending'].includes(outcome!.finalNoticeStatus))
+        );
+        const directUncertain = campaignMode.workflowMode === 'direct' && Boolean(outcome) && (
+          outcome!.status === 'enforcement_reconciliation_required'
+          || ['failed', 'reconciliation_required'].includes(outcome!.finalNoticeStatus)
+        );
+        const uncertain = item.status !== 'skipped' && (!outcome
+          || outcome.status === 'email_unknown'
+          || outcome.status === 'email_sending'
+          || outcome.status === 'enforcement_reconciliation_required'
+          || outcome.finalNoticeStatus === 'sending'
+          || outcome.finalNoticeStatus === 'reconciliation_required'
+          || directUncertain);
+        if (uncertain) finalRunStatus = 'reconciliation_required';
+        else if (directPending && finalRunStatus === 'completed') finalRunStatus = 'in_progress';
+        return prisma.offboardOperationRunItem.update({
+          where: { id: item.id },
+          data: {
+            status: item.status === 'skipped'
+              ? 'skipped'
+              : uncertain
+                ? 'reconciliation_required'
+                : directPending
+                  ? 'pending'
+                  : 'completed',
+            outcome: operationJson(outcome ? {
+              recipientStatus: outcome.status,
+              waveNumber: outcome.waveNumber,
+              initialEmailSentAt: outcome.initialEmailSentAt,
+              enforcedAt: outcome.enforcedAt,
+              finalNoticeStatus: outcome.finalNoticeStatus,
+              finalNoticeSentAt: outcome.finalNoticeSentAt,
+              error: outcome.lastError,
+            } : { error: 'Recipient disappeared after activation' }),
+          },
+        });
+      });
+      if (outcomeUpdates.length > 0) await prisma.$transaction(outcomeUpdates);
+    } else {
+      const claimedRun = await prisma.offboardOperationRun.findUniqueOrThrow({
+        where: { id: params.previewId },
+        include: { items: { orderBy: { position: 'asc' } } },
+      });
+      campaign = await executeOffboardRollback(params.campaignId, params.actor, claimedRun);
+      const uncertainItems = await prisma.offboardOperationRunItem.count({
+        where: { runId: params.previewId, status: 'reconciliation_required' },
+      });
+      if (uncertainItems > 0) finalRunStatus = 'reconciliation_required';
+    }
+    await prisma.offboardOperationRun.update({ where: { id: params.previewId }, data: { status: finalRunStatus, claimedUntil: null } });
+    return { duplicate: false, run: await prisma.offboardOperationRun.findUnique({ where: { id: params.previewId } }), campaign };
+  } catch (error) {
+    const directActivation = params.kind === 'activation' && campaignMode.workflowMode === 'direct';
+    const [possibleDirectEffects, activatedCampaign] = directActivation
+      ? await Promise.all([
+          prisma.accountLifecycleAction.count({ where: { offboardOperationRunId: params.previewId } }),
+          prisma.offboardCampaign.findUnique({
+            where: { id: params.campaignId },
+            select: { activationOperationRunId: true },
+          }),
+        ])
+      : [0, null];
+    const activationCommitted = activatedCampaign?.activationOperationRunId === params.previewId;
+    await prisma.offboardOperationRun.update({
+      where: { id: params.previewId },
+      data: {
+        status: possibleDirectEffects > 0 || activationCommitted ? 'reconciliation_required' : 'failed',
+        claimedUntil: null,
+      },
+    });
+    throw error;
+  }
+}
+
+export async function activateOffboardCampaign(campaignId: string, actor: string, activationOperationRunId?: string) {
+  const adminGroups = await validateAdminGroupConfiguration();
+
   const campaign = await prisma.offboardCampaign.findUnique({
     where: { id: campaignId },
     include: { recipients: true },
@@ -971,6 +1705,13 @@ export async function activateOffboardCampaign(campaignId: string, actor: string
 
   if (campaign.status !== 'dry_run') {
     throw new Error(`Only dry-run campaigns can be activated. Current status: ${campaign.status}`);
+  }
+
+  if (campaign.workflowMode === 'direct') {
+    if (!activationOperationRunId) {
+      throw new Error('Direct offboarding requires an exact claimed activation preview');
+    }
+    return activateDirectOffboardCampaign(campaign, actor, activationOperationRunId);
   }
 
   const [ldapUsersRaw, vpnAccounts] = await Promise.all([
@@ -1023,7 +1764,7 @@ export async function activateOffboardCampaign(campaignId: string, actor: string
     if (!live) {
       skipReason = 'no_longer_in_ldap_scope';
     } else {
-      skipReason = safetySkipReason(live, excludedUsernameSet, excludedEmailSet);
+      skipReason = safetySkipReason(live, excludedUsernameSet, excludedEmailSet, adminGroups);
       if (!skipReason && normalize(live.email) !== normalize(recipient.email)) {
         skipReason = 'email_changed_since_dry_run';
       }
@@ -1050,7 +1791,7 @@ export async function activateOffboardCampaign(campaignId: string, actor: string
     .filter((recipient: CampaignRecipientForActivation) => updates.some(update => update.id === recipient.id && update.status === 'pending_send'))
     .reduce((min: number | null, recipient: CampaignRecipientForActivation) => min === null ? recipient.waveNumber : Math.min(min, recipient.waveNumber), null);
 
-  return await prisma.$transaction(async (tx: any) => {
+  return await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     for (const update of updates) {
       await tx.offboardCampaignRecipient.update({
         where: { id: update.id },
@@ -1087,6 +1828,117 @@ export async function activateOffboardCampaign(campaignId: string, actor: string
   });
 }
 
+async function activateDirectOffboardCampaign(
+  campaign: Prisma.OffboardCampaignGetPayload<{ include: { recipients: true } }>,
+  actor: string,
+  activationOperationRunId: string,
+) {
+  const operationRun = await prisma.offboardOperationRun.findFirst({
+    where: {
+      id: activationOperationRunId,
+      campaignId: campaign.id,
+      kind: 'activation',
+      actor,
+      status: 'claimed',
+      policyVersion: DIRECT_OFFBOARD_POLICY_VERSION,
+    },
+    include: { items: true },
+  });
+  if (!operationRun?.authorizationEvidence) {
+    throw new Error('Direct offboarding requires durable authorization evidence before activation');
+  }
+
+  const operationItems = new Map(operationRun.items.map(item => [item.recipientId, item]));
+  const updates = campaign.recipients.map(recipient => {
+    const item = operationItems.get(recipient.id);
+    if (!item || item.status === 'skipped' || recipient.status === 'skipped') {
+      return {
+        id: recipient.id,
+        status: 'skipped' as const,
+        skipReason: recipient.skipReason || jsonArray(item?.conflicts)[0] || 'not_authorized_by_activation_preview',
+        targetDirectoryObjectGuid: null,
+      };
+    }
+    const expected = item.expectedState && typeof item.expectedState === 'object' && !Array.isArray(item.expectedState)
+      ? item.expectedState as Record<string, unknown>
+      : {};
+    const targetDirectoryObjectGuid = typeof expected.liveAdObjectGuid === 'string'
+      ? expected.liveAdObjectGuid
+      : null;
+    if (!targetDirectoryObjectGuid) {
+      throw new Error(`Direct activation preview lacks immutable directory identity for ${recipient.adUsername}`);
+    }
+    return {
+      id: recipient.id,
+      status: 'direct_pending' as const,
+      skipReason: null,
+      targetDirectoryObjectGuid,
+    };
+  });
+
+  const activatedCount = updates.filter(update => update.status === 'direct_pending').length;
+  if (activatedCount < 1) {
+    throw new Error('Direct offboarding has no conflict-free recipients to execute');
+  }
+  const activatedIds = new Set(updates.filter(update => update.status === 'direct_pending').map(update => update.id));
+  const firstWave = campaign.recipients
+    .filter(recipient => activatedIds.has(recipient.id))
+    .reduce((minimum: number | null, recipient) => minimum === null
+      ? recipient.waveNumber
+      : Math.min(minimum, recipient.waveNumber), null);
+
+  return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    for (const update of updates) {
+      await tx.offboardCampaignRecipient.update({
+        where: { id: update.id },
+        data: {
+          status: update.status,
+          skipReason: update.skipReason,
+          targetDirectoryObjectGuid: update.targetDirectoryObjectGuid,
+          tokenHash: null,
+          projectedDeadlineAt: null,
+          deadlineAt: null,
+          finalNoticeStatus: update.status === 'direct_pending' ? 'pending' : 'not_applicable',
+        },
+      });
+    }
+    await tx.offboardCampaign.update({
+      where: { id: campaign.id },
+      data: {
+        status: 'active',
+        activatedAt: new Date(),
+        activatedBy: actor,
+        activeLockKey: ACTIVE_LOCK_KEY,
+        activationOperationRunId,
+        directAcknowledgedAt: new Date(),
+        directAcknowledgedBy: actor,
+        executionPaused: false,
+        sendingPaused: true,
+        remindersPaused: true,
+        enforcementPaused: false,
+        currentWave: firstWave ?? 0,
+        eligibleRecipients: activatedCount,
+        skippedRecipients: updates.length - activatedCount,
+      },
+    });
+    await createCampaignLog(tx, {
+      campaignId: campaign.id,
+      eventType: 'direct_offboarding_activated',
+      actor,
+      message: `Direct offboarding activated with ${activatedCount} reviewed recipient${activatedCount === 1 ? '' : 's'}`,
+      details: {
+        activationOperationRunId,
+        policyVersion: DIRECT_OFFBOARD_POLICY_VERSION,
+        activatedCount,
+        skippedCount: updates.length - activatedCount,
+        firstWave,
+        reference: campaign.directOffboardReference,
+      },
+    });
+    return getOffboardCampaign(campaign.id, tx);
+  });
+}
+
 export async function controlOffboardCampaign(campaignId: string, action: string, actor: string) {
   const campaign = await prisma.offboardCampaign.findUnique({ where: { id: campaignId } });
   if (!campaign) {
@@ -1120,6 +1972,16 @@ export async function controlOffboardCampaign(campaignId: string, action: string
       data.enforcementPaused = true;
       message = 'Enforcement paused';
       break;
+    case 'pause_execution':
+      if (campaign.workflowMode !== 'direct') throw new Error('Execution controls apply only to direct offboarding');
+      data.executionPaused = true;
+      message = 'Direct offboarding paused before the next recipient claim';
+      break;
+    case 'resume_execution':
+      if (campaign.workflowMode !== 'direct') throw new Error('Execution controls apply only to direct offboarding');
+      data.executionPaused = false;
+      message = 'Direct offboarding resumed';
+      break;
     case 'resume_enforcement':
       data.enforcementPaused = false;
       message = 'Enforcement resumed';
@@ -1131,6 +1993,7 @@ export async function controlOffboardCampaign(campaignId: string, action: string
       data.sendingPaused = true;
       data.remindersPaused = true;
       data.enforcementPaused = true;
+      data.executionPaused = true;
       data.activeLockKey = null;
       message = 'Campaign cancelled';
       break;
@@ -1141,6 +2004,7 @@ export async function controlOffboardCampaign(campaignId: string, action: string
       data.sendingPaused = true;
       data.remindersPaused = true;
       data.enforcementPaused = true;
+      data.executionPaused = true;
       data.activeLockKey = null;
       message = 'Emergency stop activated';
       break;
@@ -1148,7 +2012,7 @@ export async function controlOffboardCampaign(campaignId: string, action: string
       throw new Error(`Unknown campaign control action: ${action}`);
   }
 
-  return await prisma.$transaction(async (tx: any) => {
+  return await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     await tx.offboardCampaign.update({
       where: { id: campaignId },
       data,
@@ -1186,15 +2050,72 @@ async function markStaleEmailClaims() {
   }
 }
 
+async function markStaleFinalNoticeClaims() {
+  const now = new Date();
+  const stale = await prisma.offboardCampaignRecipient.findMany({
+    where: { finalNoticeStatus: 'sending', finalNoticeClaimedUntil: { lte: now }, finalNoticeSentAt: null },
+    select: { id: true, campaignId: true },
+  });
+  let reconciliations = 0;
+  for (const recipient of stale) {
+    let transitioned = false;
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const result = await tx.offboardCampaignRecipient.updateMany({
+        where: {
+          id: recipient.id,
+          finalNoticeStatus: 'sending',
+          finalNoticeClaimedUntil: { lte: now },
+          finalNoticeSentAt: null,
+        },
+        data: {
+          finalNoticeStatus: 'reconciliation_required',
+          finalNoticeClaimId: null,
+          finalNoticeClaimedUntil: null,
+          finalNoticeError: 'Final-notice lease expired after SMTP delivery may have started',
+          lastError: 'Final notice delivery requires operator reconciliation before retry',
+        },
+      });
+      if (result.count !== 1) return;
+      transitioned = true;
+      reconciliations += 1;
+      await tx.offboardCampaign.update({
+        where: { id: recipient.campaignId },
+        data: { finalNoticeFailureCount: { increment: 1 } },
+      });
+      await createCampaignLog(tx, {
+        campaignId: recipient.campaignId,
+        recipientId: recipient.id,
+        level: 'error',
+        eventType: 'direct_final_notice_claim_expired',
+        actor: 'system',
+        message: 'Final-notice delivery claim expired and requires reconciliation',
+      });
+    });
+    if (transitioned) {
+      await syncDirectActivationRunOutcome(recipient.campaignId, recipient.id);
+    }
+  }
+  if (reconciliations > 0) {
+    appLogger.warn('Marked stale direct-offboarding final notices for reconciliation', { count: reconciliations });
+  }
+}
+
 export async function processOffboardCampaigns(options: ProcessOptions = {}) {
+  await validateAdminGroupConfiguration();
+
   const actor = options.actor || 'system';
   const limit = Math.max(1, Math.min(options.limit || 50, 250));
   await markStaleEmailClaims();
+  if (options.allowDirect !== false) {
+    await markStaleFinalNoticeClaims();
+    await markAllStaleDirectEnforcementClaims(new Date(), actor);
+  }
 
   const campaigns = await prisma.offboardCampaign.findMany({
     where: {
       status: 'active',
       ...(options.campaignId ? { id: options.campaignId } : {}),
+      ...(options.allowDirect === false ? { workflowMode: { not: 'direct' } } : {}),
     },
     orderBy: { activatedAt: 'asc' },
   });
@@ -1207,6 +2128,26 @@ export async function processOffboardCampaigns(options: ProcessOptions = {}) {
           dueAtOrBefore: options.scheduledWindow.endInclusive,
         }
       : {};
+    if (campaign.workflowMode === 'direct') {
+      const directSummary = await processDirectOffboarding(campaign.id, actor, limit);
+      await completeCampaignIfFinished(campaign.id);
+      const directProcessed = directSummary.enforced + directSummary.skipped + directSummary.failed;
+      summaries.push({
+        campaignId: campaign.id,
+        workflowMode: 'direct',
+        sent: 0,
+        reminders: 0,
+        remindersSkippedBecausePaused: true,
+        enforced: directSummary.enforced,
+        enforcementSkipped: directSummary.skipped,
+        enforcementSkippedBecausePaused: directSummary.skippedBecausePaused,
+        finalNoticesSent: directSummary.finalNoticesSent,
+        finalNoticesReconciliationRequired: directSummary.finalNoticesReconciliationRequired,
+        failures: directSummary.failed + directSummary.finalNoticesReconciliationRequired,
+        batchLimitReached: directProcessed >= limit,
+      });
+      continue;
+    }
     const shouldProcessInitialEmails = options.processInitialEmails ?? !options.scheduledWindow;
     const sendSummary = shouldProcessInitialEmails
       ? await processCampaignSending(campaign.id, actor, limit)
@@ -1247,12 +2188,15 @@ export async function processOffboardCampaigns(options: ProcessOptions = {}) {
   return summaries;
 }
 
-export async function previewProcessAllOffboardCampaign(campaignId: string) {
+export async function previewProcessAllOffboardCampaign(campaignId: string, cutoff = new Date()) {
   const campaign = await prisma.offboardCampaign.findUnique({
     where: { id: campaignId },
     select: {
       id: true,
       status: true,
+      workflowMode: true,
+      executionPaused: true,
+      currentWave: true,
       sendingPaused: true,
       remindersPaused: true,
       enforcementPaused: true,
@@ -1264,7 +2208,7 @@ export async function previewProcessAllOffboardCampaign(campaignId: string) {
     throw new Error('Campaign not found');
   }
 
-  const now = new Date();
+  const now = cutoff;
   const day3DueBefore = new Date(now.getTime() - 3 * DAY_MS);
   const day6DueBefore = new Date(now.getTime() - 6 * DAY_MS);
   const [
@@ -1274,7 +2218,10 @@ export async function previewProcessAllOffboardCampaign(campaignId: string) {
     extensionReminderCandidates,
     enforcementRecipients,
     enforcementVpnRevocations,
+    directRecipients,
+    directVpnRevocations,
     statusCounts,
+    stateRows,
   ] = await Promise.all([
     prisma.offboardCampaignRecipient.count({
       where: { campaignId, status: 'pending_send', initialEmailSentAt: null },
@@ -1355,10 +2302,38 @@ export async function previewProcessAllOffboardCampaign(campaignId: string) {
         linkedVpnUsername: { not: null },
       },
     }),
+    prisma.offboardCampaignRecipient.count({
+      where: {
+        campaignId,
+        status: 'direct_pending',
+        waveNumber: campaign.currentWave,
+      },
+    }),
+    prisma.offboardCampaignRecipient.count({
+      where: {
+        campaignId,
+        status: 'direct_pending',
+        waveNumber: campaign.currentWave,
+        linkedVpnUsername: { not: null },
+      },
+    }),
     prisma.offboardCampaignRecipient.groupBy({
       by: ['status'],
       where: { campaignId },
       _count: { status: true },
+    }),
+    prisma.offboardCampaignRecipient.findMany({
+      where: { campaignId },
+      orderBy: { id: 'asc' },
+      select: {
+        id: true,
+        updatedAt: true,
+        status: true,
+        extensions: {
+          orderBy: { id: 'asc' },
+          select: { id: true, updatedAt: true, status: true },
+        },
+      },
     }),
   ]);
   const extensionReminders = extensionReminderCandidates.filter(reminder =>
@@ -1368,10 +2343,29 @@ export async function previewProcessAllOffboardCampaign(campaignId: string) {
     )
   ).length;
   const suppressedExtensionReminders = extensionReminderCandidates.length - extensionReminders;
+  const previewDigest = crypto.createHash('sha256').update(JSON.stringify({
+    cutoff: now.toISOString(),
+    campaign: {
+      id: campaign.id,
+      status: campaign.status,
+      workflowMode: campaign.workflowMode,
+      executionPaused: campaign.executionPaused,
+      currentWave: campaign.currentWave,
+      sendingPaused: campaign.sendingPaused,
+      remindersPaused: campaign.remindersPaused,
+      enforcementPaused: campaign.enforcementPaused,
+      cancelledAt: campaign.cancelledAt,
+      emergencyStoppedAt: campaign.emergencyStoppedAt,
+    },
+    stateRows,
+  })).digest('hex');
 
   return {
     campaignId,
+    previewDigest,
+    previewedAt: now.toISOString(),
     campaignStatus: campaign.status,
+    workflowMode: campaign.workflowMode,
     runnable: campaign.status === 'active' && !campaign.cancelledAt && !campaign.emergencyStoppedAt,
     sections: {
       initialEmails: {
@@ -1395,6 +2389,15 @@ export async function previewProcessAllOffboardCampaign(campaignId: string) {
         paused: campaign.enforcementPaused,
         description: `Evaluate ${enforcementRecipients} expired recipient${enforcementRecipients === 1 ? '' : 's'} for AD disablement and ${enforcementVpnRevocations} linked VPN revocation${enforcementVpnRevocations === 1 ? '' : 's'}.`,
       },
+      directOffboarding: {
+        count: directRecipients,
+        adDisables: directRecipients,
+        vpnRevocations: directVpnRevocations,
+        sessionRevocations: directRecipients,
+        finalNotices: directRecipients,
+        paused: campaign.executionPaused || campaign.enforcementPaused,
+        description: `Recheck and converge AD, VPN, session, and request state for ${directRecipients} reviewed recipient${directRecipients === 1 ? '' : 's'} in wave ${campaign.currentWave}; already-safe components are not mutated again.`,
+      },
     },
     statusCounts: statusCounts.reduce((acc: Record<string, number>, item: OffboardCampaignStatusCount) => {
       acc[item.status] = item._count.status;
@@ -1408,9 +2411,20 @@ export async function processAllOffboardCampaign(
   input: ProcessAllOffboardInput,
   actor: string
 ) {
-  const preview = await previewProcessAllOffboardCampaign(campaignId);
+  const previewedAt = typeof input.previewedAt === 'string' ? new Date(input.previewedAt) : new Date(Number.NaN);
+  if (
+    Number.isNaN(previewedAt.getTime())
+    || previewedAt.getTime() > Date.now() + 30_000
+    || Date.now() - previewedAt.getTime() > 5 * 60_000
+  ) {
+    throw new Error('OFFBOARD_PROCESS_ALL_PREVIEW_STALE');
+  }
+  const preview = await previewProcessAllOffboardCampaign(campaignId, previewedAt);
   if (!preview.runnable) {
     throw new Error(`Campaign cannot be processed while status is ${preview.campaignStatus}`);
+  }
+  if (!input.previewDigest || input.previewDigest !== preview.previewDigest) {
+    throw new Error('OFFBOARD_PROCESS_ALL_PREVIEW_STALE');
   }
 
   const results = {
@@ -1418,7 +2432,44 @@ export async function processAllOffboardCampaign(
     initialEmails: { sent: 0, failed: 0, skippedBecausePaused: false },
     reminders: { sent: 0, failed: 0, skippedBecausePaused: false },
     enforcement: { enforced: 0, skipped: 0, failed: 0, skippedBecausePaused: false },
+    directOffboarding: {
+      enforced: 0,
+      skipped: 0,
+      failed: 0,
+      finalNoticesSent: 0,
+      finalNoticesReconciliationRequired: 0,
+      skippedBecausePaused: false,
+    },
   };
+
+  if (preview.workflowMode === 'direct') {
+    if (input.initialEmails || input.reminders || input.enforcement) {
+      throw new Error('Direct offboarding cannot run verification emails, reminders, or deadline enforcement');
+    }
+    if (input.directOffboarding) {
+      if (preview.sections.directOffboarding.paused && !input.overrideExecutionPause) {
+        results.directOffboarding.skippedBecausePaused = true;
+      } else {
+        const summary = await processDirectOffboarding(campaignId, actor, 5000, {
+          ignorePause: Boolean(input.overrideExecutionPause),
+          bypassWaveGates: false,
+        });
+        Object.assign(results.directOffboarding, summary);
+      }
+    }
+    await createCampaignLog(prisma, {
+      campaignId,
+      eventType: 'process_all_completed',
+      actor,
+      message: 'Process All completed for direct offboarding',
+      details: { input, preview: preview.sections.directOffboarding, results: results.directOffboarding },
+    });
+    await completeCampaignIfFinished(campaignId);
+    return { results, campaign: await getOffboardCampaign(campaignId) };
+  }
+  if (input.directOffboarding) {
+    throw new Error('Direct offboarding is not available for verification campaigns');
+  }
 
   if (input.initialEmails) {
     if (preview.sections.initialEmails.paused && !input.overrideSendingPause) {
@@ -1426,7 +2477,9 @@ export async function processAllOffboardCampaign(
     } else {
       const summary = await processCampaignSending(campaignId, actor, 5000, {
         ignorePause: Boolean(input.overrideSendingPause),
-        bypassWaveGates: true,
+        // Process All may override the current sending pause, but it must not
+        // silently cross a configured pause-after-wave approval boundary.
+        bypassWaveGates: false,
       });
       results.initialEmails.sent = summary.sent;
       results.initialEmails.failed = summary.failed;
@@ -1441,6 +2494,7 @@ export async function processAllOffboardCampaign(
     } else {
       const summary = await processCampaignEnforcement(campaignId, actor, 5000, {
         ignorePause: Boolean(input.overrideEnforcementPause),
+        dueAtOrBefore: previewedAt,
       });
       results.enforcement.enforced = summary.enforced;
       results.enforcement.skipped = summary.skipped;
@@ -1454,6 +2508,7 @@ export async function processAllOffboardCampaign(
     } else {
       const summary = await processCampaignReminders(campaignId, actor, 5000, {
         ignorePause: Boolean(input.overrideRemindersPause),
+        dueAtOrBefore: previewedAt,
       });
       results.reminders.sent = summary.sent;
       results.reminders.failed = summary.failed;
@@ -1561,7 +2616,7 @@ async function processCampaignSending(
   return summary;
 }
 
-async function sendInitialRecipientEmail(recipient: any, actor: string): Promise<boolean> {
+async function sendInitialRecipientEmail(recipient: OffboardCampaignRecipientRow, actor: string): Promise<boolean> {
   const token = generateToken();
   const tokenHash = hashOffboardToken(token);
   const claimed = await prisma.offboardCampaignRecipient.updateMany({
@@ -1599,7 +2654,7 @@ async function sendInitialRecipientEmail(recipient: any, actor: string): Promise
       deadline,
     });
 
-    await prisma.$transaction(async (tx: any) => {
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.offboardCampaignRecipient.update({
         where: { id: recipient.id },
         data: {
@@ -1629,7 +2684,7 @@ async function sendInitialRecipientEmail(recipient: any, actor: string): Promise
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown email failure';
-    await prisma.$transaction(async (tx: any) => {
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.offboardCampaignRecipient.update({
         where: { id: recipient.id },
         data: {
@@ -2001,6 +3056,492 @@ async function sendExtensionReminderBatch(
   return summary;
 }
 
+async function deliverDirectOffboardFinalNotice(
+  recipientId: string,
+  actor: string,
+): Promise<'sent' | 'reconciliation_required' | 'skipped'> {
+  const claimId = crypto.randomUUID();
+  const claimedAt = new Date();
+  const claim = await prisma.offboardCampaignRecipient.updateMany({
+    where: {
+      id: recipientId,
+      status: 'enforced',
+      finalNoticeStatus: 'pending',
+      finalNoticeSentAt: null,
+      campaign: { workflowMode: 'direct' },
+    },
+    data: {
+      finalNoticeStatus: 'sending',
+      finalNoticeClaimId: claimId,
+      finalNoticeClaimedAt: claimedAt,
+      finalNoticeClaimedUntil: new Date(claimedAt.getTime() + FINAL_NOTICE_CLAIM_MS),
+      finalNoticeError: null,
+    },
+  });
+  if (claim.count !== 1) return 'skipped';
+
+  const recipient = await prisma.offboardCampaignRecipient.findUnique({
+    where: { id: recipientId },
+    include: { campaign: true },
+  });
+  if (!recipient || recipient.campaign.workflowMode !== 'direct') return 'skipped';
+
+  try {
+    const info = await sendOffboardDirectCompletedEmail({
+      email: recipient.email,
+      name: recipient.displayName || recipient.adUsername,
+      adUsername: recipient.adUsername,
+      vpnUsername: recipient.linkedVpnUsername,
+    });
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const finalized = await tx.offboardCampaignRecipient.updateMany({
+        where: { id: recipientId, finalNoticeStatus: 'sending', finalNoticeClaimId: claimId },
+        data: {
+          finalNoticeStatus: 'sent',
+          finalNoticeSentAt: new Date(),
+          finalNoticeMessageId: info.messageId || null,
+          finalNoticeClaimId: null,
+          finalNoticeClaimedUntil: null,
+          finalNoticeError: null,
+          lastError: null,
+        },
+      });
+      if (finalized.count !== 1) throw new Error('Final-notice claim ownership was lost after SMTP delivery');
+      await tx.offboardCampaign.update({
+        where: { id: recipient.campaignId },
+        data: { finalNoticeSentCount: { increment: 1 } },
+      });
+      await createCampaignLog(tx, {
+        campaignId: recipient.campaignId,
+        recipientId,
+        eventType: 'direct_final_notice_sent',
+        actor,
+        message: `Completed-offboarding notice sent to ${recipient.email}`,
+        details: { messageId: info.messageId || null },
+      });
+    });
+    return 'sent';
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown final-notice delivery outcome';
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const uncertain = await tx.offboardCampaignRecipient.updateMany({
+        where: { id: recipientId, finalNoticeStatus: 'sending', finalNoticeClaimId: claimId },
+        data: {
+          finalNoticeStatus: 'reconciliation_required',
+          finalNoticeClaimId: null,
+          finalNoticeClaimedUntil: null,
+          finalNoticeError: message,
+          lastError: 'Access was removed, but final notice delivery requires reconciliation',
+        },
+      });
+      if (uncertain.count !== 1) return;
+      await tx.offboardCampaign.update({
+        where: { id: recipient.campaignId },
+        data: { finalNoticeFailureCount: { increment: 1 } },
+      });
+      await createCampaignLog(tx, {
+        campaignId: recipient.campaignId,
+        recipientId,
+        level: 'error',
+        eventType: 'direct_final_notice_reconciliation_required',
+        actor,
+        message: `Final-notice delivery outcome is uncertain for ${recipient.email}`,
+        details: { error: message },
+      });
+    });
+    return 'reconciliation_required';
+  }
+}
+
+async function markStaleEnforcementClaims(campaignId: string, now: Date, actor: string) {
+  const stale = await prisma.offboardCampaignRecipient.findMany({
+    where: { campaignId, status: 'enforcement_processing', enforcementClaimedUntil: { lte: now } },
+    select: { id: true, adUsername: true, enforcementFailureCounted: true },
+  });
+  for (const recipient of stale) {
+    let transitioned = false;
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const updated = await tx.offboardCampaignRecipient.updateMany({
+        where: {
+          id: recipient.id,
+          campaignId,
+          status: 'enforcement_processing',
+          enforcementClaimedUntil: { lte: now },
+        },
+        data: {
+          status: 'enforcement_reconciliation_required',
+          enforcementClaimId: null,
+          enforcementClaimedUntil: null,
+          enforcementError: 'Enforcement lease expired after external effects may have started',
+          enforcementFailureCounted: true,
+          lastError: 'Operator evidence is required before enforcement can continue',
+        },
+      });
+      if (updated.count !== 1) return;
+      transitioned = true;
+      if (!recipient.enforcementFailureCounted) {
+        await tx.offboardCampaign.update({
+          where: { id: campaignId },
+          data: { failedCount: { increment: 1 } },
+        });
+      }
+      await createCampaignLog(tx, {
+        campaignId,
+        recipientId: recipient.id,
+        level: 'error',
+        eventType: 'enforcement_claim_expired',
+        actor,
+        message: `Enforcement claim expired for ${recipient.adUsername}; reconciliation is required`,
+      });
+    });
+    if (transitioned) {
+      await syncDirectActivationRunOutcome(campaignId, recipient.id);
+    }
+  }
+}
+
+async function markAllStaleDirectEnforcementClaims(now: Date, actor: string) {
+  const campaigns = await prisma.offboardCampaignRecipient.findMany({
+    where: {
+      status: 'enforcement_processing',
+      enforcementClaimedUntil: { lte: now },
+      campaign: { workflowMode: 'direct' },
+    },
+    distinct: ['campaignId'],
+    select: { campaignId: true },
+  });
+  for (const campaign of campaigns) {
+    await markStaleEnforcementClaims(campaign.campaignId, now, actor);
+  }
+}
+
+async function syncDirectActivationRunOutcome(campaignId: string, recipientId: string): Promise<void> {
+  const [campaign, recipient] = await Promise.all([
+    prisma.offboardCampaign.findUnique({
+      where: { id: campaignId },
+      select: { workflowMode: true, activationOperationRunId: true },
+    }),
+    prisma.offboardCampaignRecipient.findUnique({
+      where: { id: recipientId },
+      select: {
+        status: true,
+        enforcedAt: true,
+        finalNoticeStatus: true,
+        finalNoticeSentAt: true,
+        enforcementError: true,
+        lastError: true,
+      },
+    }),
+  ]);
+  if (campaign?.workflowMode !== 'direct' || !campaign.activationOperationRunId || !recipient) return;
+
+  const isPending = ['direct_pending', 'enforcement_processing'].includes(recipient.status)
+    || (recipient.status === 'enforced' && ['pending', 'sending'].includes(recipient.finalNoticeStatus));
+  const isUncertain = recipient.status === 'enforcement_reconciliation_required'
+    || ['failed', 'reconciliation_required'].includes(recipient.finalNoticeStatus);
+  const itemStatus = isUncertain
+    ? 'reconciliation_required'
+    : isPending
+      ? 'pending'
+      : ['enforced', 'enforcement_skipped'].includes(recipient.status)
+        ? 'completed'
+        : 'failed';
+
+  await prisma.offboardOperationRunItem.updateMany({
+    where: { runId: campaign.activationOperationRunId, recipientId },
+    data: {
+      status: itemStatus,
+      outcome: operationJson({
+        recipientStatus: recipient.status,
+        enforcedAt: recipient.enforcedAt,
+        finalNoticeStatus: recipient.finalNoticeStatus,
+        finalNoticeSentAt: recipient.finalNoticeSentAt,
+        error: recipient.enforcementError || recipient.lastError,
+      }),
+    },
+  });
+
+  const expiredRunClaim = await prisma.offboardOperationRun.updateMany({
+    where: {
+      id: campaign.activationOperationRunId,
+      kind: 'activation',
+      status: 'claimed',
+      claimedUntil: { lte: new Date() },
+    },
+    data: {
+      status: 'reconciliation_required',
+      claimId: null,
+      claimedUntil: null,
+    },
+  });
+
+  const statuses = await prisma.offboardOperationRunItem.groupBy({
+    by: ['status'],
+    where: { runId: campaign.activationOperationRunId },
+    _count: { status: true },
+  });
+  const counts = new Map(statuses.map(entry => [entry.status, entry._count.status]));
+  const runStatus = expiredRunClaim.count > 0
+    ? 'reconciliation_required'
+    : (counts.get('reconciliation_required') || 0) > 0
+    ? 'reconciliation_required'
+    : (counts.get('failed') || 0) > 0
+      ? 'failed'
+      : ((counts.get('pending') || 0) + (counts.get('previewed') || 0)) > 0
+        ? 'in_progress'
+        : 'completed';
+  await prisma.offboardOperationRun.updateMany({
+    where: {
+      id: campaign.activationOperationRunId,
+      kind: 'activation',
+      status: { not: 'claimed' },
+    },
+    data: { status: runStatus, claimedUntil: null },
+  });
+}
+
+async function claimDirectRecipientWithVpnFence(params: {
+  recipientId: string;
+  campaignId: string;
+  adUsername: string;
+  accessRequestId: string | null;
+  claimId: string;
+  claimedAt: Date;
+}) {
+  const canonicalAdUsername = params.adUsername.trim().toLowerCase();
+  return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    await tx.$queryRaw<Array<{ lock_acquired: string }>>`
+      SELECT 'locked'::text AS lock_acquired
+      FROM pg_advisory_xact_lock(
+        hashtextextended(${canonicalAdUsername}, ${VPN_IDENTITY_OFFBOARD_FENCE_LOCK_NAMESPACE})
+      )
+    `;
+    const claim = await tx.offboardCampaignRecipient.updateMany({
+      where: {
+        id: params.recipientId,
+        campaignId: params.campaignId,
+        status: 'direct_pending',
+        enforcementClaimId: null,
+      },
+      data: {
+        status: 'enforcement_processing',
+        enforcementClaimId: params.claimId,
+        enforcementClaimedAt: params.claimedAt,
+        enforcementClaimedUntil: new Date(params.claimedAt.getTime() + ENFORCEMENT_CLAIM_MS),
+      },
+    });
+    if (claim.count !== 1) return claim;
+
+    await tx.vpnIdentityOffboardFence.upsert({
+      where: { canonicalAdUsername },
+      create: {
+        canonicalAdUsername,
+        campaignId: params.campaignId,
+        recipientId: params.recipientId,
+        blockedAccessRequestId: params.accessRequestId,
+      },
+      update: {
+        campaignId: params.campaignId,
+        recipientId: params.recipientId,
+        blockedAccessRequestId: params.accessRequestId,
+      },
+    });
+    return claim;
+  });
+}
+
+async function processDirectOffboarding(
+  campaignId: string,
+  actor: string,
+  limit: number,
+  controls: CampaignProcessControls = {},
+) {
+  const summary = {
+    enforced: 0,
+    skipped: 0,
+    failed: 0,
+    finalNoticesSent: 0,
+    finalNoticesReconciliationRequired: 0,
+    skippedBecausePaused: false,
+  };
+
+  const initialCampaign = await prisma.offboardCampaign.findUnique({ where: { id: campaignId } });
+  if (!initialCampaign || initialCampaign.workflowMode !== 'direct' || initialCampaign.status !== 'active'
+    || initialCampaign.cancelledAt || initialCampaign.emergencyStoppedAt) {
+    return summary;
+  }
+  if ((initialCampaign.executionPaused || initialCampaign.enforcementPaused) && !controls.ignorePause) {
+    summary.skippedBecausePaused = true;
+    return summary;
+  }
+
+  const pendingNotices = await prisma.offboardCampaignRecipient.findMany({
+    where: {
+      campaignId,
+      status: 'enforced',
+      finalNoticeStatus: 'pending',
+      finalNoticeSentAt: null,
+      campaign: { workflowMode: 'direct' },
+    },
+    orderBy: { adUsername: 'asc' },
+    take: limit,
+    select: { id: true },
+  });
+  for (const recipient of pendingNotices) {
+    const noticeGate = await prisma.offboardCampaign.findUnique({ where: { id: campaignId } });
+    if (!noticeGate || noticeGate.status !== 'active' || noticeGate.cancelledAt || noticeGate.emergencyStoppedAt
+      || ((noticeGate.executionPaused || noticeGate.enforcementPaused) && !controls.ignorePause)) {
+      summary.skippedBecausePaused = true;
+      break;
+    }
+    const notice = await deliverDirectOffboardFinalNotice(recipient.id, actor);
+    if (notice === 'sent') summary.finalNoticesSent += 1;
+    if (notice === 'reconciliation_required') summary.finalNoticesReconciliationRequired += 1;
+    await syncDirectActivationRunOutcome(campaignId, recipient.id);
+  }
+
+  while (summary.enforced + summary.skipped + summary.failed < limit) {
+    const campaign = await prisma.offboardCampaign.findUnique({ where: { id: campaignId } });
+    if (!campaign || campaign.workflowMode !== 'direct' || campaign.status !== 'active'
+      || campaign.cancelledAt || campaign.emergencyStoppedAt) {
+      break;
+    }
+    if ((campaign.executionPaused || campaign.enforcementPaused) && !controls.ignorePause) {
+      summary.skippedBecausePaused = true;
+      break;
+    }
+
+    const now = new Date();
+    await markStaleEnforcementClaims(campaignId, now, actor);
+
+    const pending = await prisma.offboardCampaignRecipient.findMany({
+      where: { campaignId, status: 'direct_pending', waveNumber: campaign.currentWave },
+      orderBy: { adUsername: 'asc' },
+      take: Math.max(1, limit - summary.enforced - summary.skipped - summary.failed),
+    });
+    if (pending.length === 0) {
+      const currentWaveBlockers = await prisma.offboardCampaignRecipient.count({
+        where: {
+          campaignId,
+          waveNumber: campaign.currentWave,
+          OR: [
+            { status: { in: ['direct_pending', 'enforcement_processing', 'enforcement_reconciliation_required'] } },
+            {
+              status: 'enforced',
+              finalNoticeStatus: { in: ['pending', 'sending', 'failed', 'reconciliation_required'] },
+            },
+          ],
+        },
+      });
+      if (currentWaveBlockers > 0) {
+        break;
+      }
+      const nextRecipient = await prisma.offboardCampaignRecipient.findFirst({
+        where: { campaignId, status: 'direct_pending' },
+        orderBy: [{ waveNumber: 'asc' }, { adUsername: 'asc' }],
+      });
+      if (!nextRecipient) {
+        if (!campaign.directExecutionCompletedAt) {
+          await prisma.offboardCampaign.update({
+            where: { id: campaignId },
+            data: { directExecutionCompletedAt: new Date(), executionPaused: true },
+          });
+          await createCampaignLog(prisma, {
+            campaignId,
+            eventType: 'direct_execution_completed',
+            actor,
+            message: 'All direct-offboarding recipients reached an enforcement outcome',
+          });
+        }
+        break;
+      }
+      const pauseAtBoundary = !controls.bypassWaveGates && campaign.pauseAfterEachWave;
+      const advanced = await prisma.offboardCampaign.updateMany({
+        where: {
+          id: campaignId,
+          currentWave: campaign.currentWave,
+          executionPaused: false,
+          enforcementPaused: false,
+          status: 'active',
+        },
+        data: {
+          currentWave: nextRecipient.waveNumber,
+          ...(pauseAtBoundary ? { executionPaused: true } : {}),
+        },
+      });
+      if (advanced.count !== 1) {
+        continue;
+      }
+      await createCampaignLog(prisma, {
+        campaignId,
+        eventType: pauseAtBoundary ? 'direct_wave_paused' : 'direct_wave_advanced',
+        actor,
+        message: pauseAtBoundary
+          ? `Direct offboarding paused before wave ${nextRecipient.waveNumber}`
+          : `Direct offboarding advanced to wave ${nextRecipient.waveNumber}`,
+        details: { nextWave: nextRecipient.waveNumber },
+      });
+      if (pauseAtBoundary) {
+        summary.skippedBecausePaused = true;
+        break;
+      }
+      continue;
+    }
+
+    for (const recipient of pending) {
+      const claimGate = await prisma.offboardCampaign.findUnique({
+        where: { id: campaignId },
+        select: {
+          status: true,
+          workflowMode: true,
+          currentWave: true,
+          executionPaused: true,
+          enforcementPaused: true,
+          cancelledAt: true,
+          emergencyStoppedAt: true,
+        },
+      });
+      if (
+        !claimGate
+        || claimGate.workflowMode !== 'direct'
+        || claimGate.status !== 'active'
+        || claimGate.currentWave !== recipient.waveNumber
+        || claimGate.cancelledAt
+        || claimGate.emergencyStoppedAt
+        || ((claimGate.executionPaused || claimGate.enforcementPaused) && !controls.ignorePause)
+      ) {
+        summary.skippedBecausePaused = Boolean(claimGate?.executionPaused || claimGate?.enforcementPaused);
+        break;
+      }
+      const claimId = crypto.randomUUID();
+      const claimedAt = new Date();
+      const claim = await claimDirectRecipientWithVpnFence({
+        recipientId: recipient.id,
+        campaignId,
+        adUsername: recipient.adUsername,
+        accessRequestId: recipient.accessRequestId,
+        claimId,
+        claimedAt,
+      });
+      if (claim.count !== 1) continue;
+      const result = await enforceRecipient(recipient.id, claimId, actor, controls);
+      if (result === 'enforced') {
+        summary.enforced += 1;
+        const notice = await deliverDirectOffboardFinalNotice(recipient.id, actor);
+        if (notice === 'sent') summary.finalNoticesSent += 1;
+        if (notice === 'reconciliation_required') summary.finalNoticesReconciliationRequired += 1;
+      } else if (result === 'skipped') {
+        summary.skipped += 1;
+      } else {
+        summary.failed += 1;
+      }
+      await syncDirectActivationRunOutcome(campaignId, recipient.id);
+      if (summary.enforced + summary.skipped + summary.failed >= limit) break;
+    }
+  }
+  return summary;
+}
+
 async function processCampaignEnforcement(
   campaignId: string,
   actor: string,
@@ -2023,6 +3564,7 @@ async function processCampaignEnforcement(
   }
 
   const now = controls.dueAtOrBefore || new Date();
+  await markStaleEnforcementClaims(campaignId, now, actor);
   const deadlineWindow = {
     ...(controls.dueAfter ? { gt: controls.dueAfter } : {}),
     lte: now,
@@ -2035,12 +3577,14 @@ async function processCampaignEnforcement(
       enforcedAt: null,
       deadlineAt: deadlineWindow,
       enforcementClaimedAt: null,
+      enforcementClaimId: null,
     },
     orderBy: { deadlineAt: 'asc' },
     take: limit,
   });
 
   for (const recipient of recipients) {
+    const claimId = crypto.randomUUID();
     const claim = await prisma.offboardCampaignRecipient.updateMany({
       where: {
         id: recipient.id,
@@ -2049,10 +3593,13 @@ async function processCampaignEnforcement(
         enforcedAt: null,
         deadlineAt: deadlineWindow,
         enforcementClaimedAt: null,
+        enforcementClaimId: null,
       },
       data: {
         status: 'enforcement_processing',
         enforcementClaimedAt: new Date(),
+        enforcementClaimId: claimId,
+        enforcementClaimedUntil: new Date(Date.now() + ENFORCEMENT_CLAIM_MS),
       },
     });
 
@@ -2060,7 +3607,7 @@ async function processCampaignEnforcement(
       continue;
     }
 
-    const result = await enforceRecipient(recipient.id, actor, controls);
+    const result = await enforceRecipient(recipient.id, claimId, actor, controls);
     if (result === 'enforced') summary.enforced += 1;
     else if (result === 'skipped') summary.skipped += 1;
     else summary.failed += 1;
@@ -2069,47 +3616,109 @@ async function processCampaignEnforcement(
   return summary;
 }
 
-async function liveEnforcementSkipReason(recipient: any): Promise<string | null> {
+type LiveEnforcementPlan = {
+  skipReason: string | null;
+  adActionRequired: boolean;
+  vpnActionRequired: boolean;
+};
+
+async function findLiveVpnCandidates(adUsername: string) {
+  return prisma.vPNAccount.findMany({
+    where: {
+      status: { notIn: ['revoked', 'disabled'] },
+      OR: [
+        { adUsername: { equals: adUsername, mode: 'insensitive' } },
+        { username: { equals: adUsername, mode: 'insensitive' } },
+      ],
+    },
+    select: { id: true },
+    take: 2,
+  });
+}
+
+async function liveEnforcementPlan(recipient: CampaignRecipientWithCampaign): Promise<LiveEnforcementPlan> {
   const userInfo = await searchLDAPUser(recipient.adUsername);
   if (!userInfo) {
-    return 'no_longer_in_ldap_scope';
+    return { skipReason: 'no_longer_in_ldap_scope', adActionRequired: false, vpnActionRequired: false };
   }
 
   const liveEmail = getAttribute(userInfo.attributes, 'mail');
   if (normalize(liveEmail) !== normalize(recipient.email)) {
-    return 'email_changed_before_enforcement';
+    return { skipReason: 'email_changed_before_enforcement', adActionRequired: false, vpnActionRequired: false };
   }
 
-  if (!isLdapAccountEnabledFromUac(getAttribute(userInfo.attributes, 'userAccountControl'))) {
-    return 'ad_account_already_disabled';
+  const adActionRequired = isLdapAccountEnabledFromUac(getAttribute(userInfo.attributes, 'userAccountControl'));
+  if (!adActionRequired && recipient.campaign.workflowMode !== 'direct') {
+    return { skipReason: 'ad_account_already_disabled', adActionRequired: false, vpnActionRequired: false };
   }
 
-  if (isAdminGroupMember(getAttributeValues(userInfo.attributes, 'memberOf'))) {
-    return 'became_admin_group_member';
+  if (isAdminGroupMember(
+    getAttributeValues(userInfo.attributes, 'memberOf'),
+    await validateAdminGroupConfiguration(),
+  )) {
+    return { skipReason: 'became_admin_group_member', adActionRequired: false, vpnActionRequired: false };
   }
 
+  if (recipient.campaign.workflowMode === 'direct') {
+    const liveObjectGuid = getAttribute(userInfo.attributes, 'objectGUID');
+    if (!recipient.targetDirectoryObjectGuid || liveObjectGuid !== recipient.targetDirectoryObjectGuid || userInfo.objectName !== recipient.adDn) {
+      return { skipReason: 'directory_identity_changed_before_direct_offboarding', adActionRequired: false, vpnActionRequired: false };
+    }
+    if (!recipient.accessRequestId || recipient.expectedRequestVersion === null) {
+      return { skipReason: 'missing_reviewed_request_identity', adActionRequired: false, vpnActionRequired: false };
+    }
+    const request = await prisma.accessRequest.findUnique({
+      where: { id: recipient.accessRequestId },
+      select: { status: true, version: true },
+    });
+    if (!request || request.status !== 'approved' || request.version !== recipient.expectedRequestVersion) {
+      return { skipReason: 'request_state_changed_before_direct_offboarding', adActionRequired: false, vpnActionRequired: false };
+    }
+  }
+
+  let vpnActionRequired = false;
+  if (recipient.campaign.workflowMode === 'direct') {
+    const liveCandidates = await findLiveVpnCandidates(recipient.adUsername);
+    if (liveCandidates.length > 1) {
+      return { skipReason: 'multiple_live_vpn_accounts_linked_to_ad_username', adActionRequired: false, vpnActionRequired: false };
+    }
+    if (!recipient.linkedVpnUsername && liveCandidates.length > 0) {
+      return { skipReason: 'vpn_link_appeared_before_direct_offboarding', adActionRequired: false, vpnActionRequired: false };
+    }
+    if (liveCandidates.length === 1 && liveCandidates[0].id !== recipient.vpnAccountId) {
+      return { skipReason: 'vpn_identity_changed_before_direct_offboarding', adActionRequired: false, vpnActionRequired: false };
+    }
+  }
   if (recipient.linkedVpnUsername) {
     const vpn = await prisma.vPNAccount.findUnique({
       where: { username: recipient.linkedVpnUsername },
-      select: { status: true, adUsername: true },
+      select: { id: true, status: true, adUsername: true },
     });
 
     if (!vpn) {
-      return 'linked_vpn_missing_before_enforcement';
+      return { skipReason: 'linked_vpn_missing_before_enforcement', adActionRequired: false, vpnActionRequired: false };
     }
     if (vpn.status === 'revoked' || vpn.status === 'disabled') {
-      return 'vpn_account_already_revoked_or_disabled';
+      if (recipient.campaign.workflowMode !== 'direct') {
+        return { skipReason: 'vpn_account_already_revoked_or_disabled', adActionRequired: false, vpnActionRequired: false };
+      }
+    } else {
+      vpnActionRequired = true;
     }
     if (vpn.adUsername && normalize(vpn.adUsername) !== normalize(recipient.adUsername)) {
-      return 'vpn_link_changed_before_enforcement';
+      return { skipReason: 'vpn_link_changed_before_enforcement', adActionRequired: false, vpnActionRequired: false };
+    }
+    if (recipient.campaign.workflowMode === 'direct' && vpn.id !== recipient.vpnAccountId) {
+      return { skipReason: 'vpn_identity_changed_before_direct_offboarding', adActionRequired: false, vpnActionRequired: false };
     }
   }
 
-  return null;
+  return { skipReason: null, adActionRequired, vpnActionRequired };
 }
 
 async function enforceRecipient(
   recipientId: string,
+  claimId: string,
   actor: string,
   controls: CampaignProcessControls = {}
 ): Promise<'enforced' | 'skipped' | 'failed'> {
@@ -2121,32 +3730,46 @@ async function enforceRecipient(
   if (!recipient) {
     return 'failed';
   }
+  if (recipient.status !== 'enforcement_processing' || recipient.enforcementClaimId !== claimId) {
+    return 'failed';
+  }
 
   if (
     recipient.campaign.status !== 'active' ||
+    (recipient.campaign.workflowMode === 'direct' && recipient.campaign.executionPaused && !controls.ignorePause) ||
     (recipient.campaign.enforcementPaused && !controls.ignorePause) ||
     recipient.campaign.cancelledAt ||
     recipient.campaign.emergencyStoppedAt
   ) {
-    await prisma.offboardCampaignRecipient.update({
-      where: { id: recipientId },
-      data: { status: 'sent', enforcementClaimedAt: null },
+    await prisma.offboardCampaignRecipient.updateMany({
+      where: { id: recipientId, status: 'enforcement_processing', enforcementClaimId: claimId },
+      data: {
+        status: recipient.campaign.workflowMode === 'direct' ? 'direct_pending' : 'sent',
+        enforcementClaimedAt: null,
+        enforcementClaimId: null,
+        enforcementClaimedUntil: null,
+      },
     });
     return 'skipped';
   }
 
   try {
-    const skipReason = await liveEnforcementSkipReason(recipient);
+    const enforcementPlan = await liveEnforcementPlan(recipient);
+    const { skipReason } = enforcementPlan;
     if (skipReason) {
-      await prisma.$transaction(async (tx: any) => {
-        await tx.offboardCampaignRecipient.update({
-          where: { id: recipientId },
+      await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const skipped = await tx.offboardCampaignRecipient.updateMany({
+          where: { id: recipientId, status: 'enforcement_processing', enforcementClaimId: claimId },
           data: {
             status: 'enforcement_skipped',
             enforcementSkippedAt: new Date(),
             skipReason,
+            enforcementClaimId: null,
+            enforcementClaimedUntil: null,
+            ...(recipient.campaign.workflowMode === 'direct' ? { finalNoticeStatus: 'not_applicable' } : {}),
           },
         });
+        if (skipped.count !== 1) throw new Error('Enforcement claim ownership was lost before skip finalization');
         await createCampaignLog(tx, {
           campaignId: recipient.campaignId,
           recipientId,
@@ -2160,49 +3783,109 @@ async function enforceRecipient(
       return 'skipped';
     }
 
-    const actionResults: LifecycleProcessSummary[] = [];
-    const adAction = await createAndProcessCampaignLifecycleAction({
-      recipient,
-      actionType: 'disable_ad',
-      targetAccountType: 'AD',
-      targetUsername: recipient.adUsername,
-      targetUserId: recipient.accessRequestId,
-      reason: `Offboard campaign ${recipient.campaign.name}: unverified by campaign deadline`,
-      actor,
+    const vpnModuleEnabled = recipient.campaign.workflowMode === 'direct'
+      ? await isModuleEnabledStrict('vpn.management')
+      : await isModuleEnabled('vpn.management');
+    if (recipient.campaign.workflowMode === 'direct' && recipient.linkedVpnUsername && !vpnModuleEnabled) {
+      throw new Error('VPN management became disabled after the reviewed direct-offboarding preview');
+    }
+    const expectsAdAction = enforcementPlan.adActionRequired;
+    const expectsVpnAction = vpnModuleEnabled && enforcementPlan.vpnActionRequired;
+    const expectationRecorded = await prisma.offboardCampaignRecipient.updateMany({
+      where: { id: recipientId, status: 'enforcement_processing', enforcementClaimId: claimId },
+      data: { enforcementExpectedAd: expectsAdAction, enforcementExpectedVpn: expectsVpnAction },
     });
-    actionResults.push(adAction);
+    if (expectationRecorded.count !== 1) throw new Error('Enforcement claim ownership was lost before action planning');
+
+    const actionResults: LifecycleProcessSummary[] = [];
+    const directReason = recipient.campaign.workflowMode === 'direct'
+      ? `Direct offboarding ${recipient.campaign.name}: ${recipient.campaign.directOffboardReason} [${recipient.campaign.directOffboardReference}]`
+      : null;
+    let adAction: LifecycleProcessSummary | null = null;
+    if (expectsAdAction) {
+      adAction = await createAndProcessCampaignLifecycleAction({
+        recipient,
+        actionType: 'disable_ad',
+        targetAccountType: 'AD',
+        targetUsername: recipient.adUsername,
+        targetUserId: recipient.accessRequestId,
+        reason: directReason || `Offboard campaign ${recipient.campaign.name}: unverified by campaign deadline`,
+        actor,
+        idempotencyKey: `offboard-enforcement:${recipient.id}:disable-ad`,
+      });
+      actionResults.push(adAction);
+      const adActionRecorded = await prisma.offboardCampaignRecipient.updateMany({
+        where: { id: recipientId, status: 'enforcement_processing', enforcementClaimId: claimId },
+        data: { adLifecycleActionId: adAction.actionId },
+      });
+      if (adActionRecorded.count !== 1) throw new Error('Enforcement claim ownership was lost after AD action');
+    }
 
     let vpnAction: LifecycleProcessSummary | null = null;
-    if (recipient.linkedVpnUsername) {
+    // VPN revocation only runs while VPN management is enabled; campaigns
+    // degrade to AD-only enforcement and record the skip.
+    if (expectsVpnAction && recipient.linkedVpnUsername) {
       vpnAction = await createAndProcessCampaignLifecycleAction({
         recipient,
         actionType: 'revoke_vpn',
         targetAccountType: 'VPN',
         targetUsername: recipient.linkedVpnUsername,
         targetUserId: recipient.vpnAccountId,
-        reason: `Offboard campaign ${recipient.campaign.name}: linked AD user unverified by campaign deadline`,
+        reason: directReason || `Offboard campaign ${recipient.campaign.name}: linked AD user unverified by campaign deadline`,
         actor,
+        idempotencyKey: `offboard-enforcement:${recipient.id}:revoke-vpn`,
       });
       actionResults.push(vpnAction);
+      const vpnActionRecorded = await prisma.offboardCampaignRecipient.updateMany({
+        where: { id: recipientId, status: 'enforcement_processing', enforcementClaimId: claimId },
+        data: { vpnLifecycleActionId: vpnAction.actionId },
+      });
+      if (vpnActionRecorded.count !== 1) throw new Error('Enforcement claim ownership was lost after VPN action');
+    }
+
+    if (recipient.campaign.workflowMode === 'direct') {
+      const remainingLiveVpn = await findLiveVpnCandidates(recipient.adUsername);
+      if (remainingLiveVpn.length > 0) {
+        throw new Error('Live VPN access remains or appeared after the reviewed revocation step; reconciliation is required');
+      }
     }
 
     const allSucceeded = actionResults.every(result => result.success);
+    if (allSucceeded) {
+      const sessionResult = await revokeUserSessionsEverywhere(recipient.adUsername, {
+        actor,
+        actorType: 'system',
+        reason: 'offboard_enforcement',
+      });
+      if (sessionResult.providerLogoutsReconciliationRequired > 0) {
+        throw new Error(`${sessionResult.providerLogoutsReconciliationRequired} provider logout(s) require reconciliation`);
+      }
+    }
     const enforcedAt = new Date();
-    await prisma.$transaction(async (tx: any) => {
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const requestMarkedOffboarded = allSucceeded
-        ? await markAccessRequestOffboardedByCampaign(tx, recipient, actor, enforcedAt)
+        ? await markAccessRequestOffboardedByCampaign(tx, recipient, actor, enforcedAt, {
+            confirmedAdDisabled: recipient.campaign.workflowMode === 'direct' && !enforcementPlan.adActionRequired,
+          })
         : false;
+      if (allSucceeded && recipient.campaign.workflowMode === 'direct' && !requestMarkedOffboarded) {
+        throw new Error('Portal request changed after external access removal; reconciliation is required');
+      }
 
-      await tx.offboardCampaignRecipient.update({
-        where: { id: recipientId },
+      const finalized = await tx.offboardCampaignRecipient.updateMany({
+        where: { id: recipientId, status: 'enforcement_processing', enforcementClaimId: claimId },
         data: {
-          status: allSucceeded ? 'enforced' : 'enforcement_failed',
+          status: allSucceeded ? 'enforced' : 'enforcement_reconciliation_required',
           enforcedAt: allSucceeded ? enforcedAt : null,
           enforcementError: allSucceeded ? null : actionResults.filter(result => !result.success).map(result => result.error).join('; '),
-          adLifecycleActionId: adAction.actionId,
+          adLifecycleActionId: adAction?.actionId || null,
           vpnLifecycleActionId: vpnAction?.actionId || null,
+          enforcementClaimId: null,
+          enforcementClaimedUntil: null,
+          enforcementFailureCounted: !allSucceeded,
         },
       });
+      if (finalized.count !== 1) throw new Error('Enforcement claim ownership was lost during finalization');
 
       await tx.offboardCampaign.update({
         where: { id: recipient.campaignId },
@@ -2224,23 +3907,24 @@ async function enforceRecipient(
       });
     });
 
-    if (allSucceeded) {
-      await prisma.session.deleteMany({ where: { username: recipient.adUsername } }).catch(() => {});
-      return 'enforced';
-    }
+    if (allSucceeded) return 'enforced';
 
     return 'failed';
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown enforcement failure';
-    await prisma.$transaction(async (tx: any) => {
-      await tx.offboardCampaignRecipient.update({
-        where: { id: recipientId },
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const reconciled = await tx.offboardCampaignRecipient.updateMany({
+        where: { id: recipientId, status: 'enforcement_processing', enforcementClaimId: claimId },
         data: {
-          status: 'enforcement_failed',
+          status: 'enforcement_reconciliation_required',
           enforcementError: message,
           lastError: message,
+          enforcementClaimId: null,
+          enforcementClaimedUntil: null,
+          enforcementFailureCounted: true,
         },
       });
+      if (reconciled.count !== 1) return;
       await tx.offboardCampaign.update({
         where: { id: recipient.campaignId },
         data: { failedCount: { increment: 1 } },
@@ -2260,30 +3944,138 @@ async function enforceRecipient(
 }
 
 async function createAndProcessCampaignLifecycleAction(params: {
-  recipient: any;
+  recipient: CampaignRecipientWithCampaign;
   actionType: string;
   targetAccountType: string;
   targetUsername: string;
   targetUserId?: string | null;
   reason: string;
   actor: string;
+  idempotencyKey?: string;
 }): Promise<LifecycleProcessSummary> {
-  const action = await prisma.$transaction(async (tx: any) => {
+  if (params.idempotencyKey) {
+    const existing = await prisma.accountLifecycleAction.findUnique({
+      where: { idempotencyKey: params.idempotencyKey },
+      select: { id: true, status: true, errorMessage: true },
+    });
+    if (existing) {
+      if (existing.status === 'completed') {
+        return { actionId: existing.id, success: true };
+      }
+      if (existing.status === 'queued') {
+        const resumed = await processLifecycleAction(existing.id);
+        return { actionId: existing.id, success: resumed.success, error: resumed.error };
+      }
+      return {
+        actionId: existing.id,
+        success: false,
+        error: existing.errorMessage || `Existing lifecycle action is ${existing.status}`,
+      };
+    }
+  }
+
+  const requiresDirectoryEvidence = ['disable_ad', 'enable_ad', 'disable_both', 'enable_both']
+    .includes(params.actionType);
+  let directoryEvidence: {
+    targetDirectoryDn: string;
+    targetDirectoryObjectGuid: string;
+    preflightSnapshot: Prisma.InputJsonObject;
+    policyVersion: string;
+  } | null = null;
+  if (requiresDirectoryEvidence) {
+    const relatedRequestId = params.recipient.accessRequestId;
+    if (!relatedRequestId) {
+      throw new Error(`Campaign lifecycle action for ${params.targetUsername} has no portal request owner`);
+    }
+    const allowedStatuses = ['enable_ad', 'enable_both'].includes(params.actionType)
+      ? ['approved', 'offboarded']
+      : ['approved'];
+    const owners = await prisma.accessRequest.findMany({
+      where: {
+        AND: [{ OR: [
+          { ldapUsername: { equals: params.targetUsername, mode: 'insensitive' } },
+          { linkedAdUsername: { equals: params.targetUsername, mode: 'insensitive' } },
+        ] }, { OR: [
+          { provisioningState: null },
+          { provisioningState: { in: [...LIFECYCLE_READY_NON_NULL_PROVISIONING_STATES] } },
+        ] }],
+        status: { in: allowedStatuses },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 2,
+      select: { id: true, version: true },
+    });
+    if (owners.length !== 1 || owners[0].id !== relatedRequestId) {
+      throw new Error(`Campaign lifecycle action for ${params.targetUsername} has ambiguous portal ownership`);
+    }
+    const directoryUser = await searchLDAPUser(params.targetUsername);
+    if (!directoryUser) {
+      throw new Error(`Campaign lifecycle target ${params.targetUsername} no longer exists in LDAP`);
+    }
+    const liveUsername = getAttribute(directoryUser.attributes, 'sAMAccountName');
+    const objectGuid = getAttribute(directoryUser.attributes, 'objectGUID');
+    const rawUac = getAttribute(directoryUser.attributes, 'userAccountControl');
+    if (
+      normalize(liveUsername) !== normalize(params.targetUsername)
+      || !directoryUser.objectName
+      || !objectGuid
+      || !rawUac
+      || !/^\d+$/.test(rawUac)
+    ) {
+      throw new Error(`Campaign lifecycle target ${params.targetUsername} lacks immutable directory identity evidence`);
+    }
+    if (params.recipient.campaign.workflowMode === 'direct' && (
+      !params.recipient.adDn
+      || !params.recipient.targetDirectoryObjectGuid
+      || owners[0].version !== params.recipient.expectedRequestVersion
+      || directoryUser.objectName.toLowerCase() !== params.recipient.adDn.toLowerCase()
+      || objectGuid !== params.recipient.targetDirectoryObjectGuid
+    )) {
+      throw new Error(`Campaign lifecycle target ${params.targetUsername} no longer matches the reviewed directory object`);
+    }
+    const targetDirectoryDn = params.recipient.campaign.workflowMode === 'direct'
+      ? params.recipient.adDn!
+      : directoryUser.objectName;
+    const targetDirectoryObjectGuid = params.recipient.campaign.workflowMode === 'direct'
+      ? params.recipient.targetDirectoryObjectGuid!
+      : objectGuid;
+    directoryEvidence = {
+      targetDirectoryDn,
+      targetDirectoryObjectGuid,
+      preflightSnapshot: {
+        relatedRequestId,
+        requestVersion: params.recipient.campaign.workflowMode === 'direct'
+          ? params.recipient.expectedRequestVersion
+          : owners[0].version,
+        dn: targetDirectoryDn,
+        username: liveUsername,
+        objectGuid: targetDirectoryObjectGuid,
+        userAccountControl: Number(rawUac),
+        enabled: isLdapAccountEnabledFromUac(rawUac),
+        observedAt: new Date().toISOString(),
+        bindingMode: 'portal_request_and_object_guid',
+      },
+      policyVersion: 'governed-directory-identity-v1',
+    };
+  }
+
+  const action = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const created = await tx.accountLifecycleAction.create({
       data: {
         actionType: params.actionType,
         targetAccountType: params.targetAccountType,
         targetUsername: params.targetUsername,
         targetUserId: params.targetUserId || null,
-        status: 'processing',
+        status: 'queued',
         reason: params.reason,
         requestedBy: 'offboard-campaign',
         requestedAt: new Date(),
-        processedAt: new Date(),
-        processedBy: 'system',
         relatedRequestId: params.recipient.accessRequestId || null,
         offboardCampaignId: params.recipient.campaignId,
         offboardRecipientId: params.recipient.id,
+        offboardOperationRunId: params.recipient.campaign.activationOperationRunId || null,
+        idempotencyKey: params.idempotencyKey,
+        ...(directoryEvidence || {}),
         rollbackData: JSON.stringify({
           originalAdEnabled: params.recipient.originalAdEnabled,
           originalAdStatus: params.recipient.originalAdStatus,
@@ -2298,10 +4090,11 @@ async function createAndProcessCampaignLifecycleAction(params: {
         actionId: created.id,
         event: 'created',
         performedBy: params.actor,
-        newStatus: 'processing',
+        newStatus: 'queued',
         details: JSON.stringify({
           offboardCampaignId: params.recipient.campaignId,
           offboardRecipientId: params.recipient.id,
+          offboardOperationRunId: params.recipient.campaign.activationOperationRunId || null,
         }),
       },
     });
@@ -2317,13 +4110,211 @@ async function createAndProcessCampaignLifecycleAction(params: {
   };
 }
 
-async function recreateMissingVpnAccountForVerificationRecovery(recipient: any, actor: string): Promise<boolean> {
-  if (!recipient.linkedVpnUsername) {
+export async function reconcileOffboardEnforcement(params: {
+  campaignId: string;
+  recipientId: string;
+  actor: string;
+  resolution: 'not_applied' | 'verified_complete';
+  evidence: string;
+}) {
+  const evidence = params.evidence.trim();
+  if (evidence.length < 10) {
+    throw new Error('Reconciliation evidence must contain at least 10 characters');
+  }
+
+  const recipient = await prisma.offboardCampaignRecipient.findUnique({
+    where: { id: params.recipientId },
+    include: { campaign: true },
+  });
+  if (!recipient || recipient.campaignId !== params.campaignId) {
+    throw new Error('Offboard recipient not found');
+  }
+  if (recipient.status !== 'enforcement_reconciliation_required') {
+    throw new Error('Only enforcement_reconciliation_required recipients can be reconciled');
+  }
+
+  // Query the relation, not only the denormalized IDs: a crash can happen
+  // after an action row is created but before its ID is copied to recipient.
+  const actions = await prisma.accountLifecycleAction.findMany({
+    where: { offboardRecipientId: recipient.id },
+    select: { id: true, status: true, actionType: true },
+  });
+  const completedActions = actions.filter((action) => action.status === 'completed');
+  const providerTasks = await prisma.providerLogoutTask.findMany({
+    where: { username: recipient.adUsername },
+    select: { id: true, status: true },
+  });
+  const liveSessionCount = await prisma.session.count({ where: { username: recipient.adUsername } });
+  if (params.resolution === 'not_applied' && (actions.length > 0 || providerTasks.length > 0)) {
+    throw new Error('Durable lifecycle or provider-logout evidence exists; this enforcement cannot be certified as not applied');
+  }
+  if (params.resolution === 'verified_complete' && completedActions.length !== actions.length) {
+    throw new Error('Every recorded lifecycle action must be completed before enforcement can be certified complete');
+  }
+  if (params.resolution === 'verified_complete') {
+    if (recipient.enforcementExpectedAd !== false && !completedActions.some((action) => action.actionType === 'disable_ad')) {
+      throw new Error('A completed AD-disable lifecycle action is required before enforcement can be certified complete');
+    }
+    if (recipient.enforcementExpectedVpn && !completedActions.some((action) => action.actionType === 'revoke_vpn')) {
+      throw new Error('A completed VPN-revoke lifecycle action is required before enforcement can be certified complete');
+    }
+    if (providerTasks.some((task) => task.status !== 'completed')) {
+      throw new Error('Every provider logout task must be completed before enforcement can be certified complete');
+    }
+    if (liveSessionCount > 0) {
+      throw new Error('Live portal sessions remain; enforcement cannot be certified complete');
+    }
+  }
+
+  await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    const now = new Date();
+    if (params.resolution === 'verified_complete') {
+      const requestMarked = await markAccessRequestOffboardedByCampaign(tx, recipient, params.actor, now, {
+        confirmedAdDisabled: recipient.campaign.workflowMode === 'direct' && recipient.enforcementExpectedAd === false,
+      });
+      if (recipient.campaign.workflowMode === 'direct' && !requestMarked) {
+        throw new Error('Portal request changed after external access removal; keep this recipient in reconciliation');
+      }
+    }
+
+    const updated = await tx.offboardCampaignRecipient.updateMany({
+      where: {
+        id: params.recipientId,
+        campaignId: params.campaignId,
+        status: 'enforcement_reconciliation_required',
+      },
+      data: params.resolution === 'not_applied'
+        ? {
+            status: recipient.campaign.workflowMode === 'direct' ? 'direct_pending' : 'sent',
+            enforcementClaimedAt: null,
+            enforcementClaimId: null,
+            enforcementClaimedUntil: null,
+            enforcementError: null,
+            enforcementFailureCounted: false,
+            lastError: `Retry authorized by ${params.actor}: ${evidence}`,
+          }
+        : {
+            status: 'enforced',
+            enforcedAt: now,
+            enforcementClaimedAt: null,
+            enforcementClaimId: null,
+            enforcementClaimedUntil: null,
+            enforcementError: null,
+            enforcementFailureCounted: false,
+            lastError: null,
+          },
+    });
+    if (updated.count !== 1) throw new Error('Offboard enforcement reconciliation conflict');
+
+    await tx.offboardCampaign.update({
+      where: { id: params.campaignId },
+      data: {
+        ...(recipient.enforcementFailureCounted ? { failedCount: { decrement: 1 } } : {}),
+        ...(params.resolution === 'verified_complete' ? { enforcedCount: { increment: 1 } } : {}),
+      },
+    });
+    await createCampaignLog(tx, {
+      campaignId: params.campaignId,
+      recipientId: params.recipientId,
+      eventType: `enforcement_reconciled_${params.resolution}`,
+      actor: params.actor,
+      message: params.resolution === 'verified_complete'
+        ? `Operator certified enforcement complete for ${recipient.adUsername}`
+        : `Operator certified no enforcement effects for ${recipient.adUsername}; retry is re-armed`,
+      details: { resolution: params.resolution, evidence },
+    });
+  });
+
+  await syncDirectActivationRunOutcome(params.campaignId, params.recipientId);
+
+  return getOffboardCampaign(params.campaignId);
+}
+
+export async function reconcileOffboardFinalNotice(params: {
+  campaignId: string;
+  recipientId: string;
+  actor: string;
+  resolution: 'not_delivered' | 'verified_delivered';
+  evidence: string;
+}) {
+  const evidence = params.evidence.trim();
+  if (evidence.length < 10) {
+    throw new Error('Final-notice reconciliation evidence must contain at least 10 characters');
+  }
+  const recipient = await prisma.offboardCampaignRecipient.findUnique({
+    where: { id: params.recipientId },
+    include: { campaign: true },
+  });
+  if (!recipient || recipient.campaignId !== params.campaignId) throw new Error('Offboard recipient not found');
+  if (recipient.campaign.workflowMode !== 'direct' || recipient.status !== 'enforced') {
+    throw new Error('Final-notice reconciliation is available only after direct offboarding completed');
+  }
+  if (recipient.finalNoticeStatus !== 'reconciliation_required') {
+    throw new Error('Only reconciliation_required final notices can be reconciled');
+  }
+
+  await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    const updated = await tx.offboardCampaignRecipient.updateMany({
+      where: {
+        id: params.recipientId,
+        campaignId: params.campaignId,
+        status: 'enforced',
+        finalNoticeStatus: 'reconciliation_required',
+      },
+      data: params.resolution === 'not_delivered'
+        ? {
+            finalNoticeStatus: 'pending',
+            finalNoticeClaimedAt: null,
+            finalNoticeClaimId: null,
+            finalNoticeClaimedUntil: null,
+            finalNoticeError: null,
+            lastError: `Final-notice retry authorized by ${params.actor}: ${evidence}`,
+          }
+        : {
+            finalNoticeStatus: 'sent',
+            finalNoticeSentAt: new Date(),
+            finalNoticeClaimedAt: null,
+            finalNoticeClaimId: null,
+            finalNoticeClaimedUntil: null,
+            finalNoticeError: null,
+            lastError: null,
+          },
+    });
+    if (updated.count !== 1) throw new Error('Final-notice reconciliation conflict');
+    await tx.offboardCampaign.update({
+      where: { id: params.campaignId },
+      data: {
+        finalNoticeFailureCount: { decrement: 1 },
+        ...(params.resolution === 'verified_delivered' ? { finalNoticeSentCount: { increment: 1 } } : {}),
+      },
+    });
+    await createCampaignLog(tx, {
+      campaignId: params.campaignId,
+      recipientId: params.recipientId,
+      eventType: `direct_final_notice_reconciled_${params.resolution}`,
+      actor: params.actor,
+      message: params.resolution === 'verified_delivered'
+        ? `Operator verified final notice delivery for ${recipient.email}`
+        : `Operator verified final notice was not delivered for ${recipient.email}; retry is re-armed`,
+      details: { resolution: params.resolution, evidence },
+    });
+  });
+  if (params.resolution === 'not_delivered') {
+    await deliverDirectOffboardFinalNotice(params.recipientId, params.actor);
+  }
+  await syncDirectActivationRunOutcome(params.campaignId, params.recipientId);
+  await completeCampaignIfFinished(params.campaignId);
+  return getOffboardCampaign(params.campaignId);
+}
+
+async function recreateMissingVpnAccountForVerificationRecovery(recipient: CampaignRecipientWithCampaign, actor: string): Promise<boolean> {
+  const linkedVpnUsername = recipient.linkedVpnUsername;
+  if (!linkedVpnUsername) {
     return false;
   }
 
   const existing = await prisma.vPNAccount.findUnique({
-    where: { username: recipient.linkedVpnUsername },
+    where: { username: linkedVpnUsername },
     select: { id: true },
   });
 
@@ -2338,13 +4329,13 @@ async function recreateMissingVpnAccountForVerificationRecovery(recipient: any, 
   const password = originalVpn?.password || accessRequest?.accountPassword;
 
   if (!password) {
-    throw new Error(`Cannot recreate missing VPN account ${recipient.linkedVpnUsername}: password snapshot is unavailable`);
+    throw new Error(`Cannot recreate missing VPN account ${linkedVpnUsername}: password snapshot is unavailable`);
   }
 
-  await prisma.$transaction(async (tx: any) => {
+  await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const vpnAccount = await tx.vPNAccount.create({
       data: {
-        username: recipient.linkedVpnUsername,
+        username: linkedVpnUsername,
         name: originalVpn?.name || accessRequest?.name || recipient.displayName || recipient.adUsername,
         email: originalVpn?.email || accessRequest?.email || recipient.email || null,
         portalType: originalVpn?.portalType || (accessRequest?.isInternal ? 'Limited' : 'External'),
@@ -2375,6 +4366,7 @@ async function recreateMissingVpnAccountForVerificationRecovery(recipient: any, 
     await tx.vPNAccountStatusLog.create({
       data: {
         accountId: vpnAccount.id,
+        liveAccountId: vpnAccount.id,
         oldStatus: null,
         newStatus: 'revoked',
         changedBy: 'offboard-campaign',
@@ -2395,7 +4387,7 @@ async function recreateMissingVpnAccountForVerificationRecovery(recipient: any, 
   return true;
 }
 
-async function recoverVerifiedRecipientAccess(recipient: any, actor: string) {
+async function recoverVerifiedRecipientAccess(recipient: CampaignRecipientWithCampaign, actor: string) {
   const results: LifecycleProcessSummary[] = [];
   const recoveryErrors: string[] = [];
 
@@ -2456,7 +4448,7 @@ async function recoverVerifiedRecipientAccess(recipient: any, actor: string) {
   const errors = [...recoveryErrors, ...failedResults].filter(Boolean);
   const allSucceeded = errors.length === 0;
 
-  await prisma.$transaction(async (tx: any) => {
+  await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const requestStatusRestored = allSucceeded
       ? await restoreAccessRequestAfterCampaignRollback(tx, recipient, actor)
       : false;
@@ -2591,6 +4583,9 @@ export async function previewOffboardDeadlineExtension(
   const campaign = await prisma.offboardCampaign.findUnique({ where: { id: campaignId } });
   if (!campaign) {
     throw new Error('Campaign not found');
+  }
+  if (campaign.workflowMode !== 'verification') {
+    throw new Error('Direct offboarding cannot be extended or converted into a verification campaign');
   }
   if (campaign.status !== 'active' || campaign.cancelledAt || campaign.emergencyStoppedAt) {
     throw new Error('Deadline extensions are only available for active campaigns');
@@ -2727,6 +4722,7 @@ async function reactivateEnforcedRecipientForExtension(
 
   if (
     errors.length === 0 &&
+    (await isModuleEnabled('vpn.management')) &&
     recipient.linkedVpnUsername &&
     (preview.actions.includes('restore_vpn') || preview.actions.includes('recreate_and_restore_vpn'))
   ) {
@@ -3133,6 +5129,9 @@ export async function getOffboardRecipientVerificationContext(token: string) {
   if (!recipient) {
     throw new Error('Invalid or expired verification link');
   }
+  if (recipient.campaign.workflowMode !== 'verification') {
+    throw new Error('Direct-offboarding records cannot be verified or reactivated');
+  }
 
   const context = {
     recipientId: recipient.id,
@@ -3177,6 +5176,9 @@ export async function verifyOffboardRecipientToken(token: string, ipAddress?: st
   if (!recipient) {
     throw new Error('Invalid or expired verification link');
   }
+  if (recipient.campaign.workflowMode !== 'verification') {
+    throw new Error('Direct-offboarding records cannot be verified or reactivated');
+  }
 
   if (recipient.verifiedAt) {
     return { recipientId: recipient.id, campaignId: recipient.campaignId, alreadyVerified: true };
@@ -3193,7 +5195,7 @@ export async function verifyOffboardRecipientToken(token: string, ipAddress?: st
     recipient.vpnLifecycleActionId
   );
 
-  const updated = await prisma.$transaction(async (tx: any) => {
+  const updated = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const result = await tx.offboardCampaignRecipient.updateMany({
       where: {
         id: recipient.id,
@@ -3263,32 +5265,53 @@ async function completeCampaignIfFinished(campaignId: string) {
   }
 
   const remaining = await prisma.offboardCampaignRecipient.count({
-    where: {
-      campaignId,
-      status: {
-        in: ['dry_run_ready', 'pending_send', 'email_sending', 'sent', 'enforcement_processing'],
-      },
-    },
+    where: campaign.workflowMode === 'direct'
+      ? {
+          campaignId,
+          OR: [
+            { status: { in: ['dry_run_ready', 'direct_pending', 'enforcement_processing', 'enforcement_reconciliation_required'] } },
+            { finalNoticeStatus: { in: ['pending', 'sending', 'reconciliation_required'] } },
+          ],
+        }
+      : {
+          campaignId,
+          status: {
+            in: ['dry_run_ready', 'pending_send', 'email_sending', 'sent', 'enforcement_processing', 'enforcement_reconciliation_required'],
+          },
+        },
   });
 
   if (remaining === 0) {
-    await prisma.$transaction(async (tx: any) => {
+    const exceptionCount = await prisma.offboardCampaignRecipient.count({
+      where: {
+        campaignId,
+        OR: [
+          { status: { in: ['skipped', 'enforcement_skipped', 'enforcement_failed'] } },
+          { finalNoticeStatus: 'failed' },
+        ],
+      },
+    });
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.offboardCampaign.update({
         where: { id: campaignId },
         data: {
-          status: 'completed',
+          status: exceptionCount > 0 ? 'completed_with_exceptions' : 'completed',
           completedAt: new Date(),
           activeLockKey: null,
           sendingPaused: true,
           remindersPaused: true,
           enforcementPaused: true,
+          executionPaused: true,
         },
       });
       await createCampaignLog(tx, {
         campaignId,
-        eventType: 'campaign_completed',
+        eventType: exceptionCount > 0 ? 'campaign_completed_with_exceptions' : 'campaign_completed',
         actor: 'system',
-        message: 'Campaign completed because all recipients reached a terminal state',
+        message: exceptionCount > 0
+          ? `Campaign completed with ${exceptionCount} recipient exception${exceptionCount === 1 ? '' : 's'}`
+          : 'Campaign completed because all recipients reached a terminal state',
+        details: { exceptionCount, workflowMode: campaign.workflowMode },
       });
     });
   }
@@ -3312,6 +5335,9 @@ export async function previewOffboardRollback(campaignId: string) {
     const actions: string[] = [];
     const conflicts: string[] = [];
     const originalRequest = getOriginalAccessRequestSnapshot(recipient);
+    let currentAdStatus: string | null = null;
+    let currentRequestStatus: string | null = null;
+    let currentVpnStatus: string | null = null;
 
     if (recipient.adLifecycleActionId && recipient.originalAdEnabled) {
       const request = recipient.accessRequestId
@@ -3336,6 +5362,8 @@ export async function previewOffboardRollback(campaignId: string) {
       if (originalRequest?.status === 'approved' && request?.status !== 'offboarded') {
         conflicts.push('Access request status changed after campaign enforcement');
       }
+      currentAdStatus = request?.adAccountStatus ?? null;
+      currentRequestStatus = request?.status ?? null;
     }
 
     if (recipient.vpnLifecycleActionId && recipient.linkedVpnUsername && recipient.originalVpnStatus && recipient.originalVpnStatus !== 'revoked') {
@@ -3348,6 +5376,7 @@ export async function previewOffboardRollback(campaignId: string) {
       } else {
         conflicts.push('VPN account is not revoked in the portal database');
       }
+      currentVpnStatus = vpn?.status ?? null;
     }
 
     items.push({
@@ -3357,6 +5386,12 @@ export async function previewOffboardRollback(campaignId: string) {
       actions,
       conflicts,
       rollbackable: actions.length > 0 && conflicts.length === 0,
+      recipientUpdatedAt: recipient.updatedAt.toISOString(),
+      recipientStatus: recipient.status,
+      rollbackStatus: recipient.rollbackStatus,
+      currentAdStatus,
+      currentRequestStatus,
+      currentVpnStatus,
     });
   }
 
@@ -3369,15 +5404,30 @@ export async function previewOffboardRollback(campaignId: string) {
   };
 }
 
-export async function executeOffboardRollback(campaignId: string, actor: string) {
+export async function executeOffboardRollback(campaignId: string, actor: string, operationRun?: { id: string; items: Array<{ recipientId: string | null; actions: unknown; conflicts: unknown }> }) {
   const campaign = await prisma.offboardCampaign.findUnique({ where: { id: campaignId } });
   if (!campaign) {
     throw new Error('Campaign not found');
   }
 
-  const preview = await previewOffboardRollback(campaignId);
+  const preview = operationRun
+    ? {
+        campaignId,
+        total: operationRun.items.length,
+        rollbackable: operationRun.items.filter(item => jsonArray(item.actions).length > 0 && jsonArray(item.conflicts).length === 0).length,
+        conflicts: operationRun.items.filter(item => jsonArray(item.conflicts).length > 0).length,
+        items: operationRun.items.map(item => ({
+          recipientId: item.recipientId || '',
+          adUsername: '',
+          linkedVpnUsername: null,
+          actions: jsonArray(item.actions),
+          conflicts: jsonArray(item.conflicts),
+          rollbackable: jsonArray(item.actions).length > 0 && jsonArray(item.conflicts).length === 0,
+        })),
+      }
+    : await previewOffboardRollback(campaignId);
 
-  await prisma.$transaction(async (tx: any) => {
+  await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     await tx.offboardCampaign.update({
       where: { id: campaignId },
       data: {
@@ -3414,6 +5464,12 @@ export async function executeOffboardRollback(campaignId: string, actor: string)
           rollbackError: item.conflicts.join('; ') || 'No rollback action available',
         },
       });
+      if (operationRun) {
+        await prisma.offboardOperationRunItem.updateMany({
+          where: { runId: operationRun.id, recipientId: recipient.id },
+          data: { status: 'skipped', outcome: { reason: item.conflicts.join('; ') || 'No rollback action available' } },
+        });
+      }
       continue;
     }
 
@@ -3428,6 +5484,7 @@ export async function executeOffboardRollback(campaignId: string, actor: string)
           targetUserId: recipient.accessRequestId,
           reason: `Rollback for offboard campaign ${campaign.name}`,
           actor,
+          idempotencyKey: operationRun ? `${operationRun.id}:${recipient.id}:enable_ad` : undefined,
         });
         results.push(result);
         await prisma.offboardCampaignRecipient.update({
@@ -3445,6 +5502,7 @@ export async function executeOffboardRollback(campaignId: string, actor: string)
           targetUserId: recipient.vpnAccountId,
           reason: `Rollback for offboard campaign ${campaign.name}`,
           actor,
+          idempotencyKey: operationRun ? `${operationRun.id}:${recipient.id}:restore_vpn` : undefined,
         });
         results.push(result);
         await prisma.offboardCampaignRecipient.update({
@@ -3460,7 +5518,7 @@ export async function executeOffboardRollback(campaignId: string, actor: string)
         failureCount += 1;
       }
 
-      await prisma.$transaction(async (tx: any) => {
+      await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         const requestStatusRestored = allSucceeded
           ? await restoreAccessRequestAfterCampaignRollback(tx, recipient, actor)
           : false;
@@ -3485,10 +5543,19 @@ export async function executeOffboardRollback(campaignId: string, actor: string)
           details: { results, requestStatusRestored },
         });
       });
+      if (operationRun) {
+        await prisma.offboardOperationRunItem.updateMany({
+          where: { runId: operationRun.id, recipientId: recipient.id },
+          data: {
+            status: allSucceeded ? 'completed' : 'reconciliation_required',
+            outcome: operationJson({ results, requestStatusRestored: allSucceeded }),
+          },
+        });
+      }
     } catch (error) {
       failureCount += 1;
       const message = error instanceof Error ? error.message : 'Unknown rollback failure';
-      await prisma.$transaction(async (tx: any) => {
+      await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         await tx.offboardCampaignRecipient.update({
           where: { id: recipient.id },
           data: {
@@ -3507,10 +5574,16 @@ export async function executeOffboardRollback(campaignId: string, actor: string)
           details: { error: message },
         });
       });
+      if (operationRun) {
+        await prisma.offboardOperationRunItem.updateMany({
+          where: { runId: operationRun.id, recipientId: recipient.id },
+          data: { status: 'reconciliation_required', outcome: operationJson({ error: message }) },
+        });
+      }
     }
   }
 
-  await prisma.$transaction(async (tx: any) => {
+  await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     await tx.offboardCampaign.update({
       where: { id: campaignId },
       data: {

@@ -107,6 +107,7 @@ export interface SupportTicket {
 }
 export interface BatchAccountItem {
   id: string;
+  accessRequestId?: string | null;
   name: string;
   ldapUsername: string;
   status: string;

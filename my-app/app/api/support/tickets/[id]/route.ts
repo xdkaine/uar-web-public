@@ -1,49 +1,27 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { getSessionFromCookies } from '@/lib/session';
+import { checkSupportAuth, supportAuthHasPermission } from '@/lib/support-auth';
+import { resolveTicketMutationAccess, resolveTicketViewAccess } from '@/lib/support/ticket-access';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
-import { searchLDAPUser } from '@/lib/ldap/user-search';
+import { resolveLDAPUserDisplayNames } from '@/lib/ldap/user-search';
 import { isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit } from '@/lib/validation';
+import { serializeSupportTicket } from '@/lib/support/ticket-json';
 
 interface UpdateTicketBody {
   status?: unknown;
 }
 
-async function checkUserAuth() {
-  const session = await getSessionFromCookies();
-
-  if (!session) {
-    return null;
-  }
-
-  return { username: session.username, isAdmin: session.isAdmin };
-}
-
 // Helper function to fetch display names for a list of usernames
 async function getDisplayNames(usernames: string[]): Promise<Record<string, string>> {
-  const displayNameMap: Record<string, string> = {};
-
-  // Fetch display names in parallel
-  await Promise.all(
-    usernames.map(async (username) => {
-      try {
-        const userInfo = await searchLDAPUser(username);
-        if (userInfo) {
-          // Prefer displayName, then cn, then username
-          const displayNameAttr = userInfo.attributes.find(attr => attr.type === 'displayName');
-          const cnAttr = userInfo.attributes.find(attr => attr.type === 'cn');
-          displayNameMap[username] = displayNameAttr?.values[0] || cnAttr?.values[0] || username;
-        } else {
-          displayNameMap[username] = username;
-        }
-      } catch {
-        // If lookup fails, use the username as fallback
-        displayNameMap[username] = username;
-      }
-    })
-  );
-
-  return displayNameMap;
+  try {
+    const resolved = await resolveLDAPUserDisplayNames(usernames);
+    return Object.fromEntries(usernames.map((username) => [
+      username,
+      resolved.get(username.toLowerCase()) || username,
+    ]));
+  } catch {
+    return Object.fromEntries(usernames.map((username) => [username, username]));
+  }
 }
 
 // Get a specific ticket
@@ -52,10 +30,13 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await checkUserAuth();
+    const { auth, response } = await checkSupportAuth();
 
     if (!auth) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+      return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!supportAuthHasPermission(auth, 'tickets.read')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const resolvedParams = await params;
@@ -76,8 +57,10 @@ export async function GET(
       return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
     }
 
-    // Users can only view their own tickets unless they're admin
-    if (ticket.username !== auth.username && !auth.isAdmin) {
+    // Users can view their own tickets; admins and assignee-group members can
+    // view tickets assigned to them (ADR-0007).
+    const access = await resolveTicketViewAccess(ticket, auth);
+    if (!access) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
@@ -121,12 +104,13 @@ export async function GET(
     }
 
     return NextResponse.json({
-      ticket: {
+      ticket: serializeSupportTicket({
         ...ticket,
         displayName: displayNameMap[ticket.username] || ticket.username,
         statusLogs: enrichedStatusLogs,
         responses: enrichedResponses,
-      }
+        viewerRole: access,
+      })
     });
   } catch (error) {
     console.error('Error fetching support ticket:', error);
@@ -143,10 +127,13 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await checkUserAuth();
+    const { auth, response } = await checkSupportAuth();
 
     if (!auth) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+      return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!supportAuthHasPermission(auth, 'tickets.respond')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const resolvedParams = await params;
@@ -168,9 +155,13 @@ export async function PATCH(
       return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
     }
 
-    // Only ticket owner or admin can update status
-    if (ticket.username !== auth.username && !auth.isAdmin) {
+    // Ticket owner, admin, or assignee-group member can update status
+    const access = await resolveTicketMutationAccess(ticket, auth);
+    if (!access) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+    if (ticket.status === status) {
+      return NextResponse.json({ error: `Ticket is already ${status}` }, { status: 409 });
     }
 
     const updateData: {
@@ -192,21 +183,15 @@ export async function PATCH(
       updateData.closedBy = null;
     }
 
-    // Use transaction to update ticket and create status log
-    const [updatedTicket] = await prisma.$transaction([
-      prisma.supportTicket.update({
-        where: { id: resolvedParams.id },
+    // Compare-and-set prevents two operators from silently overwriting each
+    // other's status transition while preserving an accurate immutable log.
+    const updatedTicket = await prisma.$transaction(async (tx) => {
+      const claimed = await tx.supportTicket.updateMany({
+        where: { id: resolvedParams.id, status: ticket.status, updatedAt: ticket.updatedAt },
         data: updateData,
-        include: {
-          responses: {
-            orderBy: { createdAt: 'asc' },
-          },
-          statusLogs: {
-            orderBy: { createdAt: 'desc' },
-          },
-        },
-      }),
-      prisma.ticketStatusLog.create({
+      });
+      if (claimed.count !== 1) return null;
+      await tx.ticketStatusLog.create({
         data: {
           ticketId: resolvedParams.id,
           oldStatus: ticket.status,
@@ -214,8 +199,18 @@ export async function PATCH(
           changedBy: auth.username,
           isStaff: auth.isAdmin,
         },
-      }),
-    ]);
+      });
+      return tx.supportTicket.findUnique({
+        where: { id: resolvedParams.id },
+        include: {
+          responses: { orderBy: { createdAt: 'asc' } },
+          statusLogs: { orderBy: { createdAt: 'desc' } },
+        },
+      });
+    });
+    if (!updatedTicket) {
+      return NextResponse.json({ error: 'Ticket changed while you were editing. Refresh and try again.' }, { status: 409 });
+    }
 
     // Log the ticket status update (only if admin)
     if (auth.isAdmin) {
@@ -238,6 +233,8 @@ export async function PATCH(
         },
         ipAddress: getIpAddress(request),
         userAgent: getUserAgent(request),
+      }).catch((auditError) => {
+        console.error('[Ticket Status] Status changed but audit logging failed:', auditError);
       });
     }
 
@@ -290,7 +287,22 @@ export async function PATCH(
       }
     }
 
-    return NextResponse.json({ ticket: updatedTicket });
+    // Visual workflow graphs observe status changes, including closes (ADR-0013).
+    try {
+      const { emitFlowEvent } = await import('@/lib/flow/engine');
+      await emitFlowEvent('ticket_status_changed', `ticket_status:${ticket.id}:${status}:${updatedTicket.updatedAt}`, {
+        ticketId: ticket.id,
+        ticketSubject: ticket.subject,
+        oldStatus: ticket.status,
+        newStatus: status,
+        status,
+        username: auth.username,
+      });
+    } catch (flowError) {
+      console.error('[Ticket Status Update] Flow emission failed:', flowError);
+    }
+
+    return NextResponse.json({ ticket: serializeSupportTicket(updatedTicket) });
   } catch (error) {
     if (isJsonBodyError(error)) {
       return NextResponse.json({ error: error.message }, { status: error.statusCode });

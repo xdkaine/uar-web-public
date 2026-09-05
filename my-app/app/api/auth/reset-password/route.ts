@@ -2,13 +2,14 @@ import { NextRequest, NextResponse } from 'next/server';
 import type { Prisma } from '@prisma/client';
 import { createHash } from 'crypto';
 import { prisma } from '@/lib/prisma';
-import { changeLDAPUserPassword, searchLDAPUser } from '@/lib/ldap';
+import { changeLDAPUserPassword, createLDAPClient, searchLDAPUser } from '@/lib/ldap';
 import { validatePasswordStrength } from '@/lib/password';
 import { checkRateLimitAsync, getRequiredClientIp, isRateLimitUnavailable, RateLimitPresets } from '@/lib/ratelimit';
 import { appLogger } from '@/lib/logger';
 import { parseJsonWithLimit, MAX_REQUEST_BODY_SIZE, isJsonBodyError } from '@/lib/validation';
 import { logActionHistoryEvent } from '@/lib/action-history';
 import { AuditActions, AuditCategories, getUserAgent } from '@/lib/audit-log';
+import { getConfigValue, getRequiredSecretValue } from '@/lib/config/resolver';
 
 const MAX_TOKEN_ATTEMPTS = 5;
 
@@ -158,22 +159,16 @@ export async function POST(request: NextRequest) {
     let userDN: string | null = null;
 
     try {
-      const { Client } = await import('ldapts');
       const { escapeLDAPFilter } = await import('@/lib/ldap');
-      
-      const ldapUrl = process.env.LDAP_URL || '';
-      const client = new Client({
-        url: ldapUrl,
-        tlsOptions: ldapUrl.startsWith('ldaps://') ? {
-          rejectUnauthorized: false,
-        } : undefined,
-      });
+      const client = await createLDAPClient();
       
       try {
-        await client.bind(
-          process.env.LDAP_BIND_DN || '',
-          process.env.LDAP_BIND_PASSWORD || ''
-        );
+        const [bindDn, bindPassword, searchBase] = await Promise.all([
+          getConfigValue<string>('ldap.bindDn'),
+          getRequiredSecretValue('ldap.bindPassword'),
+          getConfigValue<string>('ldap.searchBase'),
+        ]);
+        await client.bind(bindDn, bindPassword);
 
         const opts = {
           filter: `(mail=${escapeLDAPFilter(email)})`,
@@ -181,7 +176,7 @@ export async function POST(request: NextRequest) {
           attributes: ['sAMAccountName', 'distinguishedName'],
         };
 
-        const { searchEntries } = await client.search(process.env.LDAP_SEARCH_BASE || '', opts);
+        const { searchEntries } = await client.search(searchBase, opts);
 
         if (searchEntries.length === 0) {
           await logActionHistoryEvent({

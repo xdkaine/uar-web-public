@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 import { isJsonBodyError, parseAdminJson } from '@/lib/admin-json-parser';
+import { requireModuleEnabled } from '@/lib/modules/guards';
 
 type EventRequestBody = {
   name?: string;
@@ -16,6 +18,10 @@ export async function GET(request: NextRequest) {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!actorHasPermission(admin, 'events.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const events = await prisma.event.findMany({
@@ -59,6 +65,13 @@ export async function POST(request: NextRequest) {
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+
+    if (!actorHasPermission(admin, 'events.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    const moduleGuard = await requireModuleEnabled('events');
+    if (moduleGuard) return moduleGuard;
 
     const body = await parseAdminJson<EventRequestBody>(request);
     const { name, description, endDate, isActive } = body;

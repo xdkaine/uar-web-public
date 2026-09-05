@@ -1,13 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { searchLDAPUserForProvisioning } from '@/lib/ldap';
 import { prisma } from '@/lib/prisma';
-import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { checkReviewAccessWithRateLimit } from '@/lib/adminAuth';
 import { encryptPassword } from '@/lib/encryption';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
-import { sendVPNPendingFacultyNotification, sendStudentDirectorNotification } from '@/lib/email';
+import { sendStudentDirectorNotification, sendWorkflowStageNotification } from '@/lib/email';
 import { getEmailConfig, getStudentDirectorEmails } from '@/lib/email-config';
+import { deliverFacultyNotification } from '@/lib/faculty-notification';
+import { isModuleEnabled } from '@/lib/modules/core';
+import { actorCanActOnStage, actorHasPermission } from '@/lib/rbac/core';
+import {
+  findStageIndexByStatus,
+  nextReviewStatusAfter,
+  resolveStageNotificationRecipients,
+  resolveWorkflowForRequest,
+  supportsFacultyHandoffActions,
+  workflowIntegrityConflict,
+} from '@/lib/workflow/core';
 import { extractBronconame } from '@/lib/validation';
 import { findReusableOffboardedRequest } from '@/lib/offboard-reenrollment';
+import { toSafeAccessRequestResponse } from '@/lib/access-request-response';
 
 type ReusableOffboardedRequest = { id: string } | null;
 
@@ -16,7 +28,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const { admin, response } = await checkAdminAuthWithRateLimit(request);
+    const { admin, response } = await checkReviewAccessWithRateLimit(request);
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
@@ -34,17 +46,67 @@ export async function POST(
     if (!accessRequest) {
       return NextResponse.json({ error: 'Request not found' }, { status: 404 });
     }
+    if (['in_progress', 'reconciliation_required'].includes(accessRequest.accountUpdateState || '')) {
+      return NextResponse.json({ error: 'Account update ownership must be resolved before changing request stage.' }, { status: 409 });
+    }
+
+    // Resolve the governance workflow this request is pinned to and verify the
+    // request is at a preparable (non-final) review stage.
+    const workflow = await resolveWorkflowForRequest(accessRequest);
+    const workflowConflict = workflowIntegrityConflict(workflow);
+    if (workflowConflict) {
+      return NextResponse.json({ error: workflowConflict, code: 'WORKFLOW_RECONCILIATION_REQUIRED' }, { status: 409 });
+    }
+    const currentStageIndex = findStageIndexByStatus(workflow.stages, accessRequest.status);
+
+    if (currentStageIndex === -1 || currentStageIndex >= workflow.stages.length - 1) {
+      return NextResponse.json(
+        {
+          error:
+            'Acknowledgement is not available for this request under its configured review workflow. Requests at their final review stage are approved directly.',
+        },
+        { status: 409 }
+      );
+    }
+
+    const currentStage = workflow.stages[currentStageIndex];
+    if (!actorCanActOnStage(admin, currentStage.reviewerRoleKey)) {
+      return NextResponse.json(
+        {
+          error: `You do not have the reviewer role required for the "${currentStage.label}" stage.`,
+          code: 'MISSING_STAGE_ROLE',
+        },
+        { status: 403 }
+      );
+    }
+    if (!actorHasPermission(admin, 'access_requests.provision')) {
+      return NextResponse.json(
+        { error: 'Provisioning permission is required to prepare directory credentials.' },
+        { status: 403 }
+      );
+    }
+
+    const nextStatus = nextReviewStatusAfter(workflow.stages, accessRequest.status);
+    if (!nextStatus) {
+      return NextResponse.json(
+        { error: 'No subsequent review stage is configured for this request.' },
+        { status: 409 }
+      );
+    }
+    const legacyFacultyHandoff = supportsFacultyHandoffActions(workflow.stages);
+
+    const vpnModuleEnabled = await isModuleEnabled('vpn.management');
 
     // Validate required fields based on account type
     if (!ldapUsername || !password) {
       return NextResponse.json(
-        { error: 'LDAP username and password are required' },
+        { error: 'Directory username and password are required' },
         { status: 400 }
       );
     }
 
-    // VPN username is only required for external users
-    if (!accessRequest.isInternal && !vpnUsername) {
+    // VPN username is only required for external users when VPN management is enabled
+    if (vpnModuleEnabled && !accessRequest.isInternal && !vpnUsername) {
       return NextResponse.json(
         { error: 'VPN username is required for external users' },
         { status: 400 }
@@ -62,9 +124,8 @@ export async function POST(
       );
     }
 
-    // funny logic time
-    // check AD if account isnt done yet
-    // If accountcreated is set, we're interacting with an existing account
+    // Check Active Directory only when credentials have not already been prepared.
+    // An existing accountCreatedAt means this route is handling an existing identity.
     let reusableAdRequest: ReusableOffboardedRequest = null;
     let reusableVpnRequest: ReusableOffboardedRequest = null;
     if (!accessRequest.accountCreatedAt) {
@@ -80,7 +141,7 @@ export async function POST(
 
           if (!reusableAdRequest) {
             return NextResponse.json(
-              { error: `LDAP username "${ldapUsername}" already exists in Active Directory` },
+              { error: `Directory username "${ldapUsername}" already exists in Active Directory` },
               { status: 400 }
             );
           }
@@ -88,13 +149,13 @@ export async function POST(
       } catch (ldapError) {
         console.error('LDAP search error during acknowledgment:', ldapError);
         return NextResponse.json(
-          { error: 'Failed to verify LDAP username availability. Please try again.' },
+          { error: 'Failed to verify directory username availability. Please try again.' },
           { status: 500 }
         );
       }
 
-      // Check if username already exists in Active Directory (for external users)
-      if (!accessRequest.isInternal && vpnUsername) {
+      // Check if username already exists in Active Directory (for external users, VPN module only)
+      if (vpnModuleEnabled && !accessRequest.isInternal && vpnUsername) {
         try {
           const vpnUser = await searchLDAPUserForProvisioning(vpnUsername);
           
@@ -124,9 +185,9 @@ export async function POST(
     // Check if LDAP username is already in use in database
     // NOTE: We exclude reusable terminal requests so usernames can be reused after denial or campaign offboarding.
     const usernameChecks: Array<{ ldapUsername?: string; vpnUsername?: string }> = [{ ldapUsername }];
-    
-    // Only check username for external users
-    if (!accessRequest.isInternal && vpnUsername) {
+
+    // Only check VPN username for external users when the VPN module is enabled
+    if (vpnModuleEnabled && !accessRequest.isInternal && vpnUsername) {
       usernameChecks.push({ vpnUsername });
     }
     
@@ -161,28 +222,56 @@ export async function POST(
       manuallyAssignedAt?: Date;
       manuallyAssignedBy?: string;
       manualAssignmentNotes?: string;
+      sentToFacultyAt?: null;
+      sentToFacultyBy?: null;
+      facultyNotificationState?: null;
+      facultyNotificationClaimId?: null;
+      facultyNotificationClaimedUntil?: null;
+      facultyNotificationError?: null;
+      stageNotificationState?: string;
+      stageNotificationStageKey?: string;
+      stageNotificationError?: string;
+      stageNotificationStateChangedAt?: Date;
+      version: { increment: number };
     } = {
       acknowledgedByDirector: true,
       acknowledgedAt: new Date(),
       acknowledgedBy: admin.username,
-      status: 'pending_faculty',
+      status: nextStatus,
       ldapUsername,
       accountPassword: encryptPassword(password),
+      version: { increment: 1 },
     };
+    if (legacyFacultyHandoff) {
+      updateData.sentToFacultyAt = null;
+      updateData.sentToFacultyBy = null;
+      updateData.facultyNotificationState = null;
+      updateData.facultyNotificationClaimId = null;
+      updateData.facultyNotificationClaimedUntil = null;
+      updateData.facultyNotificationError = null;
+    } else {
+      const nextStage = workflow.stages[currentStageIndex + 1];
+      updateData.stageNotificationState = 'delivery_unknown';
+      updateData.stageNotificationStageKey = nextStage.key;
+      updateData.stageNotificationError = `Delivery to ${nextStage.label} has not been confirmed.`;
+      updateData.stageNotificationStateChangedAt = new Date();
+    }
 
     const reusableRequest = reusableAdRequest || reusableVpnRequest;
 
     if (reusableRequest) {
       updateData.linkedAdUsername = ldapUsername;
-      updateData.linkedVpnUsername = vpnUsername || ldapUsername;
+      if (vpnModuleEnabled) {
+        updateData.linkedVpnUsername = vpnUsername || ldapUsername;
+      }
       updateData.isManuallyAssigned = true;
       updateData.manuallyAssignedAt = new Date();
       updateData.manuallyAssignedBy = admin.username;
       updateData.manualAssignmentNotes = `Prepared for reactivation from campaign-offboarded request ${reusableRequest.id}`;
     }
 
-    // Only set VPN username for external users
-    if (!accessRequest.isInternal) {
+    // Only set VPN username for external users when the VPN module is enabled
+    if (vpnModuleEnabled && !accessRequest.isInternal) {
       updateData.vpnUsername = vpnUsername;
     }
 
@@ -192,9 +281,10 @@ export async function POST(
     }
 
     const result = await prisma.accessRequest.updateMany({
-      where: { 
+      where: {
         id: resolvedParams.id,
-        status: 'pending_student_directors'
+        status: accessRequest.status,
+        version: accessRequest.version,
       },
       data: updateData,
     });
@@ -204,9 +294,9 @@ export async function POST(
         where: { id: resolvedParams.id },
         select: { status: true }
       });
-      
-      return NextResponse.json({ 
-        error: `Request status is ${current?.status}, expected pending_student_directors` 
+
+      return NextResponse.json({
+        error: `Request status is ${current?.status}, expected ${accessRequest.status}`
       }, { status: 400 });
     }
 
@@ -222,104 +312,115 @@ export async function POST(
       await prisma.requestComment.create({
         data: {
           requestId: resolvedParams.id,
-          comment: `Prepared for reactivation from campaign-offboarded request ${reusableRequest.id}. The existing account remains disabled until faculty approval re-enables access.`,
+          comment: `Prepared for reactivation from campaign-offboarded request ${reusableRequest.id}. The existing account remains disabled until final approval re-enables access.`,
           author: admin.username,
           type: 'system',
         },
       });
     }
 
-    // Create or update VPN account entry for tracking in VPN Management tab
+    // Create or update VPN account entry for tracking in VPN Management tab.
+    // Skipped entirely when the VPN module is disabled: no records are written,
+    // and historical data remains untouched (compatibility contract #4).
     // For internal users with @cpp.edu email, extract bronconame from email for VPN username
-    let vpnAccountUsername: string;
-    if (accessRequest.isInternal) {
-      vpnAccountUsername = extractBronconame(accessRequest.email) || ldapUsername;
-    } else {
-      vpnAccountUsername = vpnUsername || ldapUsername;
-    }
+    const vpnAccountUsername = accessRequest.isInternal
+      ? extractBronconame(accessRequest.email) || ldapUsername
+      : vpnUsername || ldapUsername;
     const portalType = accessRequest.isInternal ? 'Limited' : 'External';
-    
-    try {
-      // Check if VPN account already exists
-      const existingVpnAccount = await prisma.vPNAccount.findUnique({
-        where: { username: vpnAccountUsername },
-      });
+    let vpnEntryCreated = false;
 
-      let vpnAccount;
-      const encryptedPassword = encryptPassword(password);
-
-      if (existingVpnAccount) {
-        // Update existing VPN account
-        vpnAccount = await prisma.vPNAccount.update({
+    if (vpnModuleEnabled) {
+      try {
+        // Check if VPN account already exists
+        const existingVpnAccount = await prisma.vPNAccount.findUnique({
           where: { username: vpnAccountUsername },
-          data: {
-            name: accessRequest.name,
-            email: accessRequest.email,
-            portalType: portalType,
-            isInternal: accessRequest.isInternal,
-            status: 'pending_faculty',
-            password: encryptedPassword,
-            expiresAt: !accessRequest.isInternal && expirationDate ? new Date(expirationDate) : undefined,
-            accessRequestId: resolvedParams.id,
-            adUsername: ldapUsername, // Link to AD account
-          },
         });
 
-        // Create status log for the update
-        await prisma.vPNAccountStatusLog.create({
-          data: {
-            accountId: vpnAccount.id,
-            oldStatus: existingVpnAccount.status,
-            newStatus: 'pending_faculty',
-            changedBy: admin.username,
-            reason: 'Updated from access request acknowledgment',
-          },
-        });
-      } else {
-        // Create new VPN account
-        vpnAccount = await prisma.vPNAccount.create({
-          data: {
-            username: vpnAccountUsername,
-            name: accessRequest.name,
-            email: accessRequest.email,
-            portalType: portalType,
-            isInternal: accessRequest.isInternal,
-            status: 'pending_faculty',
-            password: encryptedPassword,
-            expiresAt: !accessRequest.isInternal && expirationDate ? new Date(expirationDate) : undefined,
-            createdBy: admin.username,
-            createdByFaculty: false,
-            accessRequestId: resolvedParams.id,
-            adUsername: ldapUsername, // Link to AD account
-          },
-        });
+        let vpnAccount;
+        const encryptedPassword = encryptPassword(password);
 
-        // Create initial status log for the new VPN account
-        await prisma.vPNAccountStatusLog.create({
-          data: {
-            accountId: vpnAccount.id,
-            oldStatus: null,
-            newStatus: 'pending_faculty',
-            changedBy: admin.username,
-            reason: 'Created from access request',
-          },
-        });
+        if (existingVpnAccount) {
+          // Update existing VPN account
+          vpnAccount = await prisma.vPNAccount.update({
+            where: { username: vpnAccountUsername },
+            data: {
+              name: accessRequest.name,
+              email: accessRequest.email,
+              portalType: portalType,
+              isInternal: accessRequest.isInternal,
+              status: nextStatus,
+              password: encryptedPassword,
+              expiresAt: !accessRequest.isInternal && expirationDate ? new Date(expirationDate) : undefined,
+              accessRequestId: resolvedParams.id,
+              adUsername: ldapUsername, // Link to AD account
+            },
+          });
+
+          // Create status log for the update
+          await prisma.vPNAccountStatusLog.create({
+            data: {
+              accountId: vpnAccount.id,
+              liveAccountId: vpnAccount.id,
+              oldStatus: existingVpnAccount.status,
+              newStatus: nextStatus,
+              changedBy: admin.username,
+              reason: 'Updated from access request acknowledgment',
+            },
+          });
+        } else {
+          // Create new VPN account
+          vpnAccount = await prisma.vPNAccount.create({
+            data: {
+              username: vpnAccountUsername,
+              name: accessRequest.name,
+              email: accessRequest.email,
+              portalType: portalType,
+              isInternal: accessRequest.isInternal,
+              status: nextStatus,
+              password: encryptedPassword,
+              expiresAt: !accessRequest.isInternal && expirationDate ? new Date(expirationDate) : undefined,
+              createdBy: admin.username,
+              createdByFaculty: false,
+              accessRequestId: resolvedParams.id,
+              adUsername: ldapUsername, // Link to AD account
+            },
+          });
+
+          // Create initial status log for the new VPN account
+          await prisma.vPNAccountStatusLog.create({
+            data: {
+              accountId: vpnAccount.id,
+              liveAccountId: vpnAccount.id,
+              oldStatus: null,
+              newStatus: nextStatus,
+              changedBy: admin.username,
+              reason: 'Created from access request',
+            },
+          });
+        }
+        vpnEntryCreated = true;
+      } catch (vpnError) {
+        console.error('Error creating/updating VPN account entry:', vpnError);
+        // Continue even if VPN account creation fails - this is for tracking only
       }
-    } catch (vpnError) {
-      console.error('Error creating/updating VPN account entry:', vpnError);
-      // Continue even if VPN account creation fails - this is for tracking only
     }
 
-    // adding comments at steps
-    let commentText = `Request acknowledged by ${admin.username} and moved to Pending Faculty. Credentials set: AD username: ${ldapUsername}`;
-    if (!accessRequest.isInternal && vpnUsername) {
+    // adding comments at steps - report only what actually happened
+    let commentText = `Request acknowledged by ${admin.username} and moved to ${workflow.stages[currentStageIndex + 1].label}. Credentials set: directory username: ${ldapUsername}`;
+    if (vpnModuleEnabled && !accessRequest.isInternal && vpnUsername) {
       commentText += `, Username: ${vpnUsername}`;
     }
     if (!accessRequest.isInternal && expirationDate) {
       const expDate = new Date(expirationDate).toLocaleDateString();
       commentText += `, Expiration: ${expDate}`;
     }
-    commentText += '. VPN account entry created for tracking.';
+    if (vpnModuleEnabled) {
+      commentText += vpnEntryCreated
+        ? '. VPN account entry created for tracking.'
+        : '. VPN tracking entry could not be created.';
+    } else {
+      commentText += '. VPN management is disabled; no VPN entry was created.';
+    }
 
     await prisma.requestComment.create({
       data: {
@@ -330,56 +431,109 @@ export async function POST(
       },
     });
 
-    // Send email notification to faculty when first moved to pending_faculty
-    try {
-      const emailConfig = await getEmailConfig();
-      const facultyEmail = emailConfig.facultyEmail;
-      
-      if (facultyEmail) {
-        await sendVPNPendingFacultyNotification(
-          facultyEmail,
-          vpnAccountUsername,
-          updatedRequest.name,
-          updatedRequest.email,
-          portalType,
-          admin.username
-        );
-        console.log('[Acknowledge] Email sent to faculty:', facultyEmail);
-      } else {
-        console.warn('[Acknowledge] No faculty email configured');
+    const nextStage = workflow.stages[currentStageIndex + 1];
+    const stageRecipients = await resolveStageNotificationRecipients(nextStage, async () => {
+      if (nextStage.reviewerRoleKey === 'faculty') {
+        const emailConfig = await getEmailConfig();
+        return emailConfig.facultyEmail ? [emailConfig.facultyEmail] : [];
       }
-    } catch (emailError) {
-      console.error('[Acknowledge] Failed to send faculty email:', emailError);
-      // Don't fail the request if email fails
+      return getStudentDirectorEmails();
+    });
+    let responseRequest = updatedRequest;
+    let stageNotificationStatus = stageRecipients.length > 0 ? 'failed' : 'not_configured';
+    if (legacyFacultyHandoff) {
+      // The exact Directors-to-Faculty compatibility workflow retains its
+      // durable provider-outcome state and legacy templates.
+      if (stageRecipients.length === 0) {
+        await prisma.accessRequest.updateMany({
+          where: { id: resolvedParams.id, status: nextStatus, facultyNotificationState: null },
+          data: {
+            facultyNotificationState: 'failed',
+            facultyNotificationError: 'No faculty delivery recipient is configured',
+          },
+        });
+      } else {
+        const delivery = await deliverFacultyNotification({
+          requestId: resolvedParams.id,
+          actor: admin.username,
+          recipients: stageRecipients,
+          vpnModuleEnabled,
+          expectedStatus: nextStatus,
+        });
+        stageNotificationStatus = delivery.status;
+        if (delivery.status === 'delivered') responseRequest = delivery.request;
+      }
+
+      try {
+        const directorEmails = await resolveStageNotificationRecipients(currentStage, getStudentDirectorEmails);
+        if (directorEmails.length > 0) {
+          await sendStudentDirectorNotification(
+            'Request moved to Faculty review',
+            'An access request has been acknowledged and moved to the configured Faculty review stage.',
+            {
+              'Request ID': resolvedParams.id,
+              'Name': updatedRequest.name,
+              'Email': updatedRequest.email,
+              'Directory Username': ldapUsername,
+              'VPN Username': vpnUsername || 'N/A',
+              'Type': accessRequest.isInternal ? 'Internal requester' : 'External requester',
+              'Portal Type': portalType,
+              'Acknowledged By': admin.username,
+              'Acknowledged At': new Date().toLocaleString(),
+            },
+            directorEmails
+          );
+        }
+      } catch (emailError) {
+        console.error('[Acknowledge] Failed to send legacy-stage confirmation:', emailError);
+      }
+    } else if (stageRecipients.length > 0) {
+      try {
+        await sendWorkflowStageNotification({
+          recipients: stageRecipients,
+          requestId: resolvedParams.id,
+          requestName: updatedRequest.name,
+          requestEmail: updatedRequest.email,
+          stageLabel: nextStage.label,
+          advancedBy: admin.username,
+        });
+        stageNotificationStatus = 'delivered';
+      } catch (emailError) {
+        console.error('[Acknowledge] Configured stage notification outcome is unknown:', emailError);
+        stageNotificationStatus = 'delivery_unknown';
+      }
     }
 
-    // Send notification to student directors
-    try {
-      const directorEmails = await getStudentDirectorEmails();
-      
-      if (directorEmails.length > 0) {
-        await sendStudentDirectorNotification(
-          'New Request Moved to Pending Faculty',
-          `A new access request has been acknowledged and moved to pending faculty status.`,
-          {
-            'Request ID': resolvedParams.id,
-            'Name': updatedRequest.name,
-            'Email': updatedRequest.email,
-            'LDAP Username': ldapUsername,
-            'VPN Username': vpnUsername || 'N/A',
-            'Type': accessRequest.isInternal ? 'Internal Student' : 'External Student',
-            'Portal Type': portalType,
-            'Acknowledged By': admin.username,
-            'Acknowledged At': new Date().toLocaleString(),
-          }
-        );
-        console.log('[Acknowledge] Notification sent to student directors:', directorEmails.join(', '));
+    if (!legacyFacultyHandoff) {
+      const persistedState = stageNotificationStatus === 'delivered'
+        ? 'delivered'
+        : stageNotificationStatus === 'not_configured'
+          ? 'failed'
+          : 'delivery_unknown';
+      const persistedError = persistedState === 'delivered'
+        ? null
+        : persistedState === 'failed'
+          ? `No notification recipient is configured for ${nextStage.label}.`
+          : `Delivery to ${nextStage.label} could not be confirmed. Reconcile the provider outcome before retrying.`;
+      const notificationUpdate = await prisma.accessRequest.updateMany({
+        where: {
+          id: resolvedParams.id,
+          status: nextStatus,
+          stageNotificationStageKey: nextStage.key,
+          stageNotificationState: 'delivery_unknown',
+        },
+        data: {
+          stageNotificationState: persistedState,
+          stageNotificationError: persistedError,
+          stageNotificationStateChangedAt: new Date(),
+          version: { increment: 1 },
+        },
+      });
+      if (notificationUpdate.count === 1) {
+        responseRequest = await prisma.accessRequest.findUnique({ where: { id: resolvedParams.id } }) || responseRequest;
       } else {
-        console.warn('[Acknowledge] No student director emails configured');
+        stageNotificationStatus = 'delivery_unknown';
       }
-    } catch (emailError) {
-      console.error('[Acknowledge] Failed to send student director notification:', emailError);
-      // Don't fail the request if email fails
     }
 
     // Log the acknowledgment action
@@ -396,22 +550,33 @@ export async function POST(
         vpnUsername,
         isInternal: accessRequest.isInternal,
         expirationDate,
-        vpnAccountCreated: true,
+        vpnAccountCreated: vpnEntryCreated,
+        vpnModuleEnabled,
+        workflowVersionId: workflow.id,
+        workflowVersion: workflow.version,
+        stageNotificationStatus,
+        legacyFacultyHandoff,
       },
       ipAddress: getIpAddress(request),
       userAgent: getUserAgent(request),
     });
 
-    return NextResponse.json({ 
-      success: true, 
-      request: updatedRequest 
-    });
+    return NextResponse.json(
+      {
+        success: stageNotificationStatus === 'delivered',
+        partial: stageNotificationStatus !== 'delivered',
+        stageNotificationStatus,
+        ...(legacyFacultyHandoff ? { facultyDeliveryStatus: stageNotificationStatus } : {}),
+        request: toSafeAccessRequestResponse(responseRequest),
+      },
+      { status: stageNotificationStatus === 'delivery_unknown' ? 202 : 200 }
+    );
   } catch (error) {
     console.error('Error acknowledging request:', error);
     
     // Log the failed acknowledgment
     const resolvedParams = await params;
-    const { admin } = await checkAdminAuthWithRateLimit(request);
+    const { admin } = await checkReviewAccessWithRateLimit(request);
     if (admin) {
       await logAuditAction({
         action: AuditActions.ACKNOWLEDGE_REQUEST,

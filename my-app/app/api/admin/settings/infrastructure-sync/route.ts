@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { 
   syncInfrastructureAccounts, 
   getLatestInfrastructureSync,
   getInfrastructureSyncHistory,
-  getInfrastructureSyncById 
+  getInfrastructureSyncById,
 } from '@/lib/infrastructure-sync';
 import { appLogger } from '@/lib/logger';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
@@ -14,6 +15,10 @@ export const dynamic = 'force-dynamic';
 
 type InfrastructureSyncBody = {
   dryRun?: boolean;
+  action?: 'run_sync' | 'retry_tagging';
+  syncId?: string;
+  taskId?: string;
+  confirmedDirectoryStateReviewed?: boolean;
 };
 
 /**
@@ -26,9 +31,20 @@ export async function POST(request: NextRequest) {
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+
+    if (!actorHasPermission(admin, 'settings.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
     
     const body = await parseAdminJson<InfrastructureSyncBody>(request);
     const { dryRun = false } = body;
+
+    if (body.action === 'retry_tagging') {
+      return NextResponse.json({
+        error: 'Legacy directory metadata retries are retired. Reconcile portal ownership without an LDAP metadata write.',
+        code: 'DIRECTORY_METADATA_RETRY_RETIRED',
+      }, { status: 409 });
+    }
 
     appLogger.info('Infrastructure sync triggered', { 
       triggeredBy: admin.username,
@@ -53,13 +69,17 @@ export async function POST(request: NextRequest) {
       userAgent: getUserAgent(request),
     });
 
+    const partial = result.status !== 'completed';
     return NextResponse.json({
-      success: true,
-      message: dryRun 
-        ? 'Dry run completed successfully' 
-        : 'Infrastructure sync completed successfully',
+      success: result.status === 'completed',
+      partial,
+      message: dryRun
+        ? partial ? 'Dry run completed with unresolved rows' : 'Dry run completed'
+        : result.status === 'failed'
+          ? 'Infrastructure sync failed; the durable sync record contains recovery details'
+          : partial ? 'Infrastructure sync completed with errors requiring review' : 'Infrastructure sync completed',
       data: result,
-    });
+    }, { status: partial ? 207 : 200 });
   } catch (error) {
     if (isJsonBodyError(error)) {
       return NextResponse.json({ success: false, error: error.message }, { status: error.statusCode });
@@ -96,6 +116,10 @@ export async function GET(request: NextRequest) {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!actorHasPermission(admin, 'settings.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
     
     const { searchParams } = new URL(request.url);

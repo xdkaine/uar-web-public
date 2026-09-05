@@ -38,7 +38,7 @@ export default function EventModal({ isOpen, onClose, onSave, formData, setFormD
 
         <div className="grid gap-6 py-4">
           <div>
-            <h4 className="text-sm font-medium text-gray-500 mb-4 uppercase tracking-wider">Event Information</h4>
+            <h4 className="text-sm font-medium text-muted-foreground mb-4 uppercase tracking-wider">Event Information</h4>
             <div className="space-y-4">
               <div className="grid gap-2">
                 <Label htmlFor="name">
@@ -78,7 +78,7 @@ export default function EventModal({ isOpen, onClose, onSave, formData, setFormD
                 </p>
               </div>
 
-              <div className="flex items-center space-x-2 bg-gray-50 p-4 rounded-lg border border-gray-100">
+              <div className="flex items-center space-x-2 bg-muted/50 p-4 rounded-lg border border-border">
                 <Checkbox
                   id="isActive"
                   checked={formData.isActive}

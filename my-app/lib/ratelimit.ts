@@ -14,12 +14,23 @@ interface RateLimitStore {
 
 const store: RateLimitStore = {};
 
-interface RedisRateLimitClient {
+export interface RedisRateLimitClient {
   incr(key: string): Promise<number>;
+  incrementWithFirstExpiry(key: string, seconds: number): Promise<number>;
   expire(key: string, seconds: number): Promise<unknown>;
   ttl(key: string): Promise<number>;
   get(key: string): Promise<unknown>;
   setWithExpiry(key: string, value: string, seconds: number): Promise<unknown>;
+  setIfAbsentWithExpiry(key: string, value: string, seconds: number): Promise<boolean>;
+  setIfOwnerWithExpiry(
+    ownerKey: string,
+    expectedOwner: string,
+    targetKey: string,
+    value: string,
+    seconds: number,
+    ownerSeconds: number
+  ): Promise<boolean>;
+  deleteIfValue(key: string, expectedValue: string): Promise<boolean>;
   del(key: string): Promise<number>;
   scanKeys(pattern: string): Promise<string[]>;
 }
@@ -29,7 +40,8 @@ interface NodeRedisAdapter {
   expire(key: string, seconds: number): Promise<number | boolean>;
   ttl(key: string): Promise<number>;
   get(key: string): Promise<string | null>;
-  set(key: string, value: string, options: { EX: number }): Promise<string | null>;
+  set(key: string, value: string, options: { EX: number; NX?: boolean }): Promise<string | null>;
+  eval(script: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
   del(key: string): Promise<number>;
   scanIterator?: (options: { MATCH: string; COUNT: number }) => AsyncIterable<string | string[]>;
   scan?: (cursor: string, options: { MATCH: string; COUNT: number }) => Promise<{ cursor: string | number; keys: string[] }>;
@@ -79,10 +91,29 @@ async function initializeRedisClient(): Promise<RedisRateLimitClient> {
     console.log('[RateLimit] Upstash Redis client initialized for rate limiting');
     return {
       incr: (key) => client.incr(key),
+      incrementWithFirstExpiry: async (key, seconds) => Number(await client.eval(
+        "local count = redis.call('incr', KEYS[1]); if count == 1 then redis.call('expire', KEYS[1], ARGV[1]); elseif redis.call('ttl', KEYS[1]) < 0 then redis.call('set', KEYS[1], '1', 'EX', ARGV[1]); count = 1; end; return count",
+        [key],
+        [String(seconds)]
+      )),
       expire: (key, seconds) => client.expire(key, seconds),
       ttl: (key) => client.ttl(key),
       get: (key) => client.get(key),
       setWithExpiry: (key, value, seconds) => client.set(key, value, { ex: seconds }),
+      setIfAbsentWithExpiry: async (key, value, seconds) =>
+        (await client.set(key, value, { ex: seconds, nx: true })) === 'OK',
+      setIfOwnerWithExpiry: async (ownerKey, expectedOwner, targetKey, value, seconds, ownerSeconds) =>
+        Number(await client.eval(
+          "if redis.call('get', KEYS[1]) ~= ARGV[1] or redis.call('exists', KEYS[2]) == 1 then return 0 end; redis.call('expire', KEYS[1], ARGV[4]); redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3]); return 1",
+          [ownerKey, targetKey],
+          [expectedOwner, value, String(seconds), String(ownerSeconds)]
+        )) === 1,
+      deleteIfValue: async (key, expectedValue) =>
+        Number(await client.eval(
+          "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+          [key],
+          [expectedValue]
+        )) === 1,
       del: (key) => client.del(key),
       scanKeys: async (pattern) => {
         const keys: string[] = [];
@@ -111,13 +142,32 @@ async function initializeRedisClient(): Promise<RedisRateLimitClient> {
   });
 
   await client.connect();
-  console.log('[RateLimit] Local Redis client initialized at:', redisUrl);
+  console.log('[RateLimit] Redis client initialized');
   return {
     incr: (key) => nodeClient.incr(key),
+    incrementWithFirstExpiry: async (key, seconds) => Number(await nodeClient.eval(
+      "local count = redis.call('incr', KEYS[1]); if count == 1 then redis.call('expire', KEYS[1], ARGV[1]); elseif redis.call('ttl', KEYS[1]) < 0 then redis.call('set', KEYS[1], '1', 'EX', ARGV[1]); count = 1; end; return count",
+      { keys: [key], arguments: [String(seconds)] }
+    )),
     expire: (key, seconds) => nodeClient.expire(key, seconds),
     ttl: (key) => nodeClient.ttl(key),
     get: (key) => nodeClient.get(key),
     setWithExpiry: (key, value, seconds) => nodeClient.set(key, value, { EX: seconds }),
+    setIfAbsentWithExpiry: async (key, value, seconds) =>
+      (await nodeClient.set(key, value, { EX: seconds, NX: true })) === 'OK',
+    setIfOwnerWithExpiry: async (ownerKey, expectedOwner, targetKey, value, seconds, ownerSeconds) =>
+      Number(await nodeClient.eval(
+        "if redis.call('get', KEYS[1]) ~= ARGV[1] or redis.call('exists', KEYS[2]) == 1 then return 0 end; redis.call('expire', KEYS[1], ARGV[4]); redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3]); return 1",
+        {
+          keys: [ownerKey, targetKey],
+          arguments: [expectedOwner, value, String(seconds), String(ownerSeconds)],
+        }
+      )) === 1,
+    deleteIfValue: async (key, expectedValue) =>
+      Number(await nodeClient.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+        { keys: [key], arguments: [expectedValue] }
+      )) === 1,
     del: (key) => nodeClient.del(key),
     scanKeys: async (pattern) => {
       const keys: string[] = [];
@@ -174,6 +224,17 @@ async function getRedisClient(): Promise<RedisRateLimitClient | null> {
   }
 
   return redisInitPromise;
+}
+
+/**
+ * Shared Redis control-plane client for auth safeguards that must agree
+ * across portal replicas. Unlike development rate-limit fallback, callers of
+ * this helper require Redis and therefore fail closed when it is unavailable.
+ */
+export async function getRequiredAuthRedisClient(): Promise<RedisRateLimitClient> {
+  const client = await getRedisClient();
+  if (!client) throw new RateLimitUnavailableError('Redis is required for the authentication control plane');
+  return client;
 }
 
 if (!isRedisEnabled) {
@@ -645,7 +706,8 @@ export function getClientIp(request: Request): string {
   if (process.env.TRUST_PROXY_HEADERS === 'true') {
     const forwarded = request.headers.get('x-forwarded-for');
     if (forwarded) {
-      return forwarded.split(',')[0].trim() || 'unknown';
+      const hops = forwarded.split(',').map((hop) => hop.trim()).filter(Boolean);
+      return hops[hops.length - 1] || 'unknown';
     }
 
     const realIp = request.headers.get('x-real-ip');
@@ -655,7 +717,8 @@ export function getClientIp(request: Request): string {
 
     const vercelIp = request.headers.get('x-vercel-forwarded-for');
     if (vercelIp) {
-      return vercelIp.split(',')[0].trim() || 'unknown';
+      const hops = vercelIp.split(',').map((hop) => hop.trim()).filter(Boolean);
+      return hops[hops.length - 1] || 'unknown';
     }
   }
 
@@ -698,8 +761,8 @@ export const RateLimitPresets = {
    * Login attempts: 20 per 15 minutes (increased to accommodate typos)
    */
   login: {
-    maxRequests: 200,
-    windowMs: 15 * 60 * 1000,
+    maxRequests: Number.parseInt(process.env.AUTH_LOGIN_MAX_ATTEMPTS || '20', 10),
+    windowMs: Number.parseInt(process.env.AUTH_LOGIN_WINDOW_MS || String(15 * 60 * 1000), 10),
   },
 
   /**
@@ -732,6 +795,12 @@ export const RateLimitPresets = {
   adminOperations: {
     maxRequests: 400,
     windowMs: 60 * 1000,
+  },
+
+  /** Message-template tests send real SMTP mail to the current administrator. */
+  messageTemplateTest: {
+    maxRequests: 5,
+    windowMs: 60 * 60 * 1000,
   },
 
   /**

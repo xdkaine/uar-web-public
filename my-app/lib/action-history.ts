@@ -142,6 +142,133 @@ function addDisplayName(values: Map<string, string>, key?: string | null, name?:
   values.set(lower ? currentKey.toLowerCase() : currentKey, currentName);
 }
 
+type LifecycleLink = {
+  id: string;
+  relatedRequestId?: string | null;
+  relatedBatchAccountItemId?: string | null;
+};
+
+export function activityIsRepresentedByAudit(
+  lifecycleActionId: string | null | undefined,
+  auditedLifecycleActionIds: ReadonlySet<string>,
+): boolean {
+  return Boolean(lifecycleActionId && auditedLifecycleActionIds.has(lifecycleActionId));
+}
+
+export function adActivityOwnershipLinks(
+  accountId: string,
+  lifecycleActionId: string | null | undefined,
+  lifecycleActionsById: ReadonlyMap<string, LifecycleLink>,
+  resolvedRequestIds: readonly string[],
+): { relatedRequestId?: string; relatedBatchAccountItemId?: string } {
+  const action = lifecycleActionId ? lifecycleActionsById.get(lifecycleActionId) : undefined;
+  return {
+    relatedRequestId: action?.relatedRequestId
+      ?? (resolvedRequestIds.includes(accountId) ? accountId : undefined),
+    relatedBatchAccountItemId: action?.relatedBatchAccountItemId ?? undefined,
+  };
+}
+
+type VpnStatusCorrelationEvidence = Pick<
+  VPNAccountStatusLog,
+  'id' | 'accountId' | 'newStatus' | 'changedBy' | 'createdAt' | 'lifecycleActionId'
+>;
+
+type VpnActivityCorrelationEvidence = Pick<
+  VPNAccountActivityLog,
+  'id' | 'accountId' | 'actionType' | 'performedBy' | 'createdAt' | 'lifecycleActionId'
+>;
+
+function vpnStatusForActivity(actionType: string): string | null {
+  switch (actionType.trim().toLowerCase()) {
+    case 'revoked':
+      return 'revoked';
+    case 'restored':
+    case 'enabled':
+      return 'active';
+    case 'deleted':
+      return 'deleted';
+    case 'disabled':
+      return 'disabled';
+    default:
+      return null;
+  }
+}
+
+/**
+ * Correlate duplicate VPN projections without hiding independent mutations.
+ * New lifecycle writes share an exact lifecycleActionId. Legacy rows are
+ * paired only when the account/status/actor/time match is one-to-one.
+ */
+export function vpnStatusIdsRepresentedByActivity(
+  statuses: readonly VpnStatusCorrelationEvidence[],
+  activities: readonly VpnActivityCorrelationEvidence[],
+): Set<string> {
+  const represented = new Set<string>();
+  const usedActivityIds = new Set<string>();
+
+  for (const status of statuses) {
+    if (!status.lifecycleActionId) continue;
+    const candidates = activities.filter((activity) =>
+      activity.accountId === status.accountId
+      && activity.lifecycleActionId === status.lifecycleActionId
+    );
+    if (candidates.length !== 1) continue;
+    const statusCandidates = statuses.filter((candidate) =>
+      candidate.accountId === candidates[0].accountId
+      && candidate.lifecycleActionId === candidates[0].lifecycleActionId
+    );
+    if (statusCandidates.length !== 1) continue;
+    represented.add(status.id);
+    usedActivityIds.add(candidates[0].id);
+  }
+
+  const legacyCandidates = new Map<string, VpnActivityCorrelationEvidence[]>();
+  for (const status of statuses) {
+    if (status.lifecycleActionId || represented.has(status.id)) continue;
+    legacyCandidates.set(status.id, activities.filter((activity) =>
+      !usedActivityIds.has(activity.id)
+      && activity.accountId === status.accountId
+      && activity.performedBy === status.changedBy
+      && vpnStatusForActivity(activity.actionType) === status.newStatus.trim().toLowerCase()
+      && Math.abs(activity.createdAt.getTime() - status.createdAt.getTime()) <= 5_000
+    ));
+  }
+
+  for (const status of statuses) {
+    const candidates = legacyCandidates.get(status.id);
+    if (candidates?.length !== 1) continue;
+    const [activity] = candidates;
+    const competingStatuses = statuses.filter((candidate) =>
+      legacyCandidates.get(candidate.id)?.some((item) => item.id === activity.id)
+    );
+    if (competingStatuses.length !== 1) continue;
+    represented.add(status.id);
+    usedActivityIds.add(activity.id);
+  }
+
+  return represented;
+}
+
+function requestMilestoneKeysForLifecycleAction(actionType: string): string[] {
+  switch (actionType) {
+    case 'disable_ad':
+      return ['ad-disabled'];
+    case 'enable_ad':
+      return ['ad-enabled'];
+    case 'revoke_vpn':
+      return ['vpn-revoked'];
+    case 'restore_vpn':
+      return ['vpn-restored'];
+    case 'disable_both':
+      return ['ad-disabled', 'vpn-revoked'];
+    case 'enable_both':
+      return ['ad-enabled', 'vpn-restored'];
+    default:
+      return [];
+  }
+}
+
 export async function logActionHistoryEvent(input: LogHistoryEventInput): Promise<void> {
   try {
     await logAuditAction({
@@ -386,10 +513,10 @@ function normalizeRequestComment(comment: RequestComment): ActionHistoryItem {
   });
 }
 
-function requestMilestones(request: AccessRequest): ActionHistoryItem[] {
+function requestMilestones(request: AccessRequest, suppressedKeys: ReadonlySet<string>): ActionHistoryItem[] {
   const items: ActionHistoryItem[] = [];
   const add = (key: string, date: Date | string | null | undefined, title: string, actor: string, details?: Record<string, unknown>, outcome: AuditOutcome = 'success') => {
-    if (!date) return;
+    if (!date || suppressedKeys.has(key)) return;
     items.push(makeItem({
       id: `request-state:${request.id}:${key}`,
       source: 'request_state',
@@ -567,6 +694,8 @@ export async function getActionHistory(query: HistoryQuery): Promise<ActionHisto
     return subjectName ? { ...item, subjectName } : item;
   };
   const auditedLifecycleEvents = new Set<string>();
+  const auditedLifecycleActionIds = new Set<string>();
+  const auditedRequestMilestones = new Map<string, Set<string>>();
   const auditedSyncMatchIds = new Set<string>();
   const auditedOffboardLogIds = new Set<string>();
 
@@ -579,13 +708,30 @@ export async function getActionHistory(query: HistoryQuery): Promise<ActionHisto
     if (log.relatedLifecycleActionId && lifecycleEvent) {
       auditedLifecycleEvents.add(`${log.relatedLifecycleActionId}:${lifecycleEvent}`);
     }
+    if (log.relatedLifecycleActionId) auditedLifecycleActionIds.add(log.relatedLifecycleActionId);
+    if (
+      log.relatedRequestId
+      && lifecycleEvent === 'completed'
+      && log.success
+      && log.outcome !== 'failure'
+    ) {
+      const actionType = stringDetail(details, 'actionType');
+      if (actionType) {
+        const keys = auditedRequestMilestones.get(log.relatedRequestId) ?? new Set<string>();
+        requestMilestoneKeysForLifecycleAction(actionType).forEach((key) => keys.add(key));
+        auditedRequestMilestones.set(log.relatedRequestId, keys);
+      }
+    }
     if (syncMatchId) auditedSyncMatchIds.add(syncMatchId);
     if (offboardLogId) auditedOffboardLogIds.add(offboardLogId);
   });
 
   items.push(...auditLogs.map(normalizeAuditLog));
   items.push(...requestComments.map(normalizeRequestComment));
-  requests.forEach((request) => items.push(...requestMilestones(request)));
+  requests.forEach((request) => items.push(...requestMilestones(
+    request,
+    auditedRequestMilestones.get(request.id) ?? new Set<string>(),
+  )));
 
   lifecycleActions.forEach((action: LifecycleActionWithHistory) => {
     action.history.forEach((history) => {
@@ -616,7 +762,19 @@ export async function getActionHistory(query: HistoryQuery): Promise<ActionHisto
     });
   });
 
-  adActivityLogs.forEach((log: ADAccountActivityLog) => items.push(makeItem({
+  const lifecycleActionsById = new Map<string, LifecycleLink>(
+    lifecycleActions.map((action) => [action.id, action]),
+  );
+
+  adActivityLogs.forEach((log: ADAccountActivityLog) => {
+    if (activityIsRepresentedByAudit(log.lifecycleActionId, auditedLifecycleActionIds)) return;
+    const ownership = adActivityOwnershipLinks(
+      log.accountId,
+      log.lifecycleActionId,
+      lifecycleActionsById,
+      subjects.requestIds,
+    );
+    items.push(makeItem({
     id: `ad-activity:${log.id}`,
     source: 'ad_activity',
     sourceId: log.id,
@@ -628,13 +786,23 @@ export async function getActionHistory(query: HistoryQuery): Promise<ActionHisto
     outcome: log.ldapSuccess || !log.ldapError ? 'success' : 'failure',
     subjectUsername: log.accountUsername,
     subjectEmail: log.accountEmail || undefined,
-    relatedRequestId: log.accountId,
+    relatedRequestId: ownership.relatedRequestId,
     relatedLifecycleActionId: log.lifecycleActionId || undefined,
     isDerived: true,
-    details: sanitizeAuditDetails({ reason: log.reason, notes: log.notes, ldapSuccess: log.ldapSuccess, ldapError: log.ldapError }) as Record<string, unknown>,
-  })));
+    details: sanitizeAuditDetails({
+      reason: log.reason,
+      notes: log.notes,
+      ldapSuccess: log.ldapSuccess,
+      ldapError: log.ldapError,
+      relatedBatchAccountItemId: ownership.relatedBatchAccountItemId,
+    }) as Record<string, unknown>,
+    }));
+  });
 
-  vpnStatusLogs.forEach((log: VPNAccountStatusLog) => items.push(makeItem({
+  const representedVpnStatusIds = vpnStatusIdsRepresentedByActivity(vpnStatusLogs, vpnActivityLogs);
+  vpnStatusLogs.forEach((log: VPNAccountStatusLog) => {
+    if (representedVpnStatusIds.has(log.id)) return;
+    items.push(makeItem({
     id: `vpn-status:${log.id}`,
     source: 'vpn_status',
     sourceId: log.id,
@@ -647,10 +815,13 @@ export async function getActionHistory(query: HistoryQuery): Promise<ActionHisto
     outcome: 'success',
     relatedVpnAccountId: log.accountId,
     isDerived: true,
-    details: sanitizeAuditDetails({ oldStatus: log.oldStatus, newStatus: log.newStatus, reason: log.reason }) as Record<string, unknown>,
-  })));
+      details: sanitizeAuditDetails({ oldStatus: log.oldStatus, newStatus: log.newStatus, reason: log.reason }) as Record<string, unknown>,
+    }));
+  });
 
-  vpnActivityLogs.forEach((log: VPNAccountActivityLog) => items.push(makeItem({
+  vpnActivityLogs.forEach((log: VPNAccountActivityLog) => {
+    if (activityIsRepresentedByAudit(log.lifecycleActionId, auditedLifecycleActionIds)) return;
+    items.push(makeItem({
     id: `vpn-activity:${log.id}`,
     source: 'vpn_activity',
     sourceId: log.id,
@@ -665,8 +836,9 @@ export async function getActionHistory(query: HistoryQuery): Promise<ActionHisto
     relatedVpnAccountId: log.accountId,
     relatedLifecycleActionId: log.lifecycleActionId || undefined,
     isDerived: true,
-    details: sanitizeAuditDetails({ reason: log.reason, oldPortalType: log.oldPortalType, newPortalType: log.newPortalType, notes: log.notes }) as Record<string, unknown>,
-  })));
+      details: sanitizeAuditDetails({ reason: log.reason, oldPortalType: log.oldPortalType, newPortalType: log.newPortalType, notes: log.notes }) as Record<string, unknown>,
+    }));
+  });
 
   adMatches.forEach((match: ADAccountMatch) => {
     if (auditedSyncMatchIds.has(match.id)) return;

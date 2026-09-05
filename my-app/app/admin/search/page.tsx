@@ -1,15 +1,66 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useToast } from '@/hooks/useToast';
 import RequestDetailModal from '@/components/admin/RequestDetailModal';
+import { ClientLocalDate } from '@/components/admin/ClientLocalDate';
 import { useAdminPageTracking } from '@/hooks/useAdminPageTracking';
+import { useAdminNavigation } from '@/components/admin/AdminShell';
+import {
+  getAvailableAdminSearchTypes,
+  type AdminSearchType,
+} from '@/lib/rbac/search-access';
+import {
+  AlertTriangle,
+  FileText,
+  History,
+  LifeBuoy,
+  Loader2,
+  Search,
+  ShieldCheck,
+  Wifi,
+} from 'lucide-react';
+
+const SEARCH_DEBOUNCE_MS = 350;
 
 interface SearchResult {
   id: string;
   type: string;
-  [key: string]: any;
+  // Fields populated by /api/admin/search depending on result type
+  name?: string;
+  email?: string;
+  username?: string | null;
+  status?: string;
+  isInternal?: boolean;
+  event?: string;
+  institution?: string;
+  createdAt?: string;
+  actionType?: string;
+  targetAccountType?: string;
+  targetUsername?: string;
+  reason?: string;
+  requestedBy?: string;
+  relatedRequestId?: string | null;
+  relatedTicketId?: string | null;
+  completedAt?: string | null;
+  fullName?: string;
+  portalType?: string;
+  expiresAt?: string | null;
+  revokedReason?: string | null;
+  ticketNumber?: string;
+  subject?: string;
+  category?: string;
+  priority?: string;
+  requesterName?: string;
+  requesterEmail?: string;
+  assignedTo?: string | null;
+  action?: string;
+  targetId?: string | null;
+  targetType?: string | null;
+  timestamp?: string;
+  ipAddress?: string | null;
+  review?: { workflow: { version: number; warning: string | null }; currentStage: { label: string } | null };
 }
 
 interface SearchResults {
@@ -23,8 +74,130 @@ interface SearchResults {
   searchType: string;
 }
 
+const TYPE_OPTIONS: Array<{ value: AdminSearchType; label: string }> = [
+  { value: 'all', label: 'All' },
+  { value: 'requests', label: 'Requests' },
+  { value: 'lifecycle', label: 'Lifecycle' },
+  { value: 'vpn', label: 'VPN' },
+  { value: 'tickets', label: 'Tickets' },
+  { value: 'audit', label: 'Audit' },
+];
+
+function statusBadgeClass(status?: string): string {
+  const map: Record<string, string> = {
+    pending_verification: 'bg-muted text-foreground',
+    pending_student_directors: 'bg-blue-100 dark:bg-blue-950/60 text-blue-800 dark:text-blue-200',
+    pending_faculty: 'bg-yellow-100 dark:bg-yellow-950/60 text-yellow-800 dark:text-yellow-200',
+    approved: 'bg-green-100 dark:bg-green-950/60 text-green-800 dark:text-green-200',
+    rejected: 'bg-red-100 dark:bg-red-950/60 text-red-800 dark:text-red-200',
+    offboarded: 'bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-100 border border-slate-200 dark:border-slate-700',
+    queued: 'bg-blue-100 dark:bg-blue-950/60 text-blue-800 dark:text-blue-200',
+    processing: 'bg-yellow-100 dark:bg-yellow-950/60 text-yellow-800 dark:text-yellow-200',
+    completed: 'bg-green-100 dark:bg-green-950/60 text-green-800 dark:text-green-200',
+    failed: 'bg-red-100 dark:bg-red-950/60 text-red-800 dark:text-red-200',
+    cancelled: 'bg-border text-muted-foreground',
+    active: 'bg-green-100 dark:bg-green-950/60 text-green-800 dark:text-green-200',
+    revoked: 'bg-red-100 dark:bg-red-950/60 text-red-800 dark:text-red-200',
+    expired: 'bg-muted text-foreground',
+    open: 'bg-blue-100 dark:bg-blue-950/60 text-blue-800 dark:text-blue-200',
+    in_progress: 'bg-purple-100 dark:bg-purple-950/60 text-purple-800 dark:text-purple-200',
+    closed: 'bg-muted text-foreground',
+  };
+  return map[status ?? ''] || 'bg-muted text-foreground';
+}
+
+function StatusBadge({ status, label }: { status?: string; label?: string }) {
+  if (!status) return null;
+  return (
+    <span className={`inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${statusBadgeClass(status)}`}>
+      {(label || status.replace(/_/g, ' ')).toUpperCase()}
+    </span>
+  );
+}
+
+function typeIcon(type: string, className = 'h-4 w-4') {
+  switch (type) {
+    case 'lifecycle_action':
+      return <History className={`${className} text-purple-500`} />;
+    case 'vpn_account':
+      return <Wifi className={`${className} text-green-500`} />;
+    case 'support_ticket':
+      return <LifeBuoy className={`${className} text-yellow-600 dark:text-yellow-400`} />;
+    case 'audit_log':
+      return <ShieldCheck className={`${className} text-muted-foreground`} />;
+    default:
+      return <FileText className={`${className} text-blue-500`} />;
+  }
+}
+
+function resultTitle(item: SearchResult): string {
+  if (item.type === 'support_ticket') return `#${item.ticketNumber} · ${item.subject}`;
+  if (item.type === 'access_request') return item.name || item.id;
+  if (item.type === 'lifecycle_action') return `${(item.actionType || '').replace(/_/g, ' ').toUpperCase()} — ${item.targetUsername}`;
+  if (item.type === 'vpn_account') return item.username || item.id;
+  return item.action || item.id;
+}
+
+function resultSubtitleParts(item: SearchResult): string[] {
+  const values: Record<string, Array<string | undefined | null>> = {
+    access_request: [item.email, item.username && `@${item.username}`, item.event],
+    lifecycle_action: [item.reason, item.requestedBy && `by ${item.requestedBy}`],
+    vpn_account: [item.fullName, item.email, item.portalType],
+    support_ticket: [item.requesterName && `@${item.requesterName}`, item.category],
+    audit_log: [item.username && `@${item.username}`, item.targetId, item.ipAddress],
+  };
+  return (values[item.type] ?? []).filter((value): value is string => Boolean(value));
+}
+
+function ResultRow({
+  item,
+  onOpen,
+}: {
+  item: SearchResult;
+  onOpen?: () => void;
+}) {
+  const title = resultTitle(item);
+  const subtitleParts = resultSubtitleParts(item);
+
+  const when = item.timestamp || item.createdAt;
+
+  const body = (
+    <div className="group flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 transition-colors hover:border-border hover:bg-muted/40">
+      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-muted/70">
+        {typeIcon(item.type)}
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-medium text-foreground" title={title}>
+          {title}
+        </p>
+        {subtitleParts.length > 0 && (
+          <p className="truncate text-xs text-muted-foreground">
+            {subtitleParts.join(' · ')}
+          </p>
+        )}
+      </div>
+        <StatusBadge status={item.status} label={item.review?.currentStage?.label} />
+      {when && (
+        <span className="hidden shrink-0 text-xs text-muted-foreground sm:block">
+          <ClientLocalDate value={when} format="date" />
+        </span>
+      )}
+    </div>
+  );
+
+  if (onOpen) {
+    return (
+      <button type="button" onClick={onOpen} className="w-full text-left">
+        {body}
+      </button>
+    );
+  }
+  return body;
+}
+
 export default function GlobalSearchPage() {
   const { showToast } = useToast();
+  const navigation = useAdminNavigation();
   useAdminPageTracking('Admin Global Search', 'navigation');
 
   useEffect(() => {
@@ -32,552 +205,231 @@ export default function GlobalSearchPage() {
   }, []);
 
   const [searchQuery, setSearchQuery] = useState('');
-  const [searchType, setSearchType] = useState<'all' | 'requests' | 'lifecycle' | 'vpn' | 'tickets' | 'audit'>('all');
+  const [searchType, setSearchType] = useState<AdminSearchType>('all');
   const [results, setResults] = useState<SearchResults | null>(null);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const availableSearchTypes = useMemo(
+    () => getAvailableAdminSearchTypes(navigation?.permissions ?? new Set<string>()),
+    [navigation?.permissions]
+  );
+  const availableTypeOptions = useMemo(
+    () => TYPE_OPTIONS.filter(
+      (option) => option.value === 'all' || availableSearchTypes.includes(option.value)
+    ),
+    [availableSearchTypes]
+  );
+  const hasOperationalSearchGap = navigation?.state === 'ready' && availableSearchTypes.length === 0;
 
-  // Collapsible state for each category - all collapsed by default
-  const [collapsedCategories, setCollapsedCategories] = useState({
-    accessRequests: true,
-    lifecycleActions: true,
-    vpnAccounts: true,
-    supportTickets: true,
-    auditLogs: true,
-  });
-
-  const handleSearch = async (e?: React.FormEvent) => {
-    e?.preventDefault();
-
-    if (!searchQuery || searchQuery.length < 2) {
-      showToast('Please enter at least 2 characters to search', 'error');
-      return;
+  useEffect(() => {
+    if (searchType !== 'all' && !availableSearchTypes.includes(searchType)) {
+      setSearchType('all');
     }
+  }, [availableSearchTypes, searchType]);
 
-    setLoading(true);
-    setSearched(true);
-
-    try {
-      const res = await fetch(`/api/admin/search?q=${encodeURIComponent(searchQuery)}&type=${searchType}`);
-
-      if (!res.ok) {
-        const error = await res.json();
-        throw new Error(error.error || 'Search failed');
+  const runSearch = useCallback(
+    async (query: string, type: AdminSearchType) => {
+      const trimmed = query.trim();
+      if (trimmed.length < 2) {
+        setResults(null);
+        setSearched(false);
+        return;
       }
 
-      const data = await res.json();
-      setResults(data);
-    } catch (error) {
-      console.error('Search error:', error);
-      showToast(error instanceof Error ? error.message : 'Search failed', 'error');
-    } finally {
-      setLoading(false);
-    }
-  };
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
 
-  const getStatusBadge = (status: string, type: string) => {
-    const statusColors: Record<string, string> = {
-      // Access Requests
-      pending_verification: 'bg-gray-100 text-gray-800',
-      pending_student_directors: 'bg-blue-100 text-blue-800',
-      pending_faculty: 'bg-yellow-100 text-yellow-800',
-      approved: 'bg-green-100 text-green-800',
-      rejected: 'bg-red-100 text-red-800',
-      offboarded: 'bg-slate-100 text-slate-800',
-
-      // Lifecycle Actions
-      pending: 'bg-gray-100 text-gray-800',
-      queued: 'bg-blue-100 text-blue-800',
-      processing: 'bg-yellow-100 text-yellow-800',
-      completed: 'bg-green-100 text-green-800',
-      failed: 'bg-red-100 text-red-800',
-      cancelled: 'bg-gray-300 text-gray-700',
-
-      // VPN Accounts
-      active: 'bg-green-100 text-green-800',
-      revoked: 'bg-red-100 text-red-800',
-      expired: 'bg-gray-100 text-gray-800',
-
-      // Support Tickets
-      open: 'bg-blue-100 text-blue-800',
-      in_progress: 'bg-yellow-100 text-yellow-800',
-      resolved: 'bg-green-100 text-green-800',
-      closed: 'bg-gray-100 text-gray-800',
-    };
-
-    return (
-      <span className={`px-2 py-1 rounded-full text-xs font-semibold ${statusColors[status] || 'bg-gray-100 text-gray-800'}`}>
-        {status.replace(/_/g, ' ').toUpperCase()}
-      </span>
-    );
-  };
-
-  const getTypeIcon = (type: string) => {
-    const icons: Record<string, React.ReactElement> = {
-      access_request: (
-        <svg className="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-        </svg>
-      ),
-      lifecycle_action: (
-        <svg className="w-5 h-5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-        </svg>
-      ),
-      vpn_account: (
-        <svg className="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-        </svg>
-      ),
-      support_ticket: (
-        <svg className="w-5 h-5 text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z" />
-        </svg>
-      ),
-      audit_log: (
-        <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-        </svg>
-      ),
-    };
-    return icons[type] || icons.access_request;
-  };
-
-  const getTypeLabel = (type: string) => {
-    const labels: Record<string, string> = {
-      access_request: 'Access Request',
-      lifecycle_action: 'Lifecycle Action',
-      vpn_account: 'VPN Account',
-      support_ticket: 'Support Ticket',
-      audit_log: 'Audit Log',
-    };
-    return labels[type] || type;
-  };
-
-  const toggleCategory = (category: keyof typeof collapsedCategories) => {
-    setCollapsedCategories(prev => ({
-      ...prev,
-      [category]: !prev[category],
-    }));
-  };
-
-  const renderAccessRequest = (item: SearchResult) => (
-    <div
-      key={item.id}
-      onClick={() => setSelectedRequestId(item.id)}
-      className="bg-white border-2 border-gray-200 rounded-lg p-4 hover:shadow-lg transition-shadow cursor-pointer"
-    >
-      <div className="flex items-start gap-3">
-        {getTypeIcon('access_request')}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-2 flex-wrap">
-            <h4 className="font-semibold text-lg text-gray-900 break-words">{item.name}</h4>
-            {getStatusBadge(item.status, 'access_request')}
-            {item.isInternal && (
-              <span className="px-2 py-1 bg-blue-50 text-blue-700 rounded text-xs font-semibold">INTERNAL</span>
-            )}
-          </div>
-          <div className="space-y-1 text-sm text-gray-700">
-            <p className="break-words"><span className="font-semibold text-gray-900">Email:</span> {item.email}</p>
-            {item.username && <p className="break-words"><span className="font-semibold text-gray-900">Username:</span> {item.username}</p>}
-            {item.event && <p className="break-words"><span className="font-semibold text-gray-900">Event:</span> {item.event}</p>}
-            {item.institution && <p className="break-words"><span className="font-semibold text-gray-900">Institution:</span> {item.institution}</p>}
-            <p className="text-xs text-gray-600 break-all">
-              <span className="font-semibold text-gray-800">ID:</span> {item.id} |
-              <span className="ml-2">{new Date(item.createdAt).toLocaleString()}</span>
-            </p>
-          </div>
-        </div>
-      </div>
-    </div>
+      setLoading(true);
+      try {
+        const res = await fetch(
+          `/api/admin/search?q=${encodeURIComponent(trimmed)}&type=${type}`,
+          { signal: controller.signal }
+        );
+        if (!res.ok) {
+          const error = await res.json().catch(() => ({ error: 'Search failed' }));
+          throw new Error(error.error || 'Search failed');
+        }
+        const data: SearchResults = await res.json();
+        setResults(data);
+        setSearched(true);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+        console.error('Search error:', error);
+        showToast(error instanceof Error ? error.message : 'Search failed', 'error');
+      } finally {
+        setLoading((currentlyLoading) => (
+          abortRef.current === controller ? false : currentlyLoading
+        ));
+      }
+    },
+    [showToast]
   );
 
-  const renderLifecycleAction = (item: SearchResult) => (
-    <Link href={`/admin?tab=lifecycle`} key={item.id}>
-      <div className="bg-white border-2 border-gray-200 rounded-lg p-4 hover:shadow-lg transition-shadow cursor-pointer">
-        <div className="flex items-start gap-3">
-          {getTypeIcon('lifecycle_action')}
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-2 flex-wrap">
-              <h4 className="font-semibold text-lg text-gray-900 break-words">{item.actionType.replace(/_/g, ' ').toUpperCase()}</h4>
-              {getStatusBadge(item.status, 'lifecycle_action')}
-              <span className="px-2 py-1 bg-gray-100 text-gray-700 rounded text-xs font-semibold">
-                {item.targetAccountType}
-              </span>
-            </div>
-            <div className="space-y-1 text-sm text-gray-700">
-              <p className="break-words"><span className="font-semibold text-gray-900">Target:</span> {item.targetUsername}</p>
-              <p className="break-words"><span className="font-semibold text-gray-900">Reason:</span> {item.reason}</p>
-              <p className="break-words"><span className="font-semibold text-gray-900">Requested By:</span> {item.requestedBy}</p>
-              {item.relatedRequestId && (
-                <p className="break-all"><span className="font-semibold text-gray-900">Request ID:</span> {item.relatedRequestId}</p>
-              )}
-              {item.relatedTicketId && (
-                <p className="break-all"><span className="font-semibold text-gray-900">Ticket ID:</span> {item.relatedTicketId}</p>
-              )}
-              <p className="text-xs text-gray-600 break-all">
-                <span className="font-semibold text-gray-800">ID:</span> {item.id} |
-                <span className="ml-2">{new Date(item.createdAt).toLocaleString()}</span>
-                {item.completedAt && <span className="ml-2">Completed: {new Date(item.completedAt).toLocaleString()}</span>}
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
-    </Link>
-  );
+  // Debounced live search: fires as the user types and when the filter changes.
+  useEffect(() => {
+    const handle = setTimeout(() => {
+      void runSearch(searchQuery, searchType);
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery, searchType]);
 
-  const renderVPNAccount = (item: SearchResult) => (
-    <Link href={`/admin?tab=vpn`} key={item.id}>
-      <div className="bg-white border-2 border-gray-200 rounded-lg p-4 hover:shadow-lg transition-shadow cursor-pointer">
-        <div className="flex items-start gap-3">
-          {getTypeIcon('vpn_account')}
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-2 flex-wrap">
-              <h4 className="font-semibold text-lg text-gray-900 break-words">{item.username}</h4>
-              {getStatusBadge(item.status, 'vpn_account')}
-              <span className="px-2 py-1 bg-purple-100 text-purple-700 rounded text-xs font-semibold">
-                {item.portalType}
-              </span>
-            </div>
-            <div className="space-y-1 text-sm text-gray-700">
-              <p className="break-words"><span className="font-semibold text-gray-900">Name:</span> {item.fullName}</p>
-              <p className="break-words"><span className="font-semibold text-gray-900">Email:</span> {item.email}</p>
-              {item.expiresAt && (
-                <p><span className="font-semibold text-gray-900">Expires:</span> {new Date(item.expiresAt).toLocaleDateString()}</p>
-              )}
-              {item.revokedReason && (
-                <p className="break-words"><span className="font-semibold text-gray-900">Revoked Reason:</span> {item.revokedReason}</p>
-              )}
-              <p className="text-xs text-gray-600 break-all">
-                <span className="font-semibold text-gray-800">ID:</span> {item.id} |
-                <span className="ml-2">Created: {new Date(item.createdAt).toLocaleString()}</span>
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
-    </Link>
-  );
+  useEffect(() => () => abortRef.current?.abort(), []);
 
-  const renderSupportTicket = (item: SearchResult) => (
-    <Link href={`/admin?tab=tickets`} key={item.id}>
-      <div className="bg-white border-2 border-gray-200 rounded-lg p-4 hover:shadow-lg transition-shadow cursor-pointer">
-        <div className="flex items-start gap-3">
-          {getTypeIcon('support_ticket')}
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-2 flex-wrap">
-              <h4 className="font-semibold text-lg text-gray-900">#{item.ticketNumber}</h4>
-              {getStatusBadge(item.status, 'support_ticket')}
-              <span className={`px-2 py-1 rounded text-xs font-semibold ${item.priority === 'high' ? 'bg-red-100 text-red-700' :
-                item.priority === 'medium' ? 'bg-yellow-100 text-yellow-700' :
-                  'bg-gray-100 text-gray-700'
-                }`}>
-                {item.priority.toUpperCase()}
-              </span>
-            </div>
-            <div className="space-y-1 text-sm text-gray-700">
-              <p className="font-semibold text-gray-900 break-words">{item.subject}</p>
-              <p className="break-words"><span className="font-semibold text-gray-900">Category:</span> {item.category}</p>
-              <p className="break-words"><span className="font-semibold text-gray-900">Requester:</span> {item.requesterName} ({item.requesterEmail})</p>
-              {item.assignedTo && <p className="break-words"><span className="font-semibold text-gray-900">Assigned To:</span> {item.assignedTo}</p>}
-              <p className="text-xs text-gray-600 break-all">
-                <span className="font-semibold text-gray-800">ID:</span> {item.id} |
-                <span className="ml-2">{new Date(item.createdAt).toLocaleString()}</span>
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
-    </Link>
-  );
-
-  const renderAuditLog = (item: SearchResult) => (
-    <div key={item.id} className="bg-white border-2 border-gray-200 rounded-lg p-4">
-      <div className="flex items-start gap-3">
-        {getTypeIcon('audit_log')}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-2 flex-wrap">
-            <h4 className="font-semibold text-lg text-gray-900 break-words">{item.action}</h4>
-            <span className="px-2 py-1 bg-indigo-100 text-indigo-700 rounded text-xs font-semibold">
-              {item.category}
-            </span>
-          </div>
-          <div className="space-y-1 text-sm text-gray-700">
-            <p className="break-words"><span className="font-semibold text-gray-900">User:</span> {item.username}</p>
-            {item.targetId && <p className="break-all"><span className="font-semibold text-gray-900">Target ID:</span> {item.targetId}</p>}
-            {item.targetType && <p className="break-words"><span className="font-semibold text-gray-900">Target Type:</span> {item.targetType}</p>}
-            <p className="break-words"><span className="font-semibold text-gray-900">IP Address:</span> {item.ipAddress}</p>
-            <p className="text-xs text-gray-600">
-              {new Date(item.timestamp).toLocaleString()}
-            </p>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
+  const groups = results
+    ? ([
+        { key: 'accessRequests', label: 'Access Requests', type: 'access_request', items: results.accessRequests },
+        { key: 'supportTickets', label: 'Support Tickets', type: 'support_ticket', items: results.supportTickets },
+        { key: 'lifecycleActions', label: 'Lifecycle Actions', type: 'lifecycle_action', items: results.lifecycleActions },
+        { key: 'vpnAccounts', label: 'VPN Accounts', type: 'vpn_account', items: results.vpnAccounts },
+        { key: 'auditLogs', label: 'Audit Logs', type: 'audit_log', items: results.auditLogs },
+        ] as Array<{ key: keyof Pick<SearchResults, 'accessRequests' | 'lifecycleActions' | 'vpnAccounts' | 'supportTickets' | 'auditLogs'>; label: string; type: string; items: SearchResult[] }>)
+        .filter((group) => group.items.length > 0)
+    : [];
 
   return (
-    <div className="min-h-screen bg-gray-50 p-6">
-      <div className="max-w-7xl mx-auto">
-        <div className="mb-8">
-          <h1 className="text-3xl font-bold text-gray-900 mb-2">Global Search</h1>
-          <p className="text-gray-700">Search across all access requests, lifecycle actions, VPN accounts, support tickets, and audit logs</p>
+    <div className="min-h-screen bg-background p-6">
+      <div className="mx-auto max-w-4xl">
+        <div className="mb-6 space-y-1">
+          <h1 className="text-2xl font-bold tracking-tight text-foreground">Global Search</h1>
+          <p className="text-sm text-muted-foreground">
+            Find records in the operational areas available to your account.
+          </p>
         </div>
 
-        <div className="bg-white rounded-lg shadow-lg border-2 border-gray-200 p-6 mb-6">
-          <form onSubmit={handleSearch} className="space-y-4">
-            <div className="flex gap-4">
-              <div className="flex-1">
+        {hasOperationalSearchGap && (
+          <div role="alert" className="mb-6 flex gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 text-amber-900 dark:text-amber-200">
+            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
+            <div>
+              <p className="font-semibold">Search has no operational data coverage</p>
+              <p className="mt-1 text-sm">
+                Your account has Global Search access but none of the underlying Requests,
+                Lifecycle, VPN, Tickets, or Audit privileges. An administrator must correct the
+                privilege mapping before search can be used.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Search card */}
+        <div className="sticky top-0 z-10 -mx-2 mb-6 rounded-xl border border-border bg-card/95 p-4 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-card/80">
+          <div className="flex items-center gap-3">
+            <div className="flex-1">
+              <label htmlFor="admin-global-search" className="mb-2 block text-sm font-medium text-foreground">
+                Search admin records
+              </label>
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <input
+                  id="admin-global-search"
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search by name, email, username, ticket ID, request ID..."
-                  className="w-full px-4 py-3 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-black focus:border-transparent text-lg text-gray-900 placeholder:text-gray-500"
-                  disabled={loading}
+                  placeholder="Name, email, username, ticket or request ID…"
+                  className="h-11 w-full rounded-lg border border-input bg-background pl-10 pr-4 text-base text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring"
+                  disabled={hasOperationalSearchGap || navigation?.state !== 'ready'}
                 />
-              </div>
-              <select
-                value={searchType}
-                onChange={(e) => setSearchType(e.target.value as any)}
-                className="px-4 py-3 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-black focus:border-transparent"
-                disabled={loading}
-              >
-                <option value="all">All Types</option>
-                <option value="requests">Access Requests</option>
-                <option value="lifecycle">Lifecycle Actions</option>
-                <option value="vpn">VPN Accounts</option>
-                <option value="tickets">Support Tickets</option>
-                <option value="audit">Audit Logs</option>
-              </select>
-              <button
-                type="submit"
-                disabled={loading || searchQuery.length < 2}
-                className="px-8 py-3 bg-black text-white rounded-lg hover:bg-gray-800 disabled:bg-gray-400 disabled:cursor-not-allowed font-semibold flex items-center gap-2"
-              >
-                {loading ? (
-                  <>
-                    <svg className="animate-spin h-5 w-5" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                    </svg>
-                    Searching...
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-                    </svg>
-                    Search
-                  </>
+                {loading && (
+                  <Loader2 className="absolute right-3.5 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-muted-foreground" />
                 )}
-              </button>
+              </div>
             </div>
-          </form>
+          </div>
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            {availableTypeOptions.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => setSearchType(option.value)}
+                className={`rounded-full px-3 py-1.5 text-xs font-semibold transition-colors ${
+                  searchType === option.value
+                    ? 'bg-primary text-primary-foreground'
+                    : 'bg-muted text-muted-foreground hover:bg-muted/70 hover:text-foreground'
+                }`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
         </div>
 
-        {loading && (
-          <div className="text-center py-12">
-            <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-gray-900"></div>
-            <p className="mt-4 text-gray-600">Searching...</p>
+        {!searched && !loading && (
+          <div className="rounded-xl border border-dashed border-border bg-card p-12 text-center">
+            <Search className="mx-auto mb-4 h-10 w-10 text-muted-foreground/50" />
+            <h3 className="mb-1 text-lg font-semibold text-foreground">Start typing to search</h3>
+            <p className="text-sm text-muted-foreground">
+              Results appear automatically as you type — at least 2 characters.
+            </p>
           </div>
         )}
 
-        {!loading && searched && results && (
+        {searched && results && results.totalResults === 0 && !loading && (
+          <div className="rounded-xl border border-dashed border-border bg-card p-12 text-center">
+            <Search className="mx-auto mb-4 h-10 w-10 text-muted-foreground/50" />
+            <h3 className="mb-1 text-lg font-semibold text-foreground">No results</h3>
+            <p className="text-sm text-muted-foreground">
+              Nothing matched &quot;{results.searchQuery}&quot;. Try a different term or widen the type filter.
+            </p>
+          </div>
+        )}
+
+        {results && results.totalResults > 0 && (
           <div className="space-y-6">
-            <div className="bg-white rounded-lg shadow-lg border-2 border-gray-200 p-6">
-              <h2 className="text-xl text-gray-900 font-bold mb-4">
-                Search Results for &quot;{results.searchQuery}&quot;
-              </h2>
-              <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-                <div className="text-center">
-                  <div className="text-3xl font-bold text-blue-600">{results.accessRequests.length}</div>
-                  <div className="text-sm text-gray-700">Access Requests</div>
-                </div>
-                <div className="text-center">
-                  <div className="text-3xl font-bold text-purple-600">{results.lifecycleActions.length}</div>
-                  <div className="text-sm text-gray-700">Lifecycle Actions</div>
-                </div>
-                <div className="text-center">
-                  <div className="text-3xl font-bold text-green-600">{results.vpnAccounts.length}</div>
-                  <div className="text-sm text-gray-700">VPN Accounts</div>
-                </div>
-                <div className="text-center">
-                  <div className="text-3xl font-bold text-yellow-600">{results.supportTickets.length}</div>
-                  <div className="text-sm text-gray-700">Support Tickets</div>
-                </div>
-                <div className="text-center">
-                  <div className="text-3xl font-bold text-gray-600">{results.auditLogs.length}</div>
-                  <div className="text-sm text-gray-700">Audit Logs</div>
-                </div>
-              </div>
-              <div className="mt-4 text-center">
-                <span className="text-2xl font-bold text-gray-900">{results.totalResults}</span>
-                <span className="text-gray-700 ml-2">total results</span>
-              </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {groups.map((group) => (
+                <span
+                  key={group.key}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-xs font-medium text-muted-foreground"
+                >
+                  {typeIcon(group.type, 'h-3.5 w-3.5')}
+                  {group.label}
+                  <span className="font-bold text-foreground">{group.items.length}</span>
+                </span>
+              ))}
+              <span className="ml-auto text-xs text-muted-foreground">
+                {results.totalResults} total
+              </span>
             </div>
 
-            {results.totalResults === 0 && (
-              <div className="bg-white rounded-lg shadow-lg border-2 border-gray-200 p-12 text-center">
-                <svg className="w-16 h-16 text-gray-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.172 16.172a4 4 0 015.656 0M9 10h.01M15 10h.01M12 12h.01M12 12h.01M12 12h.01M12 12h.01M12 21a9 9 0 100-18 9 9 0 000 18z" />
-                </svg>
-                <h3 className="text-xl font-semibold text-gray-700 mb-2">No results found</h3>
-                <p className="text-gray-600">Try adjusting your search query or filters</p>
-              </div>
-            )}
-
-            {results.accessRequests.length > 0 && (
-              <div>
-                <button
-                  onClick={() => toggleCategory('accessRequests')}
-                  className="w-full text-left flex items-center justify-between text-xl font-bold mb-4 p-4 bg-white rounded-lg shadow border-2 border-gray-200 hover:bg-gray-50 transition-colors text-gray-900"
-                >
-                  <div className="flex items-center gap-2">
-                    {getTypeIcon('access_request')}
-                    <span>Access Requests ({results.accessRequests.length})</span>
-                  </div>
-                  <svg
-                    className={`w-6 h-6 transition-transform ${collapsedCategories.accessRequests ? 'rotate-180' : ''}`}
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                  </svg>
-                </button>
-                {!collapsedCategories.accessRequests && (
-                  <div className="space-y-3 mb-4">
-                    {results.accessRequests.map(renderAccessRequest)}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {results.lifecycleActions.length > 0 && (
-              <div>
-                <button
-                  onClick={() => toggleCategory('lifecycleActions')}
-                  className="w-full text-left flex items-center justify-between text-xl font-bold mb-4 p-4 bg-white rounded-lg shadow border-2 border-gray-200 hover:bg-gray-50 transition-colors text-gray-900"
-                >
-                  <div className="flex items-center gap-2">
-                    {getTypeIcon('lifecycle_action')}
-                    <span>Lifecycle Actions ({results.lifecycleActions.length})</span>
-                  </div>
-                  <svg
-                    className={`w-6 h-6 transition-transform ${collapsedCategories.lifecycleActions ? 'rotate-180' : ''}`}
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                  </svg>
-                </button>
-                {!collapsedCategories.lifecycleActions && (
-                  <div className="space-y-3 mb-4">
-                    {results.lifecycleActions.map(renderLifecycleAction)}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {results.vpnAccounts.length > 0 && (
-              <div>
-                <button
-                  onClick={() => toggleCategory('vpnAccounts')}
-                  className="w-full text-left flex items-center justify-between text-xl font-bold mb-4 p-4 bg-white rounded-lg shadow border-2 border-gray-200 hover:bg-gray-50 transition-colors text-gray-900"
-                >
-                  <div className="flex items-center gap-2">
-                    {getTypeIcon('vpn_account')}
-                    <span>VPN Accounts ({results.vpnAccounts.length})</span>
-                  </div>
-                  <svg
-                    className={`w-6 h-6 transition-transform ${collapsedCategories.vpnAccounts ? 'rotate-180' : ''}`}
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                  </svg>
-                </button>
-                {!collapsedCategories.vpnAccounts && (
-                  <div className="space-y-3 mb-4">
-                    {results.vpnAccounts.map(renderVPNAccount)}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {results.supportTickets.length > 0 && (
-              <div>
-                <button
-                  onClick={() => toggleCategory('supportTickets')}
-                  className="w-full text-left flex items-center justify-between text-xl font-bold mb-4 p-4 bg-white rounded-lg shadow border-2 border-gray-200 hover:bg-gray-50 transition-colors text-gray-900"
-                >
-                  <div className="flex items-center gap-2">
-                    {getTypeIcon('support_ticket')}
-                    <span>Support Tickets ({results.supportTickets.length})</span>
-                  </div>
-                  <svg
-                    className={`w-6 h-6 transition-transform ${collapsedCategories.supportTickets ? 'rotate-180' : ''}`}
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                  </svg>
-                </button>
-                {!collapsedCategories.supportTickets && (
-                  <div className="space-y-3 mb-4">
-                    {results.supportTickets.map(renderSupportTicket)}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {results.auditLogs.length > 0 && (
-              <div>
-                <button
-                  onClick={() => toggleCategory('auditLogs')}
-                  className="w-full text-left flex items-center justify-between text-xl font-bold mb-4 p-4 bg-white rounded-lg shadow border-2 border-gray-200 hover:bg-gray-50 transition-colors text-gray-900"
-                >
-                  <div className="flex items-center gap-2">
-                    {getTypeIcon('audit_log')}
-                    <span>Audit Logs ({results.auditLogs.length})</span>
-                  </div>
-                  <svg
-                    className={`w-6 h-6 transition-transform ${collapsedCategories.auditLogs ? 'rotate-180' : ''}`}
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                  </svg>
-                </button>
-                {!collapsedCategories.auditLogs && (
-                  <div className="space-y-3 mb-4">
-                    {results.auditLogs.map(renderAuditLog)}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-
-        {!loading && !searched && (
-          <div className="bg-white rounded-lg shadow-lg border-2 border-gray-200 p-12 text-center">
-            <svg className="w-20 h-20 text-gray-300 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-            </svg>
-            <h3 className="text-xl font-semibold text-gray-700 mb-2">Start Your Search</h3>
-            <p className="text-gray-600 mb-4">Enter a search query to find access requests, lifecycle actions, VPN accounts, tickets, or audit logs</p>
-            <div className="text-sm text-gray-500 space-y-1">
-              <p>• Search by name, email, or username</p>
-              <p>• Search by ticket ID or request ID</p>
-              <p>• Filter by specific entity types</p>
-            </div>
+            {groups.map((group) => (
+              <section key={group.key}>
+                <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  {group.label}
+                </h2>
+                <div className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">
+                  {group.items.map((item) => {
+                    if (item.type === 'access_request') {
+                      return (
+                        <ResultRow
+                          key={item.id}
+                          item={item}
+                          onOpen={() => setSelectedRequestId(item.id)}
+                        />
+                      );
+                    }
+                    if (item.type === 'support_ticket') {
+                      return (
+                        <Link key={item.id} href={`/admin/support/tickets/${item.id}`} className="block">
+                          <ResultRow item={item} />
+                        </Link>
+                      );
+                    }
+                    if (item.type === 'lifecycle_action' || item.type === 'vpn_account') {
+                      const tab = item.type === 'lifecycle_action' ? 'lifecycle' : 'vpn';
+                      return (
+                        <Link key={item.id} href={`/admin?tab=${tab}`} className="block">
+                          <ResultRow item={item} />
+                        </Link>
+                      );
+                    }
+                    return <ResultRow key={item.id} item={item} />;
+                  })}
+                </div>
+              </section>
+            ))}
           </div>
         )}
       </div>

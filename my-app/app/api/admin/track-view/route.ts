@@ -2,11 +2,34 @@ import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
 import { logAuditAction, AuditActions, getIpAddress, getUserAgent } from '@/lib/audit-log';
 import { isJsonBodyError, parseAdminJson } from '@/lib/admin-json-parser';
+import { ADMIN_NAV_ITEMS, type AdminNavItem } from '@/lib/admin/navigation';
 
 type TrackViewBody = {
   pageName?: string;
   category?: string;
 };
+
+const LEGACY_PAGE_PREFIX = 'Admin Dashboard - ';
+
+/**
+ * Page identifiers are allowlisted against the admin navigation registry so
+ * attacker-chosen strings can never be written into audit details. The
+ * legacy composite form sent by AdminRoutePage ("Admin Dashboard - <tabId>")
+ * is accepted when the tab resolves to a known entry.
+ */
+function resolveTrackedPage(pageName: string): AdminNavItem | null {
+  const direct = ADMIN_NAV_ITEMS.find((item) => item.id === pageName);
+  if (direct) {
+    return direct;
+  }
+  if (pageName.startsWith(LEGACY_PAGE_PREFIX)) {
+    return (
+      ADMIN_NAV_ITEMS.find((item) => item.id === pageName.slice(LEGACY_PAGE_PREFIX.length)) ??
+      null
+    );
+  }
+  return null;
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -26,10 +49,18 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const navItem = typeof pageName === 'string' ? resolveTrackedPage(pageName) : null;
+    if (!navItem || category !== navItem.category) {
+      return NextResponse.json(
+        { error: 'Unknown page identifier' },
+        { status: 400 }
+      );
+    }
+
     // Log the page view
     await logAuditAction({
       action: AuditActions.VIEW_PAGE,
-      category,
+      category: navItem.category,
       username: admin.username,
       details: {
         pageName,

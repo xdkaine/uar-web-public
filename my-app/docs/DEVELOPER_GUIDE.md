@@ -62,7 +62,7 @@ The application interacts with Active Directory using the `ldapts` library.
     *   Checks `memberOf` attribute to verify Admin Group membership.
 2.  **User Search**:
     *   Uses `sAMAccountName` filter.
-    *   Retrieves attributes: `cn`, `mail`, `memberOf`, `description`, `extensionAttribute15`.
+    *   Retrieves the attributes required by each operation, including immutable `objectGUID` evidence for governed mutations.
 3.  **Account Creation**:
     *   Creates user in the specified `LDAP_USER_BASE`.
     *   Sets `userAccountControl` to `514` (Disabled) initially, then enables it.

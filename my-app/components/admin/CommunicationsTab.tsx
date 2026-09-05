@@ -1,10 +1,13 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef, useId } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import useSWR from 'swr';
 import { useToast } from '@/hooks/useToast';
+import { fetchJson } from '@/lib/client-query';
 import MassEmailComposer from '@/components/admin/MassEmailComposer';
 import { Card, CardContent } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import CommunicationsRecipientActions from '@/components/admin/CommunicationsRecipientActions';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Search } from "lucide-react";
 import {
@@ -37,12 +40,14 @@ interface ConfirmDialogState {
 }
 
 export default function CommunicationsTab() {
+    const router = useRouter();
+    const searchParams = useSearchParams();
+    const searchInputId = useId();
     const [searchQuery, setSearchQuery] = useState('');
     const [results, setResults] = useState<SearchResult[]>([]);
     const [isSearching, setIsSearching] = useState(false);
     const [selectedItem, setSelectedItem] = useState<SearchResult | null>(null);
     const [actionLoading, setActionLoading] = useState(false);
-    const [csrfToken, setCsrfToken] = useState<string | null>(null);
     const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState>({
         isOpen: false,
         title: '',
@@ -51,23 +56,29 @@ export default function CommunicationsTab() {
     });
 
     const { showToast } = useToast();
-    const [typingTimeout, setTypingTimeout] = useState<NodeJS.Timeout | null>(null);
+    const typingTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-    // Fetch CSRF token on mount
-    useEffect(() => {
-        const fetchCsrfToken = async () => {
-            try {
-                const res = await fetch('/api/csrf-token', { cache: 'no-store' });
-                if (res.ok) {
-                    const data = await res.json();
-                    setCsrfToken(data.csrfToken);
-                }
-            } catch (error) {
-                console.error('Failed to fetch CSRF token:', error);
-            }
-        };
-        fetchCsrfToken();
+    useEffect(() => () => {
+        if (typingTimeout.current !== null) {
+            clearTimeout(typingTimeout.current);
+        }
     }, []);
+    const selectedView = searchParams.get('view') === 'manual-notifications'
+        ? 'manual-notifications'
+        : 'mass-email';
+    const selectedWorkspace = searchParams.get('workspace') === 'campaigns'
+        ? 'campaigns'
+        : 'compose';
+
+    const replaceLocation = useCallback((view: string, workspace?: string) => {
+        const params = new URLSearchParams(searchParams.toString());
+        params.set('view', view);
+        if (workspace) params.set('workspace', workspace);
+        router.replace(`/admin/communications?${params.toString()}`, { scroll: false });
+    }, [router, searchParams]);
+
+    const { data: csrfData } = useSWR<{ csrfToken: string }>('/api/csrf-token', fetchJson);
+    const csrfToken = csrfData?.csrfToken ?? null;
 
     const handleSearch = useCallback(async (query: string) => {
         if (!query || query.length < 2) {
@@ -94,15 +105,14 @@ export default function CommunicationsTab() {
         const query = e.target.value;
         setSearchQuery(query);
 
-        if (typingTimeout) {
-            clearTimeout(typingTimeout);
+        if (typingTimeout.current !== null) {
+            clearTimeout(typingTimeout.current);
         }
 
-        const timeout = setTimeout(() => {
+        typingTimeout.current = setTimeout(() => {
+            typingTimeout.current = null;
             handleSearch(query);
         }, 500);
-
-        setTypingTimeout(timeout);
     };
 
     const initiateAction = (endpoint: string, title: string, description: string) => {
@@ -126,7 +136,6 @@ export default function CommunicationsTab() {
                 if (res.ok) {
                     const data = await res.json();
                     token = data.csrfToken;
-                    setCsrfToken(data.csrfToken);
                 }
             } catch {
                 console.error("Failed to recover CSRF token");
@@ -168,29 +177,42 @@ export default function CommunicationsTab() {
     return (
         <div className="space-y-6">
             <div className="flex flex-col gap-2">
-                <h2 className="text-2xl font-bold tracking-tight text-gray-900">Communication Center</h2>
-                <p className="text-gray-500">
+                <h2 className="text-2xl font-bold tracking-tight text-foreground">Communication Center</h2>
+                <p className="text-muted-foreground">
                     Manually trigger email notifications for users. Search for a user or request to begin.
                 </p>
             </div>
 
-            <Tabs defaultValue="mass-email" className="space-y-6">
+            <Tabs value={selectedView} onValueChange={(view) => replaceLocation(view)} className="space-y-6">
                 <TabsList>
                     <TabsTrigger value="mass-email">Mass Email</TabsTrigger>
                     <TabsTrigger value="manual-notifications">Manual Notifications</TabsTrigger>
                 </TabsList>
 
-                <TabsContent value="mass-email">
-                    <MassEmailComposer />
+                <TabsContent
+                    id="mass-email-workspace"
+                    value="mass-email"
+                    className="scroll-mt-20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                    <MassEmailComposer
+                        activeWorkspace={selectedWorkspace}
+                        onWorkspaceChange={(workspace) => replaceLocation('mass-email', workspace)}
+                    />
                 </TabsContent>
 
-                <TabsContent value="manual-notifications">
+                <TabsContent
+                    id="manual-notifications"
+                    value="manual-notifications"
+                    className="scroll-mt-20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <Card className="md:col-span-1 border-2 shadow-sm">
                     <CardContent className="p-4 space-y-4">
+                        <label htmlFor={searchInputId} className="block text-sm font-medium">Search recipients</label>
                         <div className="relative">
-                            <Search className="absolute left-3 top-2.5 h-4 w-4 text-gray-400" />
+                            <Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
                             <input
+                                id={searchInputId}
                                 type="text"
                                 placeholder="Search by name, email, or username..."
                                 className="w-full pl-9 pr-4 py-2 border rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500"
@@ -201,122 +223,50 @@ export default function CommunicationsTab() {
 
                         <div className="space-y-2 max-h-[600px] overflow-y-auto">
                             {isSearching ? (
-                                <p className="text-center text-gray-500 py-4">Searching...</p>
+                                <p className="text-center text-muted-foreground py-4">Searching...</p>
                             ) : results.length > 0 ? (
                                 results.map((result) => (
-                                    <div
+                                    <button
                                         key={result.id}
+                                        type="button"
+                                        aria-pressed={selectedItem?.id === result.id}
                                         onClick={() => setSelectedItem(result)}
-                                        className={`p-3 rounded-md cursor-pointer border transition-colors ${selectedItem?.id === result.id
-                                            ? 'bg-blue-50 border-blue-300'
-                                            : 'hover:bg-gray-50 border-gray-100'
+                                        className={`block w-full p-3 text-left rounded-md cursor-pointer border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selectedItem?.id === result.id
+                                            ? 'bg-blue-50 dark:bg-blue-950/40 border-blue-300'
+                                            : 'hover:bg-muted/50 border-border'
                                             }`}
                                     >
-                                        <p className="font-semibold text-gray-900">{result.name || 'Unknown Name'}</p>
-                                        <p className="text-sm text-gray-500">{result.email}</p>
-                                        <div className="flex items-center gap-2 mt-1">
-                                            <span className={`text-xs px-2 py-0.5 rounded-full ${result.status === 'approved' ? 'bg-green-100 text-green-800' :
-                                                result.status === 'rejected' ? 'bg-red-100 text-red-800' :
-                                                    'bg-yellow-100 text-yellow-800'
+                                        <span className="block font-semibold text-foreground">{result.name || 'Unknown Name'}</span>
+                                        <span className="block text-sm text-muted-foreground">{result.email}</span>
+                                        <span className="flex items-center gap-2 mt-1">
+                                            <span className={`text-xs px-2 py-0.5 rounded-full ${result.status === 'approved' ? 'bg-green-100 dark:bg-green-950/60 text-green-800' :
+                                                result.status === 'rejected' ? 'bg-red-100 dark:bg-red-950/60 text-red-800' :
+                                                    'bg-yellow-100 dark:bg-yellow-950/60 text-yellow-800'
                                                 }`}>
                                                 {result.status}
                                             </span>
                                             {result.username && (
-                                                <span className="text-xs font-mono bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">
+                                                <span className="text-xs font-mono bg-muted text-muted-foreground px-2 py-0.5 rounded-full">
                                                     {result.username}
                                                 </span>
                                             )}
-                                        </div>
-                                    </div>
+                                        </span>
+                                    </button>
                                 ))
                             ) : searchQuery.length > 1 ? (
-                                <p className="text-center text-gray-500 py-4">No results found</p>
+                                <p className="text-center text-muted-foreground py-4">No results found</p>
                             ) : (
-                                <p className="text-center text-gray-400 py-4 text-sm">Enter a search term</p>
+                                <p className="text-center text-muted-foreground py-4 text-sm">Enter a search term</p>
                             )}
                         </div>
                     </CardContent>
                 </Card>
 
-                <Card className="md:col-span-2 border-2 shadow-sm">
-                    <CardContent className="p-6">
-                        {selectedItem ? (
-                            <div className="space-y-6">
-                                <div className="border-b pb-4">
-                                    <h3 className="text-xl font-bold text-gray-900">{selectedItem.name}</h3>
-                                    <div className="mt-1 flex flex-wrap gap-4 text-sm text-gray-600">
-                                        <p>Email: <span className="font-medium text-gray-900">{selectedItem.email}</span></p>
-                                        {selectedItem.username && (
-                                            <p>Username: <span className="font-medium text-gray-900">{selectedItem.username}</span></p>
-                                        )}
-                                        <p>ID: <span className="font-mono text-xs">{selectedItem.id}</span></p>
-                                    </div>
-                                </div>
-
-                                <div className="space-y-4">
-                                    <h4 className="font-semibold text-gray-900">Available Actions</h4>
-
-                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                                        <div className={`p-4 rounded-lg border-2 ${selectedItem.status === 'pending_verification' ? 'border-yellow-300 bg-yellow-50' : 'border-gray-100 bg-gray-50 opacity-50'}`}>
-                                            <h5 className="font-bold text-gray-900 mb-1">Resend Verification Email</h5>
-                                            <p className="text-sm text-gray-600 mb-4">Send a new email confirmation link.</p>
-                                            <Button
-                                                className="w-full"
-                                                variant={selectedItem.status === 'pending_verification' ? 'default' : 'outline'}
-                                                disabled={selectedItem.status !== 'pending_verification' || actionLoading}
-                                                onClick={() => initiateAction(
-                                                    `/api/admin/requests/${selectedItem.id}/resend-verification`,
-                                                    'Resend Verification?',
-                                                    'Are you sure you want to resend the verification email to this user?'
-                                                )}
-                                            >
-                                                Resend Verification
-                                            </Button>
-                                        </div>
-
-                                        <div className={`p-4 rounded-lg border-2 ${selectedItem.status === 'approved' ? 'border-purple-300 bg-purple-50' : 'border-gray-100 bg-gray-50 opacity-50'}`}>
-                                            <h5 className="font-bold text-gray-900 mb-1">Resend Activation Token</h5>
-                                            <p className="text-sm text-gray-600 mb-4">Send a new activation link (internal users).</p>
-                                            <Button
-                                                className="w-full"
-                                                variant={selectedItem.status === 'approved' ? 'default' : 'outline'}
-                                                disabled={selectedItem.status !== 'approved' || actionLoading}
-                                                onClick={() => initiateAction(
-                                                    `/api/admin/requests/${selectedItem.id}/resend-activation`,
-                                                    'Resend Activation Token?',
-                                                    'This will invalidate any previous activation tokens. Continue?'
-                                                )}
-                                            >
-                                                Resend Activation
-                                            </Button>
-                                        </div>
-
-                                        <div className={`p-4 rounded-lg border-2 ${selectedItem.status === 'approved' && selectedItem.username ? 'border-red-300 bg-red-50' : 'border-gray-100 bg-gray-50 opacity-50'}`}>
-                                            <h5 className="font-bold text-gray-900 mb-1">Send Admin Reset Link</h5>
-                                            <p className="text-sm text-gray-600 mb-4">Email a one-time AD password reset link for active accounts.</p>
-                                            <Button
-                                                className="w-full bg-red-600 hover:bg-red-700 text-white"
-                                                disabled={!(selectedItem.status === 'approved' && selectedItem.username) || actionLoading}
-                                                onClick={() => initiateAction(
-                                                    `/api/admin/requests/${selectedItem.id}/reset-password`,
-                                                    'Send Admin Reset Link?',
-                                                    'Are you sure you want to send an administrator-issued one-time password reset link to this user?'
-                                                )}
-                                            >
-                                                Send Reset Link
-                                            </Button>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        ) : (
-                            <div className="h-full flex flex-col items-center justify-center text-gray-400 space-y-4 py-12">
-                                <Search className="h-12 w-12 opacity-20" />
-                                <p>Select a user from the results to view actions</p>
-                            </div>
-                        )}
-                    </CardContent>
-                </Card>
+                <CommunicationsRecipientActions
+                    selectedItem={selectedItem}
+                    actionLoading={actionLoading}
+                    initiateAction={initiateAction}
+                />
             </div>
                 </TabsContent>
             </Tabs>

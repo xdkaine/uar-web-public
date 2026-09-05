@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSessionFromRequest } from '@/lib/session';
+import { getSessionFromRequest, revokeSessionById } from '@/lib/session';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { processProviderLogoutTask } from '@/lib/auth/provider-logout-audit';
 import { prisma } from '@/lib/prisma';
 import { getIpAddress, logAuditAction } from '@/lib/audit-log';
 
@@ -15,6 +17,11 @@ export async function GET(request: NextRequest) {
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+
+    if (!actorHasPermission(admin, 'sessions.read')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
     const session = { username: admin.username };
 
     // Get all active sessions
@@ -74,6 +81,10 @@ export async function DELETE(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
+    if (!actorHasPermission(admin, 'sessions.revoke')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
     const session = await getSessionFromRequest(request);
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
@@ -114,13 +125,27 @@ export async function DELETE(request: NextRequest) {
       );
     }
 
-    // Delete the session
-    await prisma.session.update({
-      where: { id: sessionId },
-      data: {
-        revokedAt: new Date()
+    // Revoke the portal session, capturing providerSid for the IdP logout.
+    const revoked = await revokeSessionById(sessionId, 'admin_kill_session');
+
+    // Full-logout posture: also destroy the OIDC provider session so the
+    // killed user cannot silently SSO back in from another app tab (ADR-0012).
+    // The audit row records the ACTUAL backchannel result - a stale "true"
+    // here would hide exactly the silent-SSO failure this exists to prevent.
+    let providerSessionDestroyed = false;
+    let providerLogoutAttempted = false;
+    let providerLogoutIncomplete = false;
+    if (revoked?.providerSid && revoked.providerLogoutTaskId) {
+      const providerResult = await processProviderLogoutTask(revoked.providerLogoutTaskId);
+      providerLogoutAttempted = providerResult.attempted;
+      providerSessionDestroyed = providerResult.destroyed;
+      providerLogoutIncomplete = providerResult.incomplete || providerResult.reconciliationRequired;
+      if (!providerSessionDestroyed) {
+        console.warn(
+          `[sessions] backchannel logout unavailable for killed session ${sessionId}`
+        );
       }
-    });
+    }
 
     // Log the kill action
     await logAuditAction({
@@ -132,15 +157,27 @@ export async function DELETE(request: NextRequest) {
       details: {
         targetUsername: targetSession.username,
         targetIsAdmin: targetSession.isAdmin,
-        targetIpAddress: targetSession.ipAddress
+        targetIpAddress: targetSession.ipAddress,
+        providerSidPresent: Boolean(revoked?.providerSid),
+        providerSessionDestroyed,
+        providerLogoutAttempted,
       },
       ipAddress: getIpAddress(request),
       userAgent: request.headers.get('user-agent') || undefined
+    }).catch((auditError) => {
+      console.error('Session termination audit persistence failed:', auditError);
     });
 
-    return NextResponse.json({ 
+    return NextResponse.json({
       success: true,
-      message: 'Session terminated successfully' 
+      partial: providerLogoutIncomplete,
+      providerLogoutAttempted,
+      providerSessionDestroyed,
+      message: providerLogoutIncomplete
+        ? 'Portal session ended, but the identity-provider session could not be confirmed destroyed'
+        : providerLogoutAttempted
+          ? 'Portal session ended and identity-provider session destruction was confirmed'
+          : 'Portal session ended; it had no linked identity-provider session to terminate',
     });
   } catch (error) {
     console.error('Error killing session:', error);
@@ -153,7 +190,7 @@ export async function DELETE(request: NextRequest) {
       errorMessage: error instanceof Error ? error.message : 'Unknown error',
       ipAddress: getIpAddress(request),
       userAgent: request.headers.get('user-agent') || undefined
-    });
+    }).catch(() => undefined);
 
     return NextResponse.json(
       { error: 'Failed to terminate session' },

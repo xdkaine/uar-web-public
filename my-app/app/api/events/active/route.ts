@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { isModuleDisabled } from '@/lib/modules/core';
 import { checkRateLimitAsync, getClientIp, RateLimitPresets } from '@/lib/ratelimit';
 
 export async function GET(request: NextRequest) {
@@ -24,6 +25,12 @@ export async function GET(request: NextRequest) {
           },
         }
       );
+    }
+
+    // Events module disabled: return an empty catalog so public request forms
+    // gracefully stop offering event-based requests (no error surfaced).
+    if (await isModuleDisabled('events')) {
+      return NextResponse.json({ events: [] });
     }
 
     const events = await prisma.event.findMany({

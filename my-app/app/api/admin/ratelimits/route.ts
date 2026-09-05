@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import {
   isRateLimitUnavailable,
   listRateLimitSessions,
@@ -18,6 +19,10 @@ export async function GET(request: NextRequest) {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!actorHasPermission(admin, 'ratelimits.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const sessions = await listRateLimitSessions();
@@ -60,6 +65,10 @@ export async function DELETE(request: NextRequest) {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!actorHasPermission(admin, 'ratelimits.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
     adminUsername = admin.username;
 

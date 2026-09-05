@@ -7,98 +7,143 @@ datasource db {
 }
 
 model AccessRequest {
-  id                     String                    @id @default(cuid())
-  createdAt              DateTime                  @default(now())
-  updatedAt              DateTime                  @updatedAt
-  version                Int                       @default(0)
-  name                   String
-  email                  String
-  isInternal             Boolean
-  needsDomainAccount     Boolean
-  institution            String?
-  eventReason            String?
-  eventId                String?
-  accessEndTime          DateTime?
-  isVerified             Boolean                   @default(false)
-  verificationToken      String?                   @unique
-  verificationAttempts   Int                       @default(0)
-  verifiedAt             DateTime?
-  verificationTokenExpiresAt DateTime?
-  status                 String                    @default("pending_verification")
-  acknowledgedByDirector Boolean                   @default(false)
-  acknowledgedAt         DateTime?
-  acknowledgedBy         String?
-  approvedAt             DateTime?
-  approvedBy             String?
-  ldapUsername           String?
-  vpnUsername            String?
-  accountPassword        String?
-  accountCreatedAt       DateTime?
-  provisioningState      String?
-  provisioningStartedAt  DateTime?
-  provisioningCompletedAt DateTime?
-  provisioningError      String?
-  accountExpiresAt       DateTime?
-  sentToFacultyAt        DateTime?
-  sentToFacultyBy        String?
-  rejectedAt             DateTime?
-  rejectedBy             String?
-  rejectionReason        String?
-  approvalMessage        String?
-  isGrandfatheredAccount Boolean                   @default(false) // For existing accounts without email
-  isManuallyAssigned     Boolean                   @default(false) // Request linked to existing AD account
-  manuallyAssignedAt     DateTime?
-  manuallyAssignedBy     String?
-  linkedAdUsername       String?                                    // The existing AD username this request is linked to
-  linkedVpnUsername      String?                                    // The existing VPN username this request is linked to (for external users)
-  manualAssignmentNotes  String?                                    // Notes about the manual assignment
+  id                              String                          @id @default(cuid())
+  createdAt                       DateTime                        @default(now())
+  updatedAt                       DateTime                        @updatedAt
+  version                         Int                             @default(0)
+  name                            String
+  email                           String
+  isInternal                      Boolean
+  needsDomainAccount              Boolean
+  institution                     String?
+  eventReason                     String?
+  eventId                         String?
+  accessEndTime                   DateTime?
+  isVerified                      Boolean                         @default(false)
+  verificationToken               String?                         @unique
+  verificationTokenHash           String?                         @unique
+  verificationAttempts            Int                             @default(0)
+  verifiedAt                      DateTime?
+  verificationTokenExpiresAt      DateTime?
+  status                          String                          @default("pending_verification")
+  acknowledgedByDirector          Boolean                         @default(false)
+  acknowledgedAt                  DateTime?
+  acknowledgedBy                  String?
+  approvedAt                      DateTime?
+  approvedBy                      String?
+  ldapUsername                    String?
+  vpnUsername                     String?
+  accountPassword                 String?
+  accountCreatedAt                DateTime?
+  provisioningState               String?
+  provisioningStartedAt           DateTime?
+  provisioningCompletedAt         DateTime?
+  provisioningError               String?
+  accountUpdateState              String? // in_progress | succeeded | failed | reconciliation_required
+  accountUpdateClaimId            String?
+  accountUpdateClaimedUntil       DateTime?
+  accountUpdateTargetLdapUsername String?
+  accountUpdateTargetVpnUsername  String?
+  accountUpdateOutcome            Json?
+  accountUpdateError              String?
+  accountExpiresAt                DateTime?
+  sentToFacultyAt                 DateTime?
+  sentToFacultyBy                 String?
+  facultyNotificationState        String? // sending | delivered | failed | delivery_unknown
+  facultyNotificationClaimId      String?
+  facultyNotificationClaimedUntil DateTime?
+  facultyNotificationError        String?
+  stageNotificationState          String? // delivery_unknown | delivered | failed
+  stageNotificationStageKey       String?
+  stageNotificationError          String?
+  stageNotificationStateChangedAt DateTime?
+  rejectedAt                      DateTime?
+  rejectedBy                      String?
+  rejectionReason                 String?
+  approvalMessage                 String?
+  isGrandfatheredAccount          Boolean                         @default(false) // For existing accounts without email
+  isManuallyAssigned              Boolean                         @default(false) // Request linked to existing AD account
+  manuallyAssignedAt              DateTime?
+  manuallyAssignedBy              String?
+  linkedAdUsername                String? // The existing AD username this request is linked to
+  linkedVpnUsername               String? // The existing VPN username this request is linked to (for external users)
+  manualAssignmentNotes           String? // Notes about the manual assignment
   // Account lifecycle tracking
-  adAccountStatus        String?                   @default("active") // "active", "disabled", "deleted"
-  adDisabledAt           DateTime?
-  adDisabledBy           String?
-  adDisabledReason       String?
-  adEnabledAt            DateTime?
-  adEnabledBy            String?
-  vpnAccountStatus       String?                   @default("active") // "active", "revoked", "deleted"
-  vpnRevokedAt           DateTime?
-  vpnRevokedBy           String?
-  vpnRevokedReason       String?
-  vpnRestoredAt          DateTime?
-  vpnRestoredBy          String?
-  event                  Event?                    @relation(fields: [eventId], references: [id])
-  comments               RequestComment[]
-  supportTickets         SupportTicket[]
-  activationToken        AccountActivationToken?
+  adAccountStatus                 String?                         @default("active") // "active", "disabled", "deleted"
+  adDisabledAt                    DateTime?
+  adDisabledBy                    String?
+  adDisabledReason                String?
+  adEnabledAt                     DateTime?
+  adEnabledBy                     String?
+  vpnAccountStatus                String?                         @default("active") // "active", "revoked", "deleted"
+  vpnRevokedAt                    DateTime?
+  vpnRevokedBy                    String?
+  vpnRevokedReason                String?
+  vpnRestoredAt                   DateTime?
+  vpnRestoredBy                   String?
+  requestTypeKey                  String?
+  workflowVersionId               String?
+  event                           Event?                          @relation(fields: [eventId], references: [id])
+  comments                        RequestComment[]
+  supportTickets                  SupportTicket[]
+  activationToken                 AccountActivationToken?
+  profileEmailVerificationTokens  ProfileEmailVerificationToken[]
+  batchAccountItem                BatchAccountItem?
+  // Removed global unique constraints - usernames can be reused after rejection or campaign offboarding
+  // @@unique([ldapUsername])
+  // @@unique([vpnUsername])
+  // @@unique([linkedAdUsername])
 
   @@index([email])
   @@index([verificationToken])
+  @@index([verificationTokenHash])
   @@index([status])
   @@index([eventId])
   @@index([ldapUsername])
+  @@index([facultyNotificationState])
+  @@index([facultyNotificationState, facultyNotificationClaimedUntil])
+  @@index([stageNotificationState])
+  @@index([provisioningState, provisioningStartedAt])
+  @@index([accountUpdateState, accountUpdateClaimedUntil])
   @@index([vpnUsername])
   @@index([isManuallyAssigned])
   @@index([linkedAdUsername])
   @@index([linkedVpnUsername])
   @@index([adAccountStatus])
   @@index([vpnAccountStatus])
-  // Removed global unique constraints - usernames can be reused after rejection or campaign offboarding
-  // @@unique([ldapUsername])
-  // @@unique([vpnUsername])
-  // @@unique([linkedAdUsername])
 }
 
 model RequestComment {
-  id        String        @id @default(cuid())
-  createdAt DateTime      @default(now())
-  updatedAt DateTime      @updatedAt
-  comment   String
-  author    String
-  requestId String
-  type      String?
-  request   AccessRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  id          String                     @id @default(cuid())
+  createdAt   DateTime                   @default(now())
+  updatedAt   DateTime                   @updatedAt
+  comment     String
+  author      String
+  requestId   String
+  type        String?
+  request     AccessRequest              @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  attachments RequestCommentAttachment[]
 
   @@index([requestId])
   @@index([createdAt])
+}
+
+model RequestCommentAttachment {
+  id            String         @id @default(cuid())
+  createdAt     DateTime       @default(now())
+  commentId     String
+  comment       RequestComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  filename      String
+  contentType   String
+  sizeBytes     Int
+  sha256        String
+  storageKey    String         @unique
+  uploadedBy    String
+  scanStatus    String         @default("clean")
+  forceDownload Boolean        @default(false)
+
+  @@index([commentId])
+  @@index([scanStatus])
 }
 
 model Event {
@@ -148,17 +193,21 @@ model AccountActivationToken {
 }
 
 model PasswordChangeChallenge {
-  id        String    @id @default(cuid())
-  username  String
-  tokenHash String    @unique
-  reason    String
-  expiresAt DateTime
-  used      Boolean   @default(false)
-  usedAt    DateTime?
-  attempts  Int       @default(0)
-  ipAddress String?
-  userAgent String?
-  createdAt DateTime  @default(now())
+  id            String    @id @default(cuid())
+  username      String
+  tokenHash     String    @unique
+  reason        String
+  authProvider  String    @default("ad")
+  correlationId String?
+  expiresAt     DateTime
+  state         String    @default("active") // active | processing | directory_applied | consumed
+  claimedAt     DateTime?
+  used          Boolean   @default(false)
+  usedAt        DateTime?
+  attempts      Int       @default(0)
+  ipAddress     String?
+  userAgent     String?
+  createdAt     DateTime  @default(now())
 
   @@index([tokenHash])
   @@index([username])
@@ -166,109 +215,221 @@ model PasswordChangeChallenge {
 }
 
 model SupportTicket {
-  id                 String                    @id @default(cuid())
-  createdAt          DateTime                  @default(now())
-  updatedAt          DateTime                  @updatedAt
-  subject            String
-  category           String?
-  severity           String?
-  body               String
-  status             String                    @default("open")
-  username           String
-  closedAt           DateTime?
-  closedBy           String?
-  relatedRequestId   String?
-  relatedRequest     AccessRequest?            @relation(fields: [relatedRequestId], references: [id])
-  responses          TicketResponse[]
-  statusLogs         TicketStatusLog[]
-  batchCreations     BatchAccountCreation[]
+  id                     String                        @id @default(cuid())
+  createdAt              DateTime                      @default(now())
+  updatedAt              DateTime                      @updatedAt
+  subject                String
+  category               String?
+  severity               String?
+  body                   String
+  status                 String                        @default("open")
+  username               String
+  // Operational tickets emitted by trusted automation. These are visible and
+  // mutable only through the administrator support workspace.
+  internalOnly           Boolean                       @default(false)
+  attachmentCount        Int                           @default(0)
+  attachmentBytes        BigInt                        @default(0)
+  closedAt               DateTime?
+  closedBy               String?
+  relatedRequestId       String?
+  // Soft reference to AllowedTicketSubjectGroup.dn: the approved group this
+  // ticket was filed on behalf of ("requested for"), when not self.
+  requestedForGroupDn    String?
+  // Soft reference to AllowedTicketSubjectGroup.dn: the group the requester
+  // asks to join via this ticket. Only groups flagged canJoinViaTicket accept
+  // values here; automation rules decide whether the add executes without a
+  // human approver.
+  joinGroupDn            String?
+  relatedRequest         AccessRequest?                @relation(fields: [relatedRequestId], references: [id])
+  responses              TicketResponse[]
+  statusLogs             TicketStatusLog[]
+  batchCreations         BatchAccountCreation[]
+  assignments            SupportTicketAssignment[]
+  assignmentHistory      TicketAssignmentHistory[]
+  attachments            TicketAttachment[]
+  quarantinedAttachments QuarantinedTicketAttachment[]
 
   @@index([username])
+  @@index([internalOnly, status])
   @@index([status])
   @@index([createdAt])
   @@index([relatedRequestId])
+  @@index([requestedForGroupDn])
+  @@index([joinGroupDn])
 }
 
 model TicketResponse {
+  id              String        @id @default(cuid())
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  message         String
+  author          String
+  isStaff         Boolean       @default(false)
+  ticketId        String
+  clientRequestId String?
+  ticket          SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@unique([ticketId, clientRequestId])
+  @@index([ticketId])
+  @@index([createdAt])
+}
+
+// Profile email verification is intentionally separate from the public
+// access-request verification token. Only a hash is stored; the claim lease
+// prevents concurrent LDAP mutations and preserves forward-recovery evidence
+// when the directory succeeds before the database can finalize.
+model ProfileEmailVerificationToken {
+  id                  String        @id @default(cuid())
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+  accessRequestId     String
+  accessRequest       AccessRequest @relation(fields: [accessRequestId], references: [id], onDelete: Cascade)
+  tokenHash           String        @unique
+  desiredEmail        String
+  expiresAt           DateTime
+  status              String        @default("issuing") // issuing | pending | claimed | directory_applied | completed | reconciliation_required | delivery_failed | revoked
+  claimId             String?
+  claimedUntil        DateTime?
+  attempts            Int           @default(0)
+  usedAt              DateTime?
+  lastError           String?
+  observedMail        String?
+  observedDescription String?
+
+  @@index([accessRequestId, status])
+  @@index([expiresAt])
+  @@index([claimedUntil])
+}
+
+model TicketAttachment {
+  id            String        @id @default(cuid())
+  createdAt     DateTime      @default(now())
+  ticketId      String
+  ticket        SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  filename      String
+  contentType   String
+  sizeBytes     Int
+  sha256        String
+  storageKey    String        @unique
+  uploadedBy    String
+  scanStatus    String        @default("legacy_unscanned") // pending | clean | legacy_unscanned
+  scannedAt     DateTime?
+  forceDownload Boolean       @default(true)
+
+  @@index([ticketId])
+  @@index([scanStatus])
+}
+
+// Infected bytes never enter TicketAttachment. Keeping quarantine in a new
+// table makes the objects unreachable to application versions predating the
+// scan gate during a rollback.
+model QuarantinedTicketAttachment {
+  id            String        @id @default(cuid())
+  createdAt     DateTime      @default(now())
+  ticketId      String
+  ticket        SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Restrict)
+  filename      String
+  contentType   String
+  sizeBytes     Int
+  sha256        String
+  storageKey    String        @unique
+  uploadedBy    String
+  scanSignature String?
+  quarantinedAt DateTime      @default(now())
+  purgedAt      DateTime?
+
+  @@index([ticketId])
+  @@index([quarantinedAt, purgedAt])
+}
+
+model TicketStatusLog {
   id        String        @id @default(cuid())
   createdAt DateTime      @default(now())
-  updatedAt DateTime      @updatedAt
-  message   String
-  author    String
-  isStaff   Boolean       @default(false)
   ticketId  String
+  oldStatus String?
+  newStatus String
+  changedBy String
+  isStaff   Boolean       @default(false)
   ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
 
   @@index([ticketId])
   @@index([createdAt])
 }
 
-model TicketStatusLog {
-  id         String        @id @default(cuid())
-  createdAt  DateTime      @default(now())
-  ticketId   String
-  oldStatus  String?
-  newStatus  String
-  changedBy  String
-  isStaff    Boolean       @default(false)
-  ticket     SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
-
-  @@index([ticketId])
-  @@index([createdAt])
-}
-
 model BatchAccountCreation {
-  id                  String               @id @default(cuid())
-  createdAt           DateTime             @default(now())
-  updatedAt           DateTime             @updatedAt
-  createdBy           String
-  description         String
-  totalAccounts       Int
-  successfulAccounts  Int                  @default(0)
-  failedAccounts      Int                  @default(0)
-  status              String               @default("processing")
-  completedAt         DateTime?
-  linkedTicketId      String?
-  linkedTicket        SupportTicket?       @relation(fields: [linkedTicketId], references: [id])
-  accounts            BatchAccountItem[]
-  auditLogs           BatchAuditLog[]
+  id                     String             @id @default(cuid())
+  submissionKey          String?            @unique
+  submissionFingerprint  String?
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+  createdBy              String
+  description            String
+  totalAccounts          Int
+  successfulAccounts     Int                @default(0)
+  failedAccounts         Int                @default(0)
+  status                 String             @default("processing")
+  processingClaimId      String?
+  processingClaimedUntil DateTime?
+  completedAt            DateTime?
+  linkedTicketId         String?
+  linkedTicket           SupportTicket?     @relation(fields: [linkedTicketId], references: [id])
+  accounts               BatchAccountItem[]
+  auditLogs              BatchAuditLog[]
 
   @@index([createdBy])
   @@index([createdAt])
   @@index([status])
+  @@index([status, processingClaimedUntil])
   @@index([linkedTicketId])
 }
 
 model BatchAccountItem {
-  id                    String                @id @default(cuid())
-  createdAt             DateTime              @default(now())
-  updatedAt             DateTime              @updatedAt
-  batchId               String
-  batch                 BatchAccountCreation  @relation(fields: [batchId], references: [id], onDelete: Cascade)
-  accountType           String                @default("AD") // "AD" or "VPN"
-  name                  String
-  email                 String?
-  ldapUsername          String
-  vpnUsername           String?
-  password              String
-  accountExpiresAt      DateTime?
-  isInternal            Boolean               @default(true)
-  status                String                @default("pending")
-  ldapCreatedAt         DateTime?
-  vpnCreatedAt          DateTime?
-  errorMessage          String?
-  completedAt           DateTime?
+  id                        String                   @id @default(cuid())
+  createdAt                 DateTime                 @default(now())
+  updatedAt                 DateTime                 @updatedAt
+  batchId                   String
+  batch                     BatchAccountCreation     @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  accessRequestId           String?                  @unique
+  accessRequest             AccessRequest?           @relation(fields: [accessRequestId], references: [id], onDelete: SetNull)
+  lifecycleOwnerKind        String                   @default("batch_item") // batch_item | access_request_legacy | unresolved
+  lifecycleActions          AccountLifecycleAction[]
+  vpnAccount                VPNAccount?
+  version                   Int                      @default(0)
+  accountType               String                   @default("AD") // "AD" or "VPN"
+  name                      String
+  email                     String?
+  ldapUsername              String
+  vpnUsername               String?
+  password                  String
+  accountExpiresAt          DateTime?
+  isInternal                Boolean                  @default(true)
+  status                    String                   @default("pending")
+  mutationStage             String?
+  ldapCreatedAt             DateTime?
+  vpnCreatedAt              DateTime?
+  errorMessage              String?
+  completedAt               DateTime?
+  targetDirectoryDn         String?
+  targetDirectoryObjectGuid String?
+  adAccountStatus           String? // active | disabled | deleted (AD items only; null means not reconciled)
+  adDisabledAt              DateTime?
+  adDisabledBy              String?
+  adDisabledReason          String?
+  adEnabledAt               DateTime?
+  adEnabledBy               String?
 
   @@index([batchId])
+  @@index([accessRequestId])
   @@index([status])
   @@index([ldapUsername])
+  @@index([adAccountStatus])
 }
 
 model BatchAuditLog {
-  id          String                @id @default(cuid())
-  createdAt   DateTime              @default(now())
+  id          String               @id @default(cuid())
+  createdAt   DateTime             @default(now())
   batchId     String
-  batch       BatchAccountCreation  @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  batch       BatchAccountCreation @relation(fields: [batchId], references: [id], onDelete: Cascade)
   action      String
   details     String
   performedBy String
@@ -281,36 +442,38 @@ model BatchAuditLog {
 }
 
 model VPNAccount {
-  id                String              @id @default(cuid())
-  createdAt         DateTime            @default(now())
-  updatedAt         DateTime            @updatedAt
-  username          String              @unique
-  name              String
-  email             String?
-  portalType        String              // "Management", "Limited", "External"
-  isInternal        Boolean             @default(false)
-  status            String              @default("pending_faculty") // "active", "pending_faculty", "disabled", "revoked"
-  expiresAt         DateTime?
-  password          String
-  createdBy         String
-  createdByFaculty  Boolean             @default(false)
-  facultyCreatedAt  DateTime?
-  disabledAt        DateTime?
-  disabledBy        String?
-  disabledReason    String?
-  revokedAt         DateTime?           // When VPN access was revoked
-  revokedBy         String?             // Who revoked access
-  revokedReason     String?             // Why it was revoked
-  restoredAt        DateTime?           // When VPN access was restored
-  restoredBy        String?             // Who restored access
-  canRestore        Boolean             @default(true) // Whether account can be restored after revocation
-  notes             String?
-  batchId           String?
-  accessRequestId   String?             // Link to the AccessRequest that created this VPN account
-  importId          String?             // Link to the VPNImport that imported this account
-  adUsername        String?             // Linked AD account username (for any account tied to an AD user)
-  statusLogs        VPNAccountStatusLog[]
-  comments          VPNAccountComment[]
+  id                 String                @id @default(cuid())
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+  username           String                @unique
+  name               String
+  email              String?
+  portalType         String // "Management", "Limited", "External"
+  isInternal         Boolean               @default(false)
+  status             String                @default("pending_faculty") // "active", "pending_faculty", "disabled", "revoked"
+  expiresAt          DateTime?
+  password           String
+  createdBy          String
+  createdByFaculty   Boolean               @default(false)
+  facultyCreatedAt   DateTime?
+  disabledAt         DateTime?
+  disabledBy         String?
+  disabledReason     String?
+  revokedAt          DateTime? // When VPN access was revoked
+  revokedBy          String? // Who revoked access
+  revokedReason      String? // Why it was revoked
+  restoredAt         DateTime? // When VPN access was restored
+  restoredBy         String? // Who restored access
+  canRestore         Boolean               @default(true) // Whether account can be restored after revocation
+  notes              String?
+  batchId            String?
+  batchAccountItemId String?               @unique
+  batchAccountItem   BatchAccountItem?     @relation(fields: [batchAccountItemId], references: [id], onDelete: SetNull)
+  accessRequestId    String? // Link to the AccessRequest that created this VPN account
+  importId           String? // Link to the VPNImport that imported this account
+  adUsername         String? // Linked AD account username (for any account tied to an AD user)
+  statusLogs         VPNAccountStatusLog[] @relation("LiveVPNAccountStatusLogs")
+  comments           VPNAccountComment[]   @relation("LiveVPNAccountComments")
 
   @@index([username])
   @@index([portalType])
@@ -324,51 +487,58 @@ model VPNAccount {
 }
 
 model VPNAccountStatusLog {
-  id          String     @id @default(cuid())
-  createdAt   DateTime   @default(now())
-  accountId   String
-  account     VPNAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  oldStatus   String?
-  newStatus   String
-  changedBy   String
-  reason      String?
+  id                String                  @id @default(cuid())
+  createdAt         DateTime                @default(now())
+  accountId         String // Immutable historical VPN account ID
+  liveAccountId     String? // Nullable live relation; cleared when the account record is deleted
+  account           VPNAccount?             @relation("LiveVPNAccountStatusLogs", fields: [liveAccountId], references: [id], onDelete: SetNull)
+  lifecycleActionId String? // Durable correlation for lifecycle-created status and activity evidence
+  lifecycleAction   AccountLifecycleAction? @relation(fields: [lifecycleActionId], references: [id], onDelete: SetNull)
+  oldStatus         String?
+  newStatus         String
+  changedBy         String
+  reason            String?
 
   @@index([accountId])
+  @@index([liveAccountId])
+  @@index([lifecycleActionId])
   @@index([createdAt])
 }
 
 model VPNAccountComment {
-  id        String     @id @default(cuid())
-  createdAt DateTime   @default(now())
-  updatedAt DateTime   @updatedAt
-  comment   String
-  author    String
-  accountId String
-  type      String?    // Optional: 'admin', 'system', 'note', etc.
-  account   VPNAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  id            String      @id @default(cuid())
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  comment       String
+  author        String
+  accountId     String // Immutable historical VPN account ID
+  liveAccountId String? // Nullable live relation; cleared when the account record is deleted
+  type          String? // Optional: 'admin', 'system', 'note', etc.
+  account       VPNAccount? @relation("LiveVPNAccountComments", fields: [liveAccountId], references: [id], onDelete: SetNull)
 
   @@index([accountId])
+  @@index([liveAccountId])
   @@index([createdAt])
 }
 
 // VPN Import records - tracks spreadsheet imports of VPN users
 model VPNImport {
-  id              String              @id @default(cuid())
-  createdAt       DateTime            @default(now())
-  updatedAt       DateTime            @updatedAt
-  userType        String              // "Internal" or "External" - which user type this import is for
-  portalType      String?             // "Management" or "Limited" - only for Internal users
-  fileName        String              // Original filename of the imported spreadsheet
-  importedBy      String              // Admin username who imported
-  totalRecords    Int                 // Total records in import
-  matchedRecords  Int                 @default(0) // How many have been matched to AD accounts
+  id               String            @id @default(cuid())
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  userType         String // "Internal" or "External" - which user type this import is for
+  portalType       String? // "Management" or "Limited" - only for Internal users
+  fileName         String // Original filename of the imported spreadsheet
+  importedBy       String // Admin username who imported
+  totalRecords     Int // Total records in import
+  matchedRecords   Int               @default(0) // How many have been matched to AD accounts
   processedRecords Int               @default(0) // How many have been processed/created as VPN accounts
-  createdAccounts Int                 @default(0) // How many VPN accounts have been created
-  status          String              @default("pending") // "pending", "processing", "completed", "failed"
-  notes           String?
-  processedAt     DateTime?           // When the queue item was fully processed
-  expiresAt       DateTime?           // Auto-cleanup timestamp
-  importRecords   VPNImportRecord[]
+  createdAccounts  Int               @default(0) // How many VPN accounts have been created
+  status           String            @default("pending") // "pending", "processing", "completed", "failed"
+  notes            String?
+  processedAt      DateTime? // When the queue item was fully processed
+  expiresAt        DateTime? // Auto-cleanup timestamp
+  importRecords    VPNImportRecord[]
 
   @@index([portalType])
   @@index([userType])
@@ -381,34 +551,34 @@ model VPNImport {
 
 // Individual records from VPN import spreadsheets
 model VPNImportRecord {
-  id              String    @id @default(cuid())
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  importId        String
-  import          VPNImport @relation(fields: [importId], references: [id], onDelete: Cascade)
-  
+  id        String    @id @default(cuid())
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  importId  String
+  import    VPNImport @relation(fields: [importId], references: [id], onDelete: Cascade)
+
   // Data from spreadsheet
-  vpnUsername     String    // VPN username from spreadsheet
-  fullName        String?
-  email           String?
-  notes           String?
-  rawData         String?   // JSON string of all imported fields
-  
+  vpnUsername String // VPN username from spreadsheet
+  fullName    String?
+  email       String?
+  notes       String?
+  rawData     String? // JSON string of all imported fields
+
   // AD Matching
-  matchStatus     String    @default("unmatched") // "unmatched", "matched", "no_match", "conflict"
-  adUsername      String?   // Matched Active Directory username
-  adDisplayName   String?
-  adEmail         String?
-  adDepartment    String?
-  matchedBy       String?   // Admin who performed the match
-  matchedAt       DateTime?
-  matchNotes      String?
-  
+  matchStatus   String    @default("unmatched") // "unmatched", "matched", "no_match", "conflict"
+  adUsername    String? // Matched Active Directory username
+  adDisplayName String?
+  adEmail       String?
+  adDepartment  String?
+  matchedBy     String? // Admin who performed the match
+  matchedAt     DateTime?
+  matchNotes    String?
+
   // VPN Account Creation
-  vpnAccountCreated Boolean @default(false)
+  vpnAccountCreated Boolean   @default(false)
   vpnAccountId      String?
   createdAt_vpn     DateTime?
-  
+
   @@index([importId])
   @@index([vpnUsername])
   @@index([matchStatus])
@@ -416,19 +586,71 @@ model VPNImportRecord {
 }
 
 model Session {
-  id           String    @id @default(cuid())
-  tokenHash    String    @unique
-  username     String
-  isAdmin      Boolean   @default(false)
-  createdAt    DateTime  @default(now())
-  expiresAt    DateTime
-  lastActivity DateTime  @default(now())
-  revokedAt    DateTime?
-  ipAddress    String?
-  userAgent    String?
+  id                 String    @id @default(cuid())
+  tokenHash          String    @unique
+  username           String
+  isAdmin            Boolean   @default(false)
+  createdAt          DateTime  @default(now())
+  expiresAt          DateTime
+  lastActivity       DateTime  @default(now())
+  revokedAt          DateTime?
+  ipAddress          String?
+  userAgent          String?
+  authProvider       String    @default("ad") // "oidc" | "ad" | "ad_manual" | "ad_outage_fallback" | "local" | "local_manual"
+  // OIDC provider session uid (ID token `sid`). Set only for sessions
+  // established through the auth service; logout uses it to destroy the IdP
+  // session so a subsequent login re-prompts for credentials.
+  providerSid        String?
+  // First-party portal binding. New fields stay nullable/disabled until the
+  // device-risk rollout moves from shadow to enforcement.
+  deviceBindingState String? // pending | verified | reauth_required
+  deviceCookieHash   String?
+  fingerprintVersion Int?
+  fingerprintHash    String?
+  deviceVerifiedAt   DateTime?
+  riskLevel          String?
 
   @@index([username])
   @@index([expiresAt])
+  @@index([riskLevel, createdAt])
+}
+
+model ProviderLogoutTask {
+  id              String    @id @default(cuid())
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  username        String
+  providerSid     String
+  providerSidHash String    @unique
+  reason          String
+  status          String    @default("pending") // pending | processing | completed | reconciliation_required
+  claimId         String?   @unique
+  claimedAt       DateTime?
+  claimedUntil    DateTime?
+  attempts        Int       @default(0)
+  completedAt     DateTime?
+  lastError       String?
+
+  @@index([status, claimedUntil])
+  @@index([username, createdAt])
+}
+
+// Local break-glass accounts (ADR-0009). Never seeded with credentials by any
+// migration; created and rotated only by system administrators through System
+// Configuration. Password material is stored solely as a salted scrypt hash.
+model LocalAccount {
+  id           String    @id @default(cuid())
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  username     String    @unique
+  passwordHash String // scrypt$N$r$p$saltB64$keyB64 - never plaintext
+  purpose      String    @default("break_glass")
+  isActive     Boolean   @default(true)
+  createdBy    String
+  lastUsedAt   DateTime?
+  lastUsedIp   String?
+
+  @@index([isActive])
 }
 
 model BlockedEmail {
@@ -452,22 +674,23 @@ model BlockedEmail {
 }
 
 model SystemSettings {
-  id                        String    @id @default(cuid())
-  createdAt                 DateTime  @default(now())
-  updatedAt                 DateTime  @updatedAt
-  loginDisabled             Boolean   @default(false)
-  internalRegistrationDisabled Boolean @default(false)
-  externalRegistrationDisabled Boolean @default(false)
-  globalNotificationBanner  String?   // Legacy field - use NotificationBanner model instead
-  notificationBannerType    String?   // Legacy field - use NotificationBanner model instead
-  lastModifiedBy            String?
-  manualOverride            Boolean   @default(false) // When true, only DB edit can re-enable logins
-  
+  id                           String   @id @default(cuid())
+  createdAt                    DateTime @default(now())
+  updatedAt                    DateTime @updatedAt
+  loginDisabled                Boolean  @default(false)
+  internalRegistrationDisabled Boolean  @default(false)
+  externalRegistrationDisabled Boolean  @default(false)
+  globalNotificationBanner     String? // Legacy field - use NotificationBanner model instead
+  notificationBannerType       String? // Legacy field - use NotificationBanner model instead
+  lastModifiedBy               String?
+  manualOverride               Boolean  @default(false) // When true, only DB edit can re-enable logins
+  authMode                     String? // Effective sign-in mode override: "oidc" | "native" | "local" (null = env AUTH_MODE)
+
   // Email Configuration
-  emailFrom                 String?   // "From" email address
-  adminEmail                String?   // Admin notification email
-  facultyEmail              String?   // Faculty approval notification email
-  studentDirectorEmails     String?   // Comma-separated list of student director emails
+  emailFrom             String? // "From" email address
+  adminEmail            String? // Admin notification email
+  facultyEmail          String? // Faculty approval notification email
+  studentDirectorEmails String? // Comma-separated list of student director emails
 
   @@index([loginDisabled])
   @@index([internalRegistrationDisabled])
@@ -475,17 +698,17 @@ model SystemSettings {
 }
 
 model NotificationBanner {
-  id            String    @id @default(cuid())
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-  message       String
-  type          String    // "info", "warning", "error", "success"
-  priority      Int       @default(0) // Higher numbers display first
-  isActive      Boolean   @default(true)
-  startDate     DateTime? // Optional: when to start showing
-  endDate       DateTime? // Optional: when to stop showing
-  createdBy     String
-  dismissible   Boolean   @default(true)
+  id          String    @id @default(cuid())
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  message     String
+  type        String // "info", "warning", "error", "success"
+  priority    Int       @default(0) // Higher numbers display first
+  isActive    Boolean   @default(true)
+  startDate   DateTime? // Optional: when to start showing
+  endDate     DateTime? // Optional: when to stop showing
+  createdBy   String
+  dismissible Boolean   @default(true)
 
   @@index([isActive])
   @@index([priority])
@@ -494,59 +717,67 @@ model NotificationBanner {
 }
 
 model MassEmailCampaign {
-  id                 String               @id @default(cuid())
-  createdAt          DateTime             @default(now())
-  updatedAt          DateTime             @updatedAt
-  name               String?
-  subject            String
-  html               String
-  text               String
-  createdBy          String
-  status             String               @default("draft") // "draft", "active", "completed", "cancelled"
-  quickSend          Boolean              @default(false)
-  dryRunAt           DateTime             @default(now())
-  activatedAt        DateTime?
-  activatedBy        String?
-  completedAt        DateTime?
-  cancelledAt        DateTime?
-  cancelledBy        String?
-  targetSnapshot     Json?
-  totalRecipients    Int                  @default(0)
-  eligibleRecipients Int                  @default(0)
-  skippedRecipients  Int                  @default(0)
-  sentCount          Int                  @default(0)
-  failedCount        Int                  @default(0)
-  recipients         MassEmailRecipient[]
-  logs               MassEmailLog[]
+  id                     String               @id @default(cuid())
+  createdAt              DateTime             @default(now())
+  updatedAt              DateTime             @updatedAt
+  name                   String?
+  subject                String
+  html                   String
+  text                   String
+  createdBy              String
+  status                 String               @default("draft") // "draft", "active", "completed", "cancelled"
+  quickSend              Boolean              @default(false)
+  dryRunAt               DateTime             @default(now())
+  activatedAt            DateTime?
+  activatedBy            String?
+  activationClaimId      String?              @unique
+  activationClaimedUntil DateTime?
+  completedAt            DateTime?
+  cancelledAt            DateTime?
+  cancelledBy            String?
+  targetSnapshot         Json?
+  totalRecipients        Int                  @default(0)
+  eligibleRecipients     Int                  @default(0)
+  skippedRecipients      Int                  @default(0)
+  sentCount              Int                  @default(0)
+  failedCount            Int                  @default(0)
+  recipients             MassEmailRecipient[]
+  logs                   MassEmailLog[]
 
   @@index([status])
   @@index([createdAt])
   @@index([createdBy])
+  @@index([status, activationClaimedUntil])
 }
 
 model MassEmailRecipient {
-  id             String            @id @default(cuid())
-  createdAt      DateTime          @default(now())
-  updatedAt      DateTime          @updatedAt
-  campaignId     String
-  campaign       MassEmailCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
-  email          String
-  displayName    String?
-  adUsername     String?
-  adDn           String?
-  accountEnabled Boolean?
-  status         String            @default("ready") // "ready", "pending_send", "sending", "sent", "failed"
-  sources        Json?
-  emailClaimedAt DateTime?
-  sentAt         DateTime?
-  messageId      String?
-  failedAt       DateTime?
-  lastError      String?
-  logs           MassEmailLog[]
+  id                     String            @id @default(cuid())
+  createdAt              DateTime          @default(now())
+  updatedAt              DateTime          @updatedAt
+  campaignId             String
+  campaign               MassEmailCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  email                  String
+  displayName            String?
+  adUsername             String?
+  adDn                   String?
+  accountEnabled         Boolean?
+  status                 String            @default("ready") // ready | pending_send | sending | sent | failed | delivery_unknown | retry_authorized
+  sources                Json?
+  emailClaimedAt         DateTime?
+  emailClaimId           String?           @unique
+  emailClaimedUntil      DateTime?
+  deliveryAttempts       Int               @default(0)
+  deliveryFailureCounted Boolean           @default(false)
+  sentAt                 DateTime?
+  messageId              String?
+  failedAt               DateTime?
+  lastError              String?
+  logs                   MassEmailLog[]
 
   @@unique([campaignId, email])
   @@index([campaignId])
   @@index([status])
+  @@index([status, emailClaimedUntil])
   @@index([email])
   @@index([adUsername])
 }
@@ -572,27 +803,30 @@ model MassEmailLog {
 }
 
 model AuditLog {
-  id            String    @id @default(cuid())
-  createdAt     DateTime  @default(now())
-  action        String    // Action type: "view_page", "create", "update", "delete", "approve", "reject", etc.
-  category      String    // Category: "access_request", "event", "user", "batch", "vpn", "support", "settings", "blocklist", "navigation"
-  username      String    // Admin who performed the action
-  actorType     String?   // "admin", "user", "system", or "anonymous"
-  targetId      String?   // ID of the affected resource (if applicable)
-  targetType    String?   // Type of target: "AccessRequest", "Event", "User", "Batch", "VPNAccount", "SupportTicket", etc.
-  subjectUsername String? // User/account username this log entry is about
-  subjectEmail  String?   // User/account email this log entry is about
-  relatedRequestId String? // AccessRequest ID this action affected or was derived from
-  relatedVpnAccountId String? // VPNAccount ID this action affected or was derived from
+  id                       String   @id @default(cuid())
+  createdAt                DateTime @default(now())
+  action                   String // Action type: "view_page", "create", "update", "delete", "approve", "reject", etc.
+  category                 String // Category: "access_request", "event", "user", "batch", "vpn", "support", "settings", "blocklist", "navigation"
+  username                 String // Admin who performed the action
+  actorType                String? // "admin", "user", "system", or "anonymous"
+  targetId                 String? // ID of the affected resource (if applicable)
+  targetType               String? // Type of target: "AccessRequest", "Event", "User", "Batch", "VPNAccount", "SupportTicket", etc.
+  subjectUsername          String? // User/account username this log entry is about
+  subjectEmail             String? // User/account email this log entry is about
+  relatedRequestId         String? // AccessRequest ID this action affected or was derived from
+  relatedVpnAccountId      String? // VPNAccount ID this action affected or was derived from
   relatedLifecycleActionId String? // AccountLifecycleAction ID this action affected or was derived from
-  eventKind     String?   // "read", "write", "notification", "security", "system", "lifecycle", "sync"
-  outcome       String?   // "success", "failure", "denied", "pending", "rollback", "skipped"
-  correlationId String?   // Groups multi-step operations across logs
-  details       String?   // JSON string with additional details about the action
-  ipAddress     String?   // IP address of the admin
-  userAgent     String?   // Browser/user agent information
-  success       Boolean   @default(true) // Whether the action succeeded
-  errorMessage  String?   // Error message if action failed
+  eventKind                String? // "read", "write", "notification", "security", "system", "lifecycle", "sync"
+  outcome                  String? // "success", "failure", "denied", "pending", "rollback", "skipped"
+  correlationId            String? // Groups multi-step operations across logs
+  clientId                 String? // OIDC relying party when the event is application-scoped
+  providerSid              String? // IdP provider session identifier when applicable
+  riskLevel                String? // low | medium | high for device/session evidence
+  details                  String? // JSON string with additional details about the action
+  ipAddress                String? // IP address of the admin
+  userAgent                String? // Browser/user agent information
+  success                  Boolean  @default(true) // Whether the action succeeded
+  errorMessage             String? // Error message if action failed
 
   @@index([username])
   @@index([action])
@@ -607,163 +841,271 @@ model AuditLog {
   @@index([relatedVpnAccountId, createdAt])
   @@index([relatedLifecycleActionId, createdAt])
   @@index([eventKind])
+  @@index([clientId, createdAt])
+  @@index([riskLevel, createdAt])
+  @@index([outcome, createdAt])
   @@index([outcome])
   @@index([correlationId])
 }
 
 // Account Lifecycle Management - Track disable/enable operations for AD and VPN accounts
 model AccountLifecycleAction {
-  id                  String                        @id @default(cuid())
-  createdAt           DateTime                      @default(now())
-  updatedAt           DateTime                      @updatedAt
-  actionType          String                        // "disable_ad", "enable_ad", "revoke_vpn", "restore_vpn", "promote_vpn_role", "demote_vpn_role"
-  targetAccountType   String                        // "AD", "VPN", "BOTH"
-  targetUsername      String                        // The username (AD or VPN) being affected
-  targetUserId        String?                       // Link to AccessRequest or VPNAccount ID
-  status              String                        @default("processing") // "processing", "completed", "failed", "cancelled"
-  reason              String                        // Why the action is being taken
-  requestedBy         String                        // Admin username who requested
-  requestedAt         DateTime                      @default(now())
-  scheduledFor        DateTime?                     // Optional: schedule for future execution
-  processedAt         DateTime?
-  processedBy         String?                       // System or admin who processed
-  completedAt         DateTime?
-  errorMessage        String?
-  rollbackData        String?                       // JSON string with data needed for rollback
-  relatedRequestId    String?                       // Link to AccessRequest if applicable
-  relatedTicketId     String?                       // Link to SupportTicket if applicable
-  vpnRoleChange       String?                       // For role changes: "Limited->Management", "Management->Limited"
-  adDisabled          Boolean                       @default(false) // Track if AD portion completed
-  vpnDisabled         Boolean                       @default(false) // Track if VPN portion completed
-  canRestore          Boolean                       @default(true)  // Whether this account can be restored
-  notes               String?                       // Additional notes
-  batchId             String?                       // Link to AccountLifecycleBatch if part of batch
-  batch               AccountLifecycleBatch?        @relation(fields: [batchId], references: [id])
-  offboardCampaignId  String?                       // Link to an offboard campaign if this action was created by campaign enforcement/rollback
-  offboardRecipientId String?                       // Link to the offboard campaign recipient that caused this action
-  offboardCampaign    OffboardCampaign?             @relation(fields: [offboardCampaignId], references: [id], onDelete: SetNull)
-  offboardRecipient   OffboardCampaignRecipient?    @relation(fields: [offboardRecipientId], references: [id], onDelete: SetNull)
-  history             AccountLifecycleHistory[]
-  adActivityLogs      ADAccountActivityLog[]
-  vpnActivityLogs     VPNAccountActivityLog[]
-  
+  id                        String                     @id @default(cuid())
+  createdAt                 DateTime                   @default(now())
+  updatedAt                 DateTime                   @updatedAt
+  actionType                String // "disable_ad", "enable_ad", "delete_ad", "revoke_vpn", "restore_vpn", "delete_vpn_record", "promote_vpn_role", "demote_vpn_role"
+  targetAccountType         String // "AD", "VPN", "BOTH"
+  targetUsername            String // The username (AD or VPN) being affected
+  targetUserId              String? // Link to AccessRequest or VPNAccount ID
+  operationMode             String                     @default("governed") // governed | batch_governed | directory_override
+  targetDirectoryDn         String? // Immutable-at-confirmation directory target snapshot
+  targetDirectoryObjectGuid String? // Immutable AD object identity captured at confirmation
+  bindingFailureCode        String? // Why governed request linkage was unavailable
+  preflightSnapshot         Json? // Directory/application state observed before execution
+  resultSnapshot            Json? // Directory state read back after execution
+  authorizationEvidence     Json? // Override acknowledgement and effective authorization evidence
+  policyVersion             String? // Lifecycle policy contract used for confirmation
+  status                    String                     @default("queued") // "queued", "processing", "completed", "failed", "reconciliation_required", "cancelled"
+  reason                    String // Why the action is being taken
+  requestedBy               String // Admin username who requested
+  requestedAt               DateTime                   @default(now())
+  scheduledFor              DateTime? // Optional: schedule for future execution
+  processedAt               DateTime?
+  processedBy               String? // System or admin who processed
+  claimId                   String? // Identifies the worker currently allowed to finalize this action
+  claimedUntil              DateTime? // Expired processing claims may be recovered by another worker
+  attempts                  Int                        @default(0)
+  completedAt               DateTime?
+  errorMessage              String?
+  rollbackData              String? // JSON string with data needed for rollback
+  relatedRequestId          String? // Link to AccessRequest if applicable
+  relatedBatchAccountItemId String? // BatchAccountItem ownership ledger when no AccessRequest exists
+  relatedBatchAccountItem   BatchAccountItem?          @relation(fields: [relatedBatchAccountItemId], references: [id], onDelete: SetNull)
+  relatedTicketId           String? // Link to SupportTicket if applicable
+  targetGroupDn             String? // Durable group target for membership actions
+  targetGroupObjectGuid     String? // Immutable AD group identity captured at confirmation
+  idempotencyKey            String?                    @unique // Stable workflow action key
+  vpnRoleChange             String? // For role changes: "Limited->Management", "Management->Limited"
+  adDisabled                Boolean                    @default(false) // Track if AD portion completed
+  vpnDisabled               Boolean                    @default(false) // Track if VPN portion completed
+  canRestore                Boolean                    @default(true) // Whether this account can be restored
+  notes                     String? // Additional notes
+  batchId                   String? // Link to AccountLifecycleBatch if part of batch
+  batch                     AccountLifecycleBatch?     @relation(fields: [batchId], references: [id])
+  planTargetKey             String? // Stable per-account key inside a reviewed lifecycle plan
+  planOrdinal               Int? // Server-enforced record order inside a reviewed deletion plan
+  offboardCampaignId        String? // Link to an offboard campaign if this action was created by campaign enforcement/rollback
+  offboardRecipientId       String? // Link to the offboard campaign recipient that caused this action
+  offboardOperationRunId    String? // Exact reviewed activation/rollback run authorizing this action
+  offboardCampaign          OffboardCampaign?          @relation(fields: [offboardCampaignId], references: [id], onDelete: SetNull)
+  offboardRecipient         OffboardCampaignRecipient? @relation(fields: [offboardRecipientId], references: [id], onDelete: SetNull)
+  offboardOperationRun      OffboardOperationRun?      @relation(fields: [offboardOperationRunId], references: [id], onDelete: SetNull)
+  history                   AccountLifecycleHistory[]
+  adActivityLogs            ADAccountActivityLog[]
+  vpnActivityLogs           VPNAccountActivityLog[]
+  vpnStatusLogs             VPNAccountStatusLog[]
+
+  @@unique([batchId, planTargetKey, actionType])
+  @@unique([batchId, planOrdinal])
   @@index([targetUsername])
+  @@index([operationMode])
   @@index([status])
   @@index([actionType])
   @@index([requestedBy])
   @@index([createdAt])
   @@index([scheduledFor])
+  @@index([status, claimedUntil])
   @@index([batchId])
   @@index([relatedRequestId])
+  @@index([relatedBatchAccountItemId])
   @@index([relatedTicketId])
+  @@index([targetGroupDn])
   @@index([targetUserId])
   @@index([offboardCampaignId])
   @@index([offboardRecipientId])
+  @@index([offboardOperationRunId])
 }
 
 model OffboardCampaign {
-  id                        String                      @id @default(cuid())
-  createdAt                 DateTime                    @default(now())
-  updatedAt                 DateTime                    @updatedAt
-  name                      String
-  createdBy                 String
-  status                    String                      @default("dry_run") // "dry_run", "active", "completed", "cancelled"
-  dryRunAt                  DateTime                    @default(now())
-  activatedAt               DateTime?
-  activatedBy               String?
-  completedAt               DateTime?
-  cancelledAt               DateTime?
-  cancelledBy               String?
-  emergencyStoppedAt        DateTime?
-  emergencyStoppedBy        String?
-  activeLockKey             String?                     @unique
-  waveSize                  Int                         @default(25)
-  canarySize                Int                         @default(0)
-  currentWave               Int                         @default(0)
-  pauseAfterEachWave        Boolean                     @default(true)
-  sendingPaused             Boolean                     @default(true)
-  remindersPaused           Boolean                     @default(false)
-  enforcementPaused         Boolean                     @default(false)
-  sendingCompletedAt        DateTime?
-  rollbackState             String                      @default("none") // "none", "previewed", "processing", "completed", "failed"
-  rollbackStartedAt         DateTime?
-  rollbackStartedBy         String?
-  rollbackCompletedAt       DateTime?
-  manualExcludedUsernames   Json?
-  manualExcludedEmails      Json?
-  summaryJson               Json?
-  totalRecipients           Int                         @default(0)
-  eligibleRecipients        Int                         @default(0)
-  skippedRecipients         Int                         @default(0)
-  sentCount                 Int                         @default(0)
-  reminder3Count            Int                         @default(0)
-  reminder6Count            Int                         @default(0)
-  verifiedCount             Int                         @default(0)
-  enforcedCount             Int                         @default(0)
-  failedCount               Int                         @default(0)
-  rollbackSuccessCount      Int                         @default(0)
-  rollbackFailureCount      Int                         @default(0)
-  recipients                OffboardCampaignRecipient[]
-  logs                      OffboardCampaignLog[]
-  extensions                OffboardCampaignExtension[]
-  lifecycleActions          AccountLifecycleAction[]
+  id                         String                      @id @default(cuid())
+  createdAt                  DateTime                    @default(now())
+  updatedAt                  DateTime                    @updatedAt
+  name                       String
+  createdBy                  String
+  workflowMode               String                      @default("verification") // "verification" | "direct"
+  status                     String                      @default("dry_run") // "dry_run", "active", "completed", "cancelled"
+  dryRunAt                   DateTime                    @default(now())
+  activatedAt                DateTime?
+  activatedBy                String?
+  completedAt                DateTime?
+  cancelledAt                DateTime?
+  cancelledBy                String?
+  emergencyStoppedAt         DateTime?
+  emergencyStoppedBy         String?
+  activeLockKey              String?                     @unique
+  waveSize                   Int                         @default(25)
+  canarySize                 Int                         @default(0)
+  currentWave                Int                         @default(0)
+  pauseAfterEachWave         Boolean                     @default(true)
+  sendingPaused              Boolean                     @default(true)
+  remindersPaused            Boolean                     @default(false)
+  enforcementPaused          Boolean                     @default(false)
+  executionPaused            Boolean                     @default(true) // Direct-mode claim gate; does not interrupt an in-flight recipient
+  sendingCompletedAt         DateTime?
+  directExecutionCompletedAt DateTime?
+  activationOperationRunId   String?
+  directOffboardReason       String?
+  directOffboardReference    String?
+  directAcknowledgedAt       DateTime?
+  directAcknowledgedBy       String?
+  rollbackState              String                      @default("none") // "none", "previewed", "processing", "completed", "failed"
+  rollbackStartedAt          DateTime?
+  rollbackStartedBy          String?
+  rollbackCompletedAt        DateTime?
+  manualExcludedUsernames    Json?
+  manualExcludedEmails       Json?
+  summaryJson                Json?
+  totalRecipients            Int                         @default(0)
+  eligibleRecipients         Int                         @default(0)
+  skippedRecipients          Int                         @default(0)
+  sentCount                  Int                         @default(0)
+  reminder3Count             Int                         @default(0)
+  reminder6Count             Int                         @default(0)
+  verifiedCount              Int                         @default(0)
+  enforcedCount              Int                         @default(0)
+  failedCount                Int                         @default(0)
+  finalNoticeSentCount       Int                         @default(0)
+  finalNoticeFailureCount    Int                         @default(0)
+  rollbackSuccessCount       Int                         @default(0)
+  rollbackFailureCount       Int                         @default(0)
+  recipients                 OffboardCampaignRecipient[]
+  logs                       OffboardCampaignLog[]
+  extensions                 OffboardCampaignExtension[]
+  lifecycleActions           AccountLifecycleAction[]
+  operationRuns              OffboardOperationRun[]
+  vpnIdentityFences          VpnIdentityOffboardFence[]
 
   @@index([status])
+  @@index([workflowMode, status])
   @@index([createdAt])
   @@index([activeLockKey])
 }
 
-model OffboardCampaignRecipient {
-  id                    String                   @id @default(cuid())
-  createdAt             DateTime                 @default(now())
-  updatedAt             DateTime                 @updatedAt
+// Immutable operator-approved snapshot for an activation or rollback. The
+// snapshot is claimed before any external work begins so a browser retry cannot
+// create a second AD/VPN mutation.
+model OffboardOperationRun {
+  id                    String                     @id @default(cuid())
+  createdAt             DateTime                   @default(now())
+  updatedAt             DateTime                   @updatedAt
   campaignId            String
-  campaign              OffboardCampaign         @relation(fields: [campaignId], references: [id], onDelete: Cascade)
-  email                 String
-  displayName           String?
-  adUsername            String
-  adDn                  String?
-  linkedVpnUsername     String?
-  accessRequestId       String?
-  vpnAccountId          String?
-  originalAdEnabled     Boolean?
-  originalAdStatus      String?
-  originalVpnStatus     String?
-  originalVpnPortalType String?
-  originalSnapshot      Json?
-  tokenHash             String?                  @unique
-  waveNumber            Int                      @default(0)
-  status                String                   @default("dry_run_ready")
-  skipReason            String?
-  projectedDeadlineAt   DateTime?
-  projectedAction       String?
-  emailClaimedAt        DateTime?
-  initialEmailSentAt    DateTime?
-  initialEmailMessageId String?
-  reminder3ClaimedAt    DateTime?
-  reminder3SentAt       DateTime?
-  reminder6ClaimedAt    DateTime?
-  reminder6SentAt       DateTime?
-  deadlineAt            DateTime?
-  verifiedAt            DateTime?
-  verifiedIpAddress     String?
-  verifiedUserAgent     String?
-  enforcementClaimedAt  DateTime?
-  enforcedAt            DateTime?
-  enforcementSkippedAt  DateTime?
-  enforcementError      String?
-  adLifecycleActionId   String?
-  vpnLifecycleActionId  String?
-  rollbackStatus        String?
-  rollbackClaimedAt     DateTime?
-  rollbackAdActionId    String?
-  rollbackVpnActionId   String?
-  rollbackError         String?
-  lastError             String?
-  tokens                OffboardCampaignRecipientToken[]
-  logs                  OffboardCampaignLog[]
-  extensions            OffboardCampaignExtension[]
+  campaign              OffboardCampaign           @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  actor                 String
+  kind                  String // "activation" | "rollback"
+  digest                String
+  expiresAt             DateTime
+  status                String                     @default("previewed") // "previewed", "claimed", "completed", "failed", "stale", "expired", "reconciliation_required"
+  claimId               String?                    @unique
+  claimedAt             DateTime?
+  claimedUntil          DateTime?
+  idempotencyKey        String?                    @unique
+  policyVersion         String?
+  authorizationEvidence Json?
+  summary               Json?
+  items                 OffboardOperationRunItem[]
   lifecycleActions      AccountLifecycleAction[]
+
+  @@index([campaignId, kind, createdAt])
+  @@index([status, expiresAt])
+}
+
+model OffboardOperationRunItem {
+  id            String                     @id @default(cuid())
+  createdAt     DateTime                   @default(now())
+  updatedAt     DateTime                   @updatedAt
+  runId         String
+  run           OffboardOperationRun       @relation(fields: [runId], references: [id], onDelete: Cascade)
+  recipientId   String?
+  recipient     OffboardCampaignRecipient? @relation(fields: [recipientId], references: [id], onDelete: SetNull)
+  position      Int
+  expectedState Json
+  actions       Json
+  conflicts     Json
+  outcome       Json?
+  status        String                     @default("previewed") // "previewed", "skipped", "completed", "failed", "reconciliation_required"
+
+  @@unique([runId, position])
+  @@index([recipientId])
+  @@index([runId, status])
+}
+
+model OffboardCampaignRecipient {
+  id                        String                           @id @default(cuid())
+  createdAt                 DateTime                         @default(now())
+  updatedAt                 DateTime                         @updatedAt
+  campaignId                String
+  campaign                  OffboardCampaign                 @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  email                     String
+  displayName               String?
+  adUsername                String
+  adDn                      String?
+  linkedVpnUsername         String?
+  accessRequestId           String?
+  vpnAccountId              String?
+  originalAdEnabled         Boolean?
+  originalAdStatus          String?
+  originalVpnStatus         String?
+  originalVpnPortalType     String?
+  originalSnapshot          Json?
+  targetDirectoryObjectGuid String?
+  expectedRequestVersion    Int?
+  tokenHash                 String?                          @unique
+  waveNumber                Int                              @default(0)
+  status                    String                           @default("dry_run_ready")
+  skipReason                String?
+  projectedDeadlineAt       DateTime?
+  projectedAction           String?
+  emailClaimedAt            DateTime?
+  initialEmailSentAt        DateTime?
+  initialEmailMessageId     String?
+  reminder3ClaimedAt        DateTime?
+  reminder3SentAt           DateTime?
+  reminder6ClaimedAt        DateTime?
+  reminder6SentAt           DateTime?
+  deadlineAt                DateTime?
+  verifiedAt                DateTime?
+  verifiedIpAddress         String?
+  verifiedUserAgent         String?
+  enforcementClaimedAt      DateTime?
+  enforcementClaimId        String?                          @unique
+  enforcementClaimedUntil   DateTime?
+  enforcementFailureCounted Boolean                          @default(false)
+  enforcementExpectedAd     Boolean?
+  enforcementExpectedVpn    Boolean?
+  enforcedAt                DateTime?
+  enforcementSkippedAt      DateTime?
+  enforcementError          String?
+  adLifecycleActionId       String?
+  vpnLifecycleActionId      String?
+  rollbackStatus            String?
+  rollbackClaimedAt         DateTime?
+  rollbackAdActionId        String?
+  rollbackVpnActionId       String?
+  rollbackError             String?
+  lastError                 String?
+  finalNoticeStatus         String                           @default("not_applicable") // not_applicable | pending | sending | sent | failed | reconciliation_required
+  finalNoticeClaimId        String?                          @unique
+  finalNoticeClaimedAt      DateTime?
+  finalNoticeClaimedUntil   DateTime?
+  finalNoticeSentAt         DateTime?
+  finalNoticeMessageId      String?
+  finalNoticeError          String?
+  tokens                    OffboardCampaignRecipientToken[]
+  logs                      OffboardCampaignLog[]
+  extensions                OffboardCampaignExtension[]
+  lifecycleActions          AccountLifecycleAction[]
+  operationRunItems         OffboardOperationRunItem[]
+  vpnIdentityFence          VpnIdentityOffboardFence?
 
   @@unique([campaignId, adUsername])
   @@index([campaignId])
@@ -775,6 +1117,26 @@ model OffboardCampaignRecipient {
   @@index([deadlineAt])
   @@index([verifiedAt])
   @@index([enforcedAt])
+  @@index([status, enforcementClaimedUntil])
+  @@index([finalNoticeStatus, finalNoticeClaimedUntil])
+}
+
+// Durable cross-path fence established when a reviewed direct-offboarding
+// recipient is claimed. A database trigger consults this row before any VPN
+// identity can become live, so imports, admin changes, and provisioning all
+// share the same race boundary.
+model VpnIdentityOffboardFence {
+  canonicalAdUsername    String                    @id
+  campaignId             String
+  campaign               OffboardCampaign          @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  recipientId            String                    @unique
+  recipient              OffboardCampaignRecipient @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  blockedAccessRequestId String?
+  createdAt              DateTime                  @default(now())
+  updatedAt              DateTime                  @updatedAt
+
+  @@index([campaignId])
+  @@index([blockedAccessRequestId])
 }
 
 model OffboardCampaignRecipientToken {
@@ -813,26 +1175,26 @@ model OffboardCampaignLog {
 }
 
 model OffboardCampaignExtension {
-  id                       String                              @id @default(cuid())
-  createdAt                DateTime                            @default(now())
-  updatedAt                DateTime                            @updatedAt
-  campaignId               String
-  campaign                 OffboardCampaign                    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
-  recipientId              String
-  recipient                OffboardCampaignRecipient           @relation(fields: [recipientId], references: [id], onDelete: Cascade)
-  createdBy                String
-  note                     String?
-  previousDeadlineAt       DateTime?
-  newDeadlineAt            DateTime
-  previousStatus           String
-  status                   String                              @default("pending_notification")
-  reactivationRequired     Boolean                             @default(false)
-  reactivationAdActionId   String?
-  reactivationVpnActionId  String?
-  notificationSentAt       DateTime?
-  notificationMessageId    String?
-  notificationError        String?
-  reminders                OffboardCampaignExtensionReminder[]
+  id                      String                              @id @default(cuid())
+  createdAt               DateTime                            @default(now())
+  updatedAt               DateTime                            @updatedAt
+  campaignId              String
+  campaign                OffboardCampaign                    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  recipientId             String
+  recipient               OffboardCampaignRecipient           @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  createdBy               String
+  note                    String?
+  previousDeadlineAt      DateTime?
+  newDeadlineAt           DateTime
+  previousStatus          String
+  status                  String                              @default("pending_notification")
+  reactivationRequired    Boolean                             @default(false)
+  reactivationAdActionId  String?
+  reactivationVpnActionId String?
+  notificationSentAt      DateTime?
+  notificationMessageId   String?
+  notificationError       String?
+  reminders               OffboardCampaignExtensionReminder[]
 
   @@index([campaignId])
   @@index([recipientId])
@@ -841,16 +1203,16 @@ model OffboardCampaignExtension {
 }
 
 model OffboardCampaignExtensionReminder {
-  id            String                    @id @default(cuid())
-  createdAt     DateTime                  @default(now())
-  updatedAt     DateTime                  @updatedAt
-  extensionId   String
-  extension     OffboardCampaignExtension @relation(fields: [extensionId], references: [id], onDelete: Cascade)
-  scheduledFor  DateTime
-  claimedAt     DateTime?
-  sentAt        DateTime?
-  messageId     String?
-  lastError     String?
+  id           String                    @id @default(cuid())
+  createdAt    DateTime                  @default(now())
+  updatedAt    DateTime                  @updatedAt
+  extensionId  String
+  extension    OffboardCampaignExtension @relation(fields: [extensionId], references: [id], onDelete: Cascade)
+  scheduledFor DateTime
+  claimedAt    DateTime?
+  sentAt       DateTime?
+  messageId    String?
+  lastError    String?
 
   @@index([extensionId])
   @@index([scheduledFor])
@@ -859,56 +1221,68 @@ model OffboardCampaignExtensionReminder {
 
 // Batch operations for account lifecycle (e.g., disable multiple accounts at once)
 model AccountLifecycleBatch {
-  id                  String                      @id @default(cuid())
-  createdAt           DateTime                    @default(now())
-  updatedAt           DateTime                    @updatedAt
-  batchType           String                      // "disable", "enable", "role_change"
-  description         String
-  requestedBy         String
-  totalActions        Int
-  completedActions    Int                         @default(0)
-  failedActions       Int                         @default(0)
-  status              String                      @default("pending") // "pending", "processing", "completed", "failed", "partial"
-  startedAt           DateTime?
-  completedAt         DateTime?
-  relatedTicketId     String?
-  notes               String?
-  actions             AccountLifecycleAction[]
-  
+  id                    String                   @id @default(cuid())
+  createdAt             DateTime                 @default(now())
+  updatedAt             DateTime                 @updatedAt
+  batchType             String // "disable", "enable", "role_change"
+  description           String
+  requestedBy           String
+  totalActions          Int
+  completedActions      Int                      @default(0)
+  failedActions         Int                      @default(0)
+  status                String                   @default("pending") // "pending", "processing", "completed", "failed", "partial"
+  startedAt             DateTime?
+  completedAt           DateTime?
+  relatedTicketId       String?
+  notes                 String?
+  idempotencyKey        String?                  @unique
+  policyVersion         String?
+  selectionDigest       String?
+  authorizationEvidence Json?
+  resultSummary         Json?
+  totalTargets          Int                      @default(0)
+  sourceBatchId         String?
+  expiresAt             DateTime?
+  confirmedAt           DateTime?
+  confirmedBy           String?
+  actions               AccountLifecycleAction[]
+
   @@index([requestedBy])
   @@index([status])
   @@index([createdAt])
+  @@index([sourceBatchId])
+  @@index([expiresAt])
 }
 
 // History tracking for all account lifecycle changes
 model AccountLifecycleHistory {
-  id                  String                    @id @default(cuid())
-  createdAt           DateTime                  @default(now())
-  actionId            String
-  action              AccountLifecycleAction    @relation(fields: [actionId], references: [id], onDelete: Cascade)
-  event               String                    // "created", "queued", "processing", "completed", "failed", "cancelled", "rolled_back"
-  details             String?                   // JSON string with additional details
-  performedBy         String?
-  previousStatus      String?
-  newStatus           String?
-  
+  id             String                 @id @default(cuid())
+  createdAt      DateTime               @default(now())
+  actionId       String
+  action         AccountLifecycleAction @relation(fields: [actionId], references: [id], onDelete: Cascade)
+  event          String // "created", "queued", "processing", "completed", "failed", "cancelled", "rolled_back"
+  details        String? // JSON string with additional details
+  performedBy    String?
+  previousStatus String?
+  newStatus      String?
+
   @@index([actionId])
   @@index([createdAt])
 }
 
 // VPN Role Management - Track portal type changes (Limited <-> Management)
 model VPNRoleChange {
-  id                  String      @id @default(cuid())
-  createdAt           DateTime    @default(now())
-  vpnAccountId        String
-  username            String
-  previousRole        String      // "Limited", "Management", "External"
-  newRole             String      // "Limited", "Management", "External"
-  changedBy           String
-  reason              String
-  relatedActionId     String?     // Link to AccountLifecycleAction if applicable
-  notes               String?
-  
+  id              String   @id @default(cuid())
+  createdAt       DateTime @default(now())
+  vpnAccountId    String
+  username        String
+  previousRole    String // "Limited", "Management", "External"
+  newRole         String // "Limited", "Management", "External"
+  changedBy       String
+  reason          String
+  relatedActionId String? // Link to AccountLifecycleAction if applicable
+  notes           String?
+
   @@index([vpnAccountId])
   @@index([username])
   @@index([createdAt])
@@ -917,58 +1291,79 @@ model VPNRoleChange {
 
 // AD Account Sync - Automatic synchronization of existing AD accounts with VPN access
 model ADAccountSync {
-  id                String              @id @default(cuid())
-  createdAt         DateTime            @default(now())
-  updatedAt         DateTime            @updatedAt
-  startedAt         DateTime            @default(now())
-  completedAt       DateTime?
-  status            String              @default("running") // "running", "completed", "failed", "partial"
-  triggeredBy       String              // Admin username who triggered the sync
-  
+  id          String    @id @default(cuid())
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+  status      String    @default("running") // "running", "completed", "failed", "partial"
+  triggeredBy String // Admin username who triggered the sync
+
   // Statistics
-  totalADAccounts   Int                 @default(0) // Total AD accounts found with @cpp.edu
-  totalVPNAccounts  Int                 @default(0) // Total VPN accounts in Limited portal
-  matchedAccounts   Int                 @default(0) // Successfully matched accounts
-  unmatchedAD       Int                 @default(0) // AD accounts without VPN match
-  unmatchedVPN      Int                 @default(0) // VPN accounts without AD match
-  autoAssigned      Int                 @default(0) // Access requests automatically assigned
-  
-  errorMessage      String?             // Error if sync failed
-  notes             String?
-  matches           ADAccountMatch[]
+  totalADAccounts  Int @default(0) // Total AD accounts found with @cpp.edu
+  totalVPNAccounts Int @default(0) // Total VPN accounts in Limited portal
+  matchedAccounts  Int @default(0) // Successfully matched accounts
+  unmatchedAD      Int @default(0) // AD accounts without VPN match
+  unmatchedVPN     Int @default(0) // VPN accounts without AD match
+  autoAssigned     Int @default(0) // Access requests automatically assigned
+
+  errorMessage String? // Error if sync failed
+  notes        String?
+  matches      ADAccountMatch[]
+  taggingTasks InfrastructureTaggingTask[]
 
   @@index([triggeredBy])
   @@index([createdAt])
   @@index([status])
 }
 
+model InfrastructureTaggingTask {
+  id              String        @id @default(cuid())
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  syncId          String
+  sync            ADAccountSync @relation(fields: [syncId], references: [id], onDelete: Cascade)
+  adUsername      String
+  accessRequestId String
+  status          String        @default("pending") // pending | processing | completed | failed | reconciliation_required
+  attempts        Int           @default(0)
+  claimId         String?
+  claimedUntil    DateTime?
+  lastError       String?
+  completedAt     DateTime?
+
+  @@unique([syncId, adUsername])
+  @@index([status, updatedAt])
+  @@index([status, claimedUntil])
+}
+
 // Individual matches found during AD sync
 model ADAccountMatch {
-  id                String        @id @default(cuid())
-  createdAt         DateTime      @default(now())
-  syncId            String
-  sync              ADAccountSync @relation(fields: [syncId], references: [id], onDelete: Cascade)
-  
+  id        String        @id @default(cuid())
+  createdAt DateTime      @default(now())
+  syncId    String
+  sync      ADAccountSync @relation(fields: [syncId], references: [id], onDelete: Cascade)
+
   // AD Account Info
-  adUsername        String        // e.g., "billy"
-  adDisplayName     String
-  adEmail           String        // e.g., "billy@cpp.edu"
-  
+  adUsername    String // e.g., "billy"
+  adDisplayName String
+  adEmail       String // e.g., "billy@cpp.edu"
+
   // VPN Account Info (if matched)
-  vpnUsername       String?       // e.g., "billy" (from Limited portal)
-  vpnAccountId      String?       // Link to VPNAccount if it exists
-  
+  vpnUsername  String? // e.g., "billy" (from Limited portal)
+  vpnAccountId String? // Link to VPNAccount if it exists
+
   // Access Request Info (if found)
-  accessRequestId   String?       // Link to AccessRequest if found
-  requestEmail      String?       // Email from the access request
-  requestName       String?       // Name from the access request
-  
+  accessRequestId String? // Link to AccessRequest if found
+  requestEmail    String? // Email from the access request
+  requestName     String? // Name from the access request
+
   // Match Status
-  matchType         String        // "full_match", "ad_only", "vpn_only", "no_request"
-  wasAutoAssigned   Boolean       @default(false) // Was this automatically assigned to a request?
-  assignedAt        DateTime?
-  
-  notes             String?
+  matchType       String // "full_match", "ad_only", "vpn_only", "no_request"
+  wasAutoAssigned Boolean   @default(false) // Was this automatically assigned to a request?
+  assignedAt      DateTime?
+
+  notes String?
 
   @@index([syncId])
   @@index([adUsername])
@@ -979,20 +1374,20 @@ model ADAccountMatch {
 
 // AD Account Activity Log - Track all enable/disable actions with lifecycle action references
 model ADAccountActivityLog {
-  id                  String                      @id @default(cuid())
-  createdAt           DateTime                    @default(now())
-  accountId           String                      // AccessRequest ID
-  accountUsername     String                      // Username at time of action
-  accountName         String?                     // Display name at time of action
-  accountEmail        String?                     // Email at time of action
-  actionType          String                      // "disabled", "enabled"
-  performedBy         String                      // Admin username
-  reason              String?                     // Why the action was taken
-  lifecycleActionId   String?                     // Link to AccountLifecycleAction if applicable
-  lifecycleAction     AccountLifecycleAction?     @relation(fields: [lifecycleActionId], references: [id], onDelete: SetNull)
-  notes               String?                     // Additional context
-  ldapSuccess         Boolean                     @default(false) // Whether LDAP operation succeeded
-  ldapError           String?                     // Any LDAP error message
+  id                String                  @id @default(cuid())
+  createdAt         DateTime                @default(now())
+  accountId         String // AccessRequest ID
+  accountUsername   String // Username at time of action
+  accountName       String? // Display name at time of action
+  accountEmail      String? // Email at time of action
+  actionType        String // "disabled", "enabled", "deleted"
+  performedBy       String // Admin username
+  reason            String? // Why the action was taken
+  lifecycleActionId String? // Link to AccountLifecycleAction if applicable
+  lifecycleAction   AccountLifecycleAction? @relation(fields: [lifecycleActionId], references: [id], onDelete: SetNull)
+  notes             String? // Additional context
+  ldapSuccess       Boolean                 @default(false) // Whether LDAP operation succeeded
+  ldapError         String? // Any LDAP error message
 
   @@index([accountId])
   @@index([accountUsername])
@@ -1003,20 +1398,20 @@ model ADAccountActivityLog {
 
 // VPN Account Activity Log - Track all enable/disable/role changes with lifecycle action references
 model VPNAccountActivityLog {
-  id                  String                      @id @default(cuid())
-  createdAt           DateTime                    @default(now())
-  accountId           String                      // VPNAccount ID
-  accountUsername     String                      // Username at time of action
-  accountName         String                      // Display name at time of action
-  accountEmail        String?                     // Email at time of action
-  actionType          String                      // "disabled", "enabled", "revoked", "restored", "role_promoted", "role_demoted"
-  performedBy         String                      // Admin username
-  reason              String?                     // Why the action was taken
-  lifecycleActionId   String?                     // Link to AccountLifecycleAction if applicable
-  lifecycleAction     AccountLifecycleAction?     @relation(fields: [lifecycleActionId], references: [id], onDelete: SetNull)
-  oldPortalType       String?                     // For role changes
-  newPortalType       String?                     // For role changes
-  notes               String?                     // Additional context
+  id                String                  @id @default(cuid())
+  createdAt         DateTime                @default(now())
+  accountId         String // VPNAccount ID
+  accountUsername   String // Username at time of action
+  accountName       String // Display name at time of action
+  accountEmail      String? // Email at time of action
+  actionType        String // "disabled", "enabled", "revoked", "restored", "deleted", "role_promoted", "role_demoted"
+  performedBy       String // Admin username
+  reason            String? // Why the action was taken
+  lifecycleActionId String? // Link to AccountLifecycleAction if applicable
+  lifecycleAction   AccountLifecycleAction? @relation(fields: [lifecycleActionId], references: [id], onDelete: SetNull)
+  oldPortalType     String? // For role changes
+  newPortalType     String? // For role changes
+  notes             String? // Additional context
 
   @@index([accountId])
   @@index([accountUsername])
@@ -1027,18 +1422,18 @@ model VPNAccountActivityLog {
 
 // AD Account Comments - Comments tied to account ID, not username (to avoid inheritance)
 model ADAccountComment {
-  id                  String      @id @default(cuid())
-  createdAt           DateTime    @default(now())
-  updatedAt           DateTime    @updatedAt
-  accountId           String      // AccessRequest ID - permanent identifier
-  accountUsername     String      // Username at time of comment (for reference)
-  comment             String
-  author              String      // Admin username
-  isInternal          Boolean     @default(false) // Internal admin note vs visible to others
-  isPinned            Boolean     @default(false) // Pin important comments
-  editedAt            DateTime?
-  deletedAt           DateTime?   // Soft delete
-  deletedBy           String?
+  id              String    @id @default(cuid())
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  accountId       String // AccessRequest ID - permanent identifier
+  accountUsername String // Username at time of comment (for reference)
+  comment         String
+  author          String // Admin username
+  isInternal      Boolean   @default(false) // Internal admin note vs visible to others
+  isPinned        Boolean   @default(false) // Pin important comments
+  editedAt        DateTime?
+  deletedAt       DateTime? // Soft delete
+  deletedBy       String?
 
   @@index([accountId])
   @@index([author])
@@ -1047,3 +1442,720 @@ model ADAccountComment {
   @@index([deletedAt])
 }
 
+// ---------------------------------------------------------------------------
+// Modular configuration, governance workflow, messaging, and RBAC models.
+// Additive only: existing tables and data are untouched. All new capability
+// state defaults to "enabled"/"current behavior" so the first deployment is
+// behavior-preserving (see docs/architecture/modularity-configuration-roadmap.md).
+// ---------------------------------------------------------------------------
+
+// Runtime enabled/disabled state for optional capabilities. Modules known to
+// the application are defined in code (my-app/lib/modules/registry.ts); this
+// table only stores operator overrides. A missing row means the module is
+// enabled, which preserves current behavior on first deployment.
+model ModuleState {
+  id        String   @id @default(cuid())
+  moduleId  String   @unique
+  enabled   Boolean  @default(true)
+  updatedBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([enabled])
+}
+
+// Generic persisted configuration storage for typed keys registered in
+// my-app/lib/config/registry.ts. Values are validated by the registry before
+// being written. Secrets never belong here; they stay in environment or a
+// dedicated secret store and are only referenced by name.
+model SystemConfigEntry {
+  key       String   @id
+  value     Json
+  updatedBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Immutable before/after trail for persisted configuration changes. One row
+// per changed key per write, appended when System Configuration saves or
+// clears an override. Secret values are NEVER recorded - secret revisions
+// store only a redaction marker so history proves a credential changed
+// without exposing material (roadmap §6.14).
+model ConfigurationRevision {
+  id            String   @id @default(cuid())
+  key           String
+  previousValue Json?
+  newValue      Json?
+  changeKind    String   @default("update") // "update" | "clear" | "secret_change"
+  changedBy     String
+  reason        String?
+  createdAt     DateTime @default(now())
+
+  @@index([key])
+  @@index([createdAt])
+}
+
+// One recorded execution of an authenticated cron route. Written best-effort:
+// an observability failure must never fail the underlying job. Outcome values
+// distinguish completed work from module-disabled skips so operators can see
+// WHY nothing happened, matching the module skip-recording contract.
+model CronRun {
+  id             String    @id @default(cuid())
+  route          String
+  outcome        String    @default("success") // "success" | "failed" | "skipped_module_disabled"
+  startedAt      DateTime  @default(now())
+  finishedAt     DateTime?
+  durationMs     Int?
+  itemsProcessed Int       @default(0)
+  errorClass     String?
+  detail         Json?
+
+  @@index([route, startedAt])
+  @@index([startedAt])
+}
+
+// Current projection of one curated operational problem. The detector and
+// subject keys identify a single episode; repeated observations update this
+// projection while immutable transitions are appended below.
+model OperationalSignal {
+  id              String                   @id @default(cuid())
+  createdAt       DateTime                 @default(now())
+  updatedAt       DateTime                 @updatedAt
+  detectorKey     String
+  subjectKey      String
+  subjectType     String
+  subjectId       String
+  reasonCode      String
+  fingerprint     String
+  status          String                   @default("active") // active | resolved
+  severity        String                   @default("warning") // info | warning | critical
+  summary         String
+  firstSeenAt     DateTime                 @default(now())
+  lastSeenAt      DateTime                 @default(now())
+  resolvedAt      DateTime?
+  occurrenceCount Int                      @default(1)
+  events          OperationalSignalEvent[]
+
+  @@unique([detectorKey, subjectKey])
+  @@index([status, lastSeenAt])
+  @@index([subjectType, subjectId])
+}
+
+// Append-only, sanitized evidence for detector transitions. Raw logs, stack
+// traces, request bodies, names, email addresses, credentials, and tokens are
+// deliberately excluded from this model and its evidence JSON.
+model OperationalSignalEvent {
+  id                String                      @id @default(cuid())
+  createdAt         DateTime                    @default(now())
+  signalId          String
+  signal            OperationalSignal           @relation(fields: [signalId], references: [id], onDelete: Restrict)
+  eventKey          String                      @unique
+  transition        String // detected | resolved
+  detectorKey       String
+  detectorVersion   Int                         @default(1)
+  evidenceVersion   Int                         @default(1)
+  sourceType        String
+  sourceId          String?
+  correlationId     String
+  summary           String
+  evidence          Json
+  archiveEligibleAt DateTime
+  archivedAt        DateTime?
+  archiveId         String?
+  archive           OperationalEvidenceArchive? @relation(fields: [archiveId], references: [id], onDelete: Restrict)
+
+  @@index([signalId, createdAt])
+  @@index([archiveEligibleAt, archivedAt])
+  @@index([archiveId])
+  @@index([correlationId])
+}
+
+// Manifest for a verified encrypted evidence bundle. The local application
+// records archive intent and verification here; write-once/WORM enforcement
+// remains a deployment storage policy and is never inferred from this row.
+model OperationalEvidenceArchive {
+  id                 String                   @id @default(cuid())
+  createdAt          DateTime                 @default(now())
+  rangeStart         DateTime
+  rangeEnd           DateTime
+  recordCount        Int
+  storageKey         String                   @unique
+  ciphertextSha256   String
+  keyId              String
+  formatVersion      Int                      @default(1)
+  readbackVerifiedAt DateTime?
+  retentionExpiresAt DateTime
+  events             OperationalSignalEvent[]
+
+  @@index([rangeEnd])
+  @@index([retentionExpiresAt])
+}
+
+// Configurable access request governance. A RequestType names what is being
+// requested; each published WorkflowDefinition version pins the ordered review
+// stages that were in effect when requests referencing it were submitted.
+model RequestType {
+  id          String               @id @default(cuid())
+  key         String               @unique
+  name        String
+  description String?
+  isActive    Boolean              @default(true)
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+  workflows   WorkflowDefinition[]
+
+  @@index([isActive])
+}
+
+// Immutable once created: editing governance publishes a new version row.
+// Existing requests keep pointing at the version they were submitted under so
+// in-flight governance can never change retroactively.
+model WorkflowDefinition {
+  id             String      @id @default(cuid())
+  requestTypeKey String
+  requestType    RequestType @relation(fields: [requestTypeKey], references: [key])
+  version        Int
+  status         String      @default("published") // "published" | "archived"
+  stages         Json // Ordered WorkflowStageConfig[]; shape validated in lib/workflow/schema.ts
+  createdBy      String?
+  createdAt      DateTime    @default(now())
+
+  @@unique([requestTypeKey, version])
+  @@index([requestTypeKey, status])
+}
+
+// Organization-owned operational copy (e.g. the faculty handoff message).
+// Keys are registered in lib/messages/catalog.ts with the exact current
+// hard-coded content as the seeded value so output is unchanged on upgrade.
+model MessageTemplate {
+  id        String                    @id @default(cuid())
+  key       String                    @unique
+  label     String
+  body      String
+  subject   String? // Editable email subject line; null uses the code default
+  variables Json? // Documented placeholder schema for editors
+  updatedBy String?
+  createdAt DateTime                  @default(now())
+  updatedAt DateTime                  @updatedAt
+  revisions MessageTemplateRevision[]
+
+  @@index([updatedAt])
+}
+
+model MessageTemplateRevision {
+  id          String          @id @default(cuid())
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  templateKey String
+  template    MessageTemplate @relation(fields: [templateKey], references: [key], onDelete: Cascade)
+  version     Int
+  status      String          @default("draft") // draft | published | archived
+  subject     String?
+  body        String
+  css         String?
+  createdBy   String
+  updatedBy   String
+  publishedAt DateTime?
+  publishedBy String?
+
+  @@unique([templateKey, version])
+  @@index([templateKey, status])
+}
+
+// Application roles used by configurable review stages and admin surfaces.
+// Permission catalogs are code-defined (my-app/lib/rbac/permissions.ts);
+// adGroupDns maps directory groups to roles via live LDAP membership checks.
+// The system_administrator role additionally inherits from the legacy
+// LDAP_ADMIN_GROUPS domain-admin check for compatibility (ADR-0004).
+//
+// LEGACY (privilege-first RBAC): RoleDefinition is retained read-only for
+// rollback. Authorization now resolves through PrivilegeAssignment below;
+// this table's rows were migrated into it and are no longer consulted.
+model RoleDefinition {
+  key         String   @id
+  name        String
+  description String?
+  permissions String[]
+  adGroupDns  String[]
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isSystem])
+}
+
+// ---------------------------------------------------------------------------
+// Privilege-first RBAC: each code-registered privilege maps directly to AD
+// group DNs. Membership is resolved live against the directory with the same
+// canonical DN comparison the legacy admin gate uses; legacy domain admins
+// (ldap.adminGroups) and break-glass accounts always hold the full catalog.
+// A missing row simply means "no groups mapped to this privilege yet".
+// ---------------------------------------------------------------------------
+model PrivilegeAssignment {
+  permissionKey String   @id
+  adGroupDns    String[]
+  updatedBy     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([updatedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Support ticket ownership and directory-group routing (ADR-0007).
+// Additive only. With no allowed groups, no snapshots, and no assignments the
+// portal behaves exactly as before: unassigned tickets notify the default
+// queue (adminEmail) and creators additionally receive a receipt.
+// ---------------------------------------------------------------------------
+
+// Administrator-approved AD groups usable in support-ticket flows. Only rows
+// in this table may be used as "requested for" subjects or assignment owners;
+// knowing a DN grants nothing.
+model AllowedTicketSubjectGroup {
+  id                String                         @id @default(cuid())
+  dn                String                         @unique
+  name              String
+  mail              String? // Mail-enabled group address; preferred over member expansion when present
+  canBeRequestedFor Boolean                        @default(true)
+  canBeAssignee     Boolean                        @default(false)
+  canJoinViaTicket  Boolean                        @default(false)
+  // When true, a published workflow may add requesters without manual review
+  // ("configured to be added automatically"). enqueue_group_add refuses
+  // groups without this flag, so automation can never outrun policy.
+  autoApproveJoin   Boolean                        @default(false)
+  isActive          Boolean                        @default(true)
+  lastSyncedAt      DateTime?
+  lastSyncStatus    String? // "success" | "partial_failure" | "failed"
+  createdBy         String?
+  updatedBy         String?
+  createdAt         DateTime                       @default(now())
+  updatedAt         DateTime                       @updatedAt
+  memberSnapshots   DirectoryGroupMemberSnapshot[]
+
+  @@index([isActive])
+}
+
+// One recorded attempt to refresh membership snapshots for all active groups.
+// Per-group outcomes live in errors; failed groups keep their previous snapshot.
+model DirectorySyncRun {
+  id              String    @id @default(cuid())
+  status          String    @default("running") // running | success | partial_failure | failed
+  triggeredBy     String // "cron" or acting username
+  startedAt       DateTime  @default(now())
+  finishedAt      DateTime?
+  groupsProcessed Int       @default(0)
+  membersCaptured Int       @default(0)
+  errors          Json?
+
+  @@index([status])
+  @@index([startedAt])
+}
+
+// Cached membership of one allowed group as captured by a sync run. AD/LDAP
+// remains authoritative; this is the local read model that keeps form
+// rendering and recipient expansion off the domain controller.
+model DirectoryGroupMemberSnapshot {
+  id             String                    @id @default(cuid())
+  groupDn        String
+  group          AllowedTicketSubjectGroup @relation(fields: [groupDn], references: [dn], onDelete: Restrict)
+  syncRunId      String
+  username       String
+  email          String?
+  displayName    String?
+  accountEnabled Boolean?
+  capturedAt     DateTime                  @default(now())
+
+  @@unique([groupDn, username])
+  @@index([username])
+  @@index([syncRunId])
+}
+
+// Assignment is data with history, not merely an email destination. One row
+// per target per ticket; deactivation preserves the row. targetGroupDn is an
+// intentional soft reference (no FK) so removing a group from the allowlist
+// never rewrites ticket history.
+model SupportTicketAssignment {
+  id             String        @id @default(cuid())
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  ticketId       String
+  ticket         SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Restrict)
+  targetType     String // "user" | "directory_group"
+  targetUsername String?
+  targetGroupDn  String?
+  targetLabel    String
+  targetEmail    String? // Verified directory email captured when direct user access is granted
+  isActive       Boolean       @default(false)
+  assignedBy     String
+  assignedAt     DateTime      @default(now())
+
+  // Uniqueness of the ACTIVE assignment per target is enforced by partial
+  // unique indexes in migration 20260822130000 (Prisma cannot express
+  // partial indexes): one active user row and one active group row per
+  // ticket, so concurrent assigns cannot create duplicate ownership.
+  @@index([ticketId])
+  @@index([targetUsername])
+  @@index([targetGroupDn])
+  @@index([isActive])
+}
+
+// Immutable audit trail of ownership changes on a ticket.
+model TicketAssignmentHistory {
+  id            String        @id @default(cuid())
+  createdAt     DateTime      @default(now())
+  ticketId      String
+  ticket        SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Restrict)
+  action        String // "assign" | "unassign"
+  targetType    String
+  targetLabel   String
+  actorUsername String
+  details       Json?
+
+  @@index([ticketId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Workflow automation, service alerts, and ticket evidence (ADR-0008/0010).
+// Additive only. No rules are seeded enabled; with zero rules the portal
+// behaves exactly as before.
+// ---------------------------------------------------------------------------
+
+// Operator-composed automation rule joining a code-defined trigger to ordered
+// code-defined actions through validated conditions. Shapes are validated on
+// write AND evaluation against lib/automation/catalog.ts; unknown keys
+// disable the rule loudly instead of misfiring (ADR-0008).
+model AutomationRule {
+  id            String          @id @default(cuid())
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  name          String
+  description   String?
+  triggerKey    String
+  triggerConfig Json?
+  conditions    Json? // Ordered condition configs; all must match
+  actions       Json // Ordered action configs, each { key, config }
+  enabled       Boolean         @default(false)
+  createdBy     String?
+  updatedBy     String?
+  runs          AutomationRun[]
+
+  @@index([triggerKey, enabled])
+}
+
+// One evaluation of one rule for one event. Unique (ruleId, eventKey) makes
+// redelivery idempotent at the database layer (ADR-0008). Rules with runs can
+// only be disabled, never deleted, so history stays reconstructable.
+model AutomationRun {
+  id         String         @id @default(cuid())
+  createdAt  DateTime       @default(now())
+  ruleId     String
+  rule       AutomationRule @relation(fields: [ruleId], references: [id], onDelete: Restrict)
+  eventKey   String
+  triggerKey String
+  status     String         @default("succeeded") // succeeded | failed | skipped
+  matched    Boolean        @default(false)
+  outcomes   Json? // Per-action results in execution order
+  error      String?
+  startedAt  DateTime       @default(now())
+  finishedAt DateTime?
+
+  @@unique([ruleId, eventKey])
+  @@index([triggerKey])
+  @@index([startedAt])
+}
+
+// Machine-raised operational alert (for example an unreachable domain
+// controller) categorized and dismissible by administrators. Re-occurrence of
+// the same condition increments counters on the dedupe key instead of
+// duplicating rows; dismissal only sticks while the underlying condition is
+// cleared - the next failing probe reopens it as a fresh occurrence.
+model ServiceAlert {
+  id              String    @id @default(cuid())
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  dedupeKey       String    @unique
+  category        String // "directory" | "email" | "storage" | "general"
+  severity        String    @default("warning") // info | warning | critical
+  title           String
+  message         String
+  source          String // Emitting probe or integration, e.g. "dc_probe"
+  status          String    @default("active") // active | resolved | dismissed
+  occurrenceCount Int       @default(1)
+  firstSeenAt     DateTime  @default(now())
+  lastSeenAt      DateTime  @default(now())
+  resolvedAt      DateTime?
+  dismissedBy     String?
+  dismissedAt     DateTime?
+  metadata        Json?
+
+  @@index([status])
+  @@index([category])
+}
+
+// ---------------------------------------------------------------------------
+// Visual workflow graphs over curated nodes (ADR-0013). Supersedes the flat
+// AutomationRule shape, which stays readable for history. No graphs are
+// seeded enabled; with zero graphs the portal behaves exactly as before.
+// ---------------------------------------------------------------------------
+
+// One operator-designed graph. drafts hold nodes/edges JSONB; publishing
+// stamps a version and enabling is an audited act (rules import as graphs).
+model WorkflowGraph {
+  id            String                 @id @default(cuid())
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+  name          String
+  description   String?
+  triggerKey    String // Which event family starts this graph
+  nodes         Json // [{ id, type, config, position }]
+  edges         Json // [{ id, source, sourceHandle?, target, condition? }]
+  status        String                 @default("draft") // draft | published | disabled
+  version       Int                    @default(1)
+  enabled       Boolean                @default(false)
+  createdBy     String?
+  updatedBy     String?
+  runs          FlowRun[]
+  monitorChecks WorkflowMonitorCheck[]
+
+  @@unique([name, version])
+  @@index([triggerKey, enabled])
+}
+
+// One execution of one graph for one event; unique (graphId, eventKey) makes
+// redelivery idempotent at the database layer (inherited from ADR-0008).
+model FlowRun {
+  id             String              @id @default(cuid())
+  createdAt      DateTime            @default(now())
+  graphId        String
+  graph          WorkflowGraph       @relation(fields: [graphId], references: [id], onDelete: Restrict)
+  eventKey       String
+  triggerKey     String
+  sourceNodeId   String?
+  sourceHandle   String?
+  contextDigest  String?
+  context        Json?
+  status         String              @default("running") // running | succeeded | failed | waiting | cancelled
+  nodeOutcomes   Json? // Per-node { nodeId, status, startedAt, finishedAt, error }
+  artifacts      FlowArtifact[]
+  timers         FlowTimer[]
+  actionAttempts FlowActionAttempt[]
+  error          String?
+  startedAt      DateTime            @default(now())
+  finishedAt     DateTime?
+
+  @@unique([graphId, eventKey])
+  @@index([triggerKey])
+  @@index([status])
+  @@index([startedAt])
+}
+
+model FlowActionAttempt {
+  id           String    @id @default(cuid())
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  runId        String
+  run          FlowRun   @relation(fields: [runId], references: [id], onDelete: Cascade)
+  nodeId       String
+  kind         String
+  status       String    @default("sending") // sending | processing | delivered | failed | delivery_unknown | reconciliation_required | retry_authorized
+  claimId      String?   @unique
+  claimedAt    DateTime?
+  claimedUntil DateTime?
+  attempts     Int       @default(0)
+  messageId    String?
+  lastError    String?
+  outcome      Json?
+
+  @@unique([runId, nodeId])
+  @@index([status, claimedUntil])
+}
+
+// Persisted delay: a run parked until dueAt, drained by the workflow tick.
+model FlowTimer {
+  id           String    @id @default(cuid())
+  createdAt    DateTime  @default(now())
+  runId        String
+  run          FlowRun   @relation(fields: [runId], references: [id], onDelete: Cascade)
+  nodeId       String
+  dueAt        DateTime
+  payload      Json? // Context snapshot carried across the wait
+  status       String    @default("pending") // pending | processing | reconciliation_required
+  claimId      String?   @unique
+  claimedAt    DateTime?
+  claimedUntil DateTime?
+  attempts     Int       @default(0)
+  lastError    String?
+
+  @@index([status, dueAt])
+  @@index([status, claimedUntil])
+}
+
+// Everything a run created so cleanup can cascade (clearing a service alert
+// also clears banners that run raised, per ADR-0013).
+model FlowArtifact {
+  id        String    @id @default(cuid())
+  createdAt DateTime  @default(now())
+  runId     String
+  run       FlowRun   @relation(fields: [runId], references: [id], onDelete: Cascade)
+  nodeId    String
+  kind      String // service_alert | notification_banner | ticket_response | lifecycle_action
+  refId     String // The created object's id or dedupe key
+  clearedAt DateTime?
+
+  @@index([runId])
+  @@index([refId])
+}
+
+// Durable bridge from security/operational producers into the workflow
+// engine. A producer commits the event with its domain record; the workflow
+// tick retries delivery until the graph-level idempotency key is accepted.
+model FlowEventOutbox {
+  id            String    @id @default(cuid())
+  createdAt     DateTime  @default(now())
+  triggerKey    String
+  eventKey      String    @unique
+  context       Json
+  graphId       String?
+  sourceNodeId  String?
+  sourceHandle  String?
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime  @default(now())
+  processedAt   DateTime?
+  lastError     String?
+  lockToken     String?
+  lockedUntil   DateTime?
+
+  @@index([processedAt, nextAttemptAt, lockedUntil])
+}
+
+model MonitoredEndpoint {
+  id                   String    @id @default(cuid())
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  configVersion        Int       @default(0)
+  name                 String
+  preset               String    @default("generic_https") // proxmox | truenas | generic_https | tcp
+  protocol             String // https | tcp
+  host                 String
+  port                 Int
+  path                 String?
+  timeoutMs            Int       @default(5000)
+  failureThreshold     Int       @default(2)
+  recoveryThreshold    Int       @default(2)
+  enabled              Boolean   @default(true)
+  currentState         String    @default("unknown") // unknown | up | down
+  consecutiveFailures  Int       @default(0)
+  consecutiveSuccesses Int       @default(0)
+  lastCheckedAt        DateTime?
+  lastTransitionAt     DateTime?
+  lastLatencyMs        Int?
+  lastError            String?
+  createdBy            String
+  updatedBy            String
+
+  @@index([enabled])
+  @@index([currentState])
+}
+
+model WorkflowMonitorCheck {
+  id                   String        @id @default(cuid())
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  graphId              String
+  graph                WorkflowGraph @relation(fields: [graphId], references: [id], onDelete: Cascade)
+  sourceNodeId         String
+  checkKey             String
+  configHash           String
+  config               Json
+  active               Boolean       @default(false)
+  nextProbeAt          DateTime      @default(now())
+  currentState         String        @default("unknown")
+  consecutiveFailures  Int           @default(0)
+  consecutiveSuccesses Int           @default(0)
+  lastCheckedAt        DateTime?
+  lastTransitionAt     DateTime?
+  lastLatencyMs        Int?
+  lastStatusCode       Int?
+  lastError            String?
+
+  @@unique([graphId, sourceNodeId, checkKey])
+  @@index([active, nextProbeAt])
+  @@index([graphId, active])
+}
+
+model MonitorCredential {
+  id            String   @id @default(cuid())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  configVersion Int      @default(0)
+  name          String
+  kind          String
+  username      String?
+  headerName    String?
+  secret        String
+  allowedHosts  String[]
+  enabled       Boolean  @default(true)
+  createdBy     String
+  updatedBy     String
+
+  @@index([enabled])
+  @@index([kind])
+}
+
+model ManagedPageRevision {
+  id          String    @id @default(cuid())
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  pageKey     String
+  version     Int
+  status      String    @default("draft")
+  document    Json
+  createdBy   String
+  updatedBy   String
+  publishedAt DateTime?
+  publishedBy String?
+
+  @@unique([pageKey, version])
+  @@index([pageKey, status])
+}
+
+model OperationalLease {
+  key       String   @id
+  owner     String
+  expiresAt DateTime
+  updatedAt DateTime @updatedAt
+
+  @@index([expiresAt])
+}
+
+model UserNotification {
+  id          String    @id @default(cuid())
+  createdAt   DateTime  @default(now())
+  username    String
+  dedupeKey   String
+  kind        String
+  severity    String    @default("info")
+  title       String
+  message     String
+  href        String?
+  readAt      DateTime?
+  dismissedAt DateTime?
+
+  @@unique([username, dedupeKey])
+  @@index([username, dismissedAt, createdAt])
+  @@index([username, readAt])
+}
+
+model UserNotificationPreference {
+  username       String   @id
+  accessRequests Boolean  @default(true)
+  supportTickets Boolean  @default(true)
+  syncFailures   Boolean  @default(true)
+  updatedAt      DateTime @updatedAt
+}
+
+// Sign-in branding and OIDC application registries intentionally have no
+// portal models: the auth service is a self-contained product that owns its
+// own branding console and client store. The portal only consumes it as a
+// relying party via env-driven configuration (AUTH_MODE/AUTH_ISSUER/...).

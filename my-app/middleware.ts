@@ -7,6 +7,7 @@ import {
   validateCsrfTokenPair,
 } from './lib/csrf-cookie-policy';
 import { isCsrfExempt, requiresCsrfValidation } from './lib/csrf-config';
+import { SESSION_COOKIE_NAME } from './lib/session-cookie-policy';
 
 // Winston is not compatible with Edge Runtime, so we define a lightweight 
 // console-based logger for middleware that mimics the JSON structure.
@@ -30,20 +31,24 @@ export async function middleware(request: NextRequest) {
   // Log all incoming requests
   edgeLogger.info('Incoming Request', {
     method: request.method,
-    url: request.url,
-    pathname: pathname,
+    pathname,
     ip: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
     userAgent: request.headers.get('user-agent'),
-    referer: request.headers.get('referer'),
   });
 
-  const response = NextResponse.next();
+  // Server layouts do not receive the resolved pathname as a prop. Set this
+  // from the request URL here (rather than trusting a client header) so the
+  // admin layout can enforce the same capability manifest before a page's
+  // client panel mounts.
+  const forwardedHeaders = new Headers(request.headers);
+  forwardedHeaders.set('x-uar-admin-pathname', pathname);
+  const response = NextResponse.next({ request: { headers: forwardedHeaders } });
 
   // Protect admin pages - require session cookie to be present
   // Full session validation happens in API routes, but this prevents
   // unauthenticated users from even loading admin pages
   if (pathname.startsWith('/admin') && !pathname.startsWith('/api/')) {
-    const sessionCookie = request.cookies.get('session_token');
+    const sessionCookie = request.cookies.get(SESSION_COOKIE_NAME);
     if (!sessionCookie?.value) {
       const loginUrl = new URL('/login', request.url);
       loginUrl.searchParams.set('redirect', pathname);

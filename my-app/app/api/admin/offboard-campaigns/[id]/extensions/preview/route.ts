@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import {
   previewOffboardDeadlineExtension,
   type ExtendOffboardCampaignInput,
@@ -14,6 +15,9 @@ export async function POST(
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!actorHasPermission(admin, 'offboard.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
     const { id } = await params;
     const body = await parseAdminJson<ExtendOffboardCampaignInput>(

@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { requireModuleEnabled } from '@/lib/modules/guards';
 import { runLockedPasswordExpirationNotifications } from '@/lib/password-expiration';
 import {
   AuditActions,
@@ -15,6 +17,12 @@ export async function POST(request: NextRequest) {
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'password_expiration.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    const moduleGuard = await requireModuleEnabled('password.expiration');
+    if (moduleGuard) return moduleGuard;
 
     const processing = await runLockedPasswordExpirationNotifications({
       actor: admin.username,

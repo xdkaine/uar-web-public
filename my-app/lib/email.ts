@@ -1,11 +1,33 @@
 import nodemailer from 'nodemailer';
+import crypto from 'crypto';
 import { getRequiredEnv } from './env-validator';
 import { appLogger } from '@/lib/logger';
+import { getConfigValue, getRequiredSecretValue } from './config/resolver';
+import { htmlToPlainText, isTicketHtml, sanitizeTicketHtml } from './ticket-content';
+import { assertExternalSideEffectAllowed } from './clone-safety';
+
+/**
+ * Resolve an operator-editable subject and body for a registered template
+ * key, falling back to the exact code defaults so behavior is unchanged
+ * until an operator customizes the template (ADR-0004 incremental migration).
+ */
+async function resolveContent(
+  key: string,
+  variables: Record<string, string>,
+  fallback: { subject: string; html: string }
+): Promise<{ subject: string; html: string }> {
+  try {
+    const { resolveEmailContent } = await import('./messages/core');
+    return await resolveEmailContent(key, variables, fallback);
+  } catch {
+    return fallback;
+  }
+}
 
 /**
  * Escape HTML characters in user-provided content for email templates
  * Prevents HTML injection in email clients
- * 
+ *
  * @param text - Text to escape
  * @returns Escaped text safe for HTML emails
  */
@@ -22,22 +44,93 @@ function escapeHtml(text: string): string {
     .replace(/'/g, '&#039;');
 }
 
-const smtpPort = parseInt(getRequiredEnv('SMTP_PORT'));
-const transporter = nodemailer.createTransport({
-  host: getRequiredEnv('SMTP_HOST'),
-  port: smtpPort,
-  secure: smtpPort === 465,
-  requireTLS: smtpPort !== 465,
-  tls: {
-    rejectUnauthorized: true,
-  },
-  auth: {
-    user: getRequiredEnv('SMTP_USER'),
-    pass: getRequiredEnv('SMTP_PASSWORD'),
-  },
-  logger: true,
-  debug: true,
-});
+/** Build recipient-facing links from the deployment-owned portal origin. */
+function portalLink(pathname: string): string {
+  return new URL(pathname, getRequiredEnv('NEXT_PUBLIC_APP_URL')).toString();
+}
+
+// SMTP connection settings resolve through persisted configuration with env
+// fallback (ADR-0005). The transport is created lazily and rebuilt when the
+// resolved settings or encrypted SMTP password change.
+let cachedTransporter: ReturnType<typeof nodemailer.createTransport> | null = null;
+let cachedTransporterKey = '';
+
+async function getTransporter(): Promise<ReturnType<typeof nodemailer.createTransport>> {
+  assertExternalSideEffectAllowed('smtp');
+  const [hostValue, portValue, userValue] = await Promise.all([
+    getConfigValue<string>('smtp.host'),
+    getConfigValue<number>('smtp.port'),
+    getConfigValue<string>('smtp.user'),
+  ]);
+
+  const host = String(hostValue || '').trim();
+  const port = Number(portValue) || 587;
+  const user = String(userValue || '').trim();
+  if (!host) {
+    throw new Error('SMTP host is not configured (set smtp.host in System Configuration or SMTP_HOST in the environment)');
+  }
+
+  const smtpPassword = await getRequiredSecretValue('smtp.password');
+  // The password itself never leaves this process or enters logs; its digest
+  // ensures a saved secret rotation rebuilds Nodemailer's authenticated pool.
+  const passwordFingerprint = crypto.createHash('sha256').update(smtpPassword).digest('hex');
+  const key = `${host}|${port}|${user}|${passwordFingerprint}`;
+
+  if (!cachedTransporter || cachedTransporterKey !== key) {
+    cachedTransporter = nodemailer.createTransport({
+      host,
+      port,
+      secure: port === 465,
+      requireTLS: port !== 465,
+      tls: {
+        rejectUnauthorized: true,
+      },
+      auth: {
+        user,
+        pass: smtpPassword,
+      },
+      logger: false,
+      debug: false,
+    });
+    cachedTransporterKey = key;
+  }
+
+  return cachedTransporter;
+}
+
+/**
+ * Sends a short verification message through the currently resolved relay
+ * configuration so operators can confirm SMTP connectivity and credentials
+ * from System Configuration without triggering any business flow.
+ */
+export async function sendRelayTestEmail(to: string): Promise<{ messageId: string }> {
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+  const from = emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM');
+  const timestamp = new Date().toISOString();
+
+  const resolved = await resolveContent(
+    'system.relay_test',
+    { timestamp },
+    {
+      subject: 'UAR Portal - SMTP Relay Test',
+      html: `<div style="font-family: Arial, sans-serif; max-width: 600px;"><h2>SMTP Relay Test</h2><p>This is a test message sent from the UAR Portal System Configuration at <code>${timestamp}</code>.</p><p>If you received it, the configured relay settings work.</p></div>`,
+    }
+  );
+
+  const info = await (await getTransporter()).sendMail({
+    from,
+    to,
+    subject: resolved.subject,
+    text: `This is a test message from the UAR Portal System Configuration, sent at ${timestamp}. If you received it, the relay settings work.`,
+    html: resolved.html,
+  });
+
+  if (info.rejected && info.rejected.length > 0) {
+    throw new Error(`Relay rejected recipient: ${info.rejected.join(', ')}`);
+  }
+  return { messageId: info.messageId };
+}
 
 export async function sendVerificationEmail(
   email: string,
@@ -55,11 +148,15 @@ export async function sendVerificationEmail(
 
   const verificationUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/api/verify?token=${verificationToken}`;
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject: 'Verify Your Access Request - Cal Poly Pomona Student SOC',
-    html: `
+  const resolved = await resolveContent(
+    'request.verification',
+    {
+      name: escapeHtml(name),
+      verificationUrl,
+    },
+    {
+      subject: 'Verify Your Access Request - Cal Poly Pomona Student SOC',
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>Hello ${escapeHtml(name)}!</h2>
         <p>Thank you for submitting your user access request to the Cal Poly Pomona Student SOC.</p>
@@ -76,11 +173,19 @@ export async function sendVerificationEmail(
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     appLogger.info('Attempting to send verification email via SMTP...');
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     appLogger.info('✅ Verification email sent successfully', {
       messageId: info.messageId,
       to: email,
@@ -113,11 +218,25 @@ export async function sendAdminNotification(
 
   const adminUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/admin/requests/${requestId}`;
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: emailConfig.adminEmail || getRequiredEnv('ADMIN_EMAIL'),
-    subject: `A New ${isInternal ? 'Internal' : 'External'} User Access Request - ${escapeHtml(name)}`,
-    html: `
+  const resolved = await resolveContent(
+    'request.admin_notification',
+    {
+      accountTypeShort: isInternal ? 'Internal' : 'External',
+      name: escapeHtml(name),
+      email: escapeHtml(email),
+      studentType: isInternal ? 'Internal Student (@cpp.edu)' : 'External Student',
+      domainAccountNeeded: needsDomainAccount ? 'Yes' : 'No',
+      eventReasonRowBlock: eventReason ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Event/Reason:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(eventReason)}</td>
+          </tr>
+          ` : '',
+      adminUrl,
+    },
+    {
+      subject: `A New ${isInternal ? 'Internal' : 'External'} User Access Request - ${escapeHtml(name)}`,
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>New Access Request Verified</h2>
         <p>A user has verified their email and is requesting access:</p>
@@ -150,9 +269,17 @@ export async function sendAdminNotification(
         </a>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: emailConfig.adminEmail || getRequiredEnv('ADMIN_EMAIL'),
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
-  await transporter.sendMail(mailOptions);
+  await (await getTransporter()).sendMail(mailOptions);
 }
 
 export async function sendAccountReadyEmail(
@@ -174,17 +301,34 @@ export async function sendAccountReadyEmail(
   const { getEmailConfig } = await import('./email-config');
   const emailConfig = await getEmailConfig();
 
-  const loginUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/login`;
+  const loginUrl = portalLink('/login');
+  const instructionsUrl = portalLink('/instructions');
+  const supportUrl = portalLink('/support/create');
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject: 'Your Account is Ready - Cal Poly Pomona Student SOC',
-    html: `
+  const resolved = await resolveContent(
+    'request.account_ready',
+    {
+      name: escapeHtml(name),
+      approvalMessageBlock: approvalMessage ? `
+        <div style="background-color: #ecfdf5; padding: 16px; border-left: 4px solid #10b981; border-radius: 4px; margin: 16px 0;">
+          <h3 style="margin-top: 0; color: #059669;">Message from Administrator</h3>
+          <p style="margin: 0; color: #333; white-space: pre-wrap;">${escapeHtml(approvalMessage)}</p>
+        </div>
+        ` : '',
+      adUsername: escapeHtml(ldapUsername),
+      password: escapeHtml(password),
+      accountType: isExternal ? 'External (VPN)' : 'Internal',
+      instructionsUrl,
+      supportUrl,
+      loginUrl,
+    },
+    {
+      subject: 'Your Account is Ready - Cal Poly Pomona Student SOC',
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>Account Created Successfully</h2>
         <p>Hello ${escapeHtml(name)},</p>
-        <p>Your access request has been approved and your account is now ready!</p>
+        <p>Your access request has been approved and your account in Active Directory is now ready.</p>
         ${approvalMessage ? `
         <div style="background-color: #ecfdf5; padding: 16px; border-left: 4px solid #10b981; border-radius: 4px; margin: 16px 0;">
           <h3 style="margin-top: 0; color: #059669;">Message from Administrator</h3>
@@ -195,7 +339,7 @@ export async function sendAccountReadyEmail(
           <h3 style="margin-top: 0; color: #059669;">Your Login Credentials</h3>
           <table style="width: 100%; border-collapse: collapse;">
             <tr>
-              <td style="padding: 8px; font-weight: bold;">AD Username:</td>
+              <td style="padding: 8px; font-weight: bold;">Directory username:</td>
               <td style="padding: 8px; font-family: monospace; background-color: #fff; border-radius: 3px;">${escapeHtml(ldapUsername)}</td>
             </tr>
             <tr>
@@ -212,36 +356,27 @@ export async function sendAccountReadyEmail(
           </tr>
         </table>
         <div style="background-color: #f5f5f5; padding: 16px; border-radius: 4px; margin: 16px 0;">
-          <h3>Access Your Portal:</h3>
-          <p style="margin: 8px 0;">
-            ${isExternal
-        ? 'As an external user, you can access the VPN portal at:'
-        : 'As an internal user, you can access the management portal at:'}
-          </p>
-          <p style="margin: 8px 0;">
-            <a href="${isExternal ? 'https://vpn.sdc.cpp.edu' : 'https://mgmt.sdc.cpp.edu'}" 
-               style="color: #059669; font-weight: bold; font-size: 16px;">
-              ${isExternal ? 'vpn.sdc.cpp.edu' : 'mgmt.sdc.cpp.edu'}
-            </a>
-          </p>
-          ${isExternal ? `
-            <h4 style="margin-top: 16px;">Next Steps for External Users:</h4>
-            <ol style="margin: 8px 0;">
-              <li>Visit the VPN portal above</li>
-              <li>Download and configure the VPN client</li>
-              <li>Use your credentials to connect</li>
-            </ol>
-          ` : ''}
+          <h3>Set up your access</h3>
+          <p style="margin: 8px 0;">Use the UAR Portal instructions for current VPN and service setup steps.</p>
+          <p style="margin: 8px 0;"><a href="${instructionsUrl}" style="color: #059669; font-weight: bold; font-size: 16px;">View setup instructions</a></p>
         </div>
         <a href="${loginUrl}" style="display: inline-block; padding: 12px 24px; background-color: #059669; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
           Get Started
         </a>
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 12px;">
-          If you have any questions, please contact the IT department.
+          Need help? <a href="${supportUrl}" style="color: #059669;">Submit a support ticket</a> through the UAR Portal.
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
@@ -252,7 +387,7 @@ export async function sendAccountReadyEmail(
       subject: mailOptions.subject,
       htmlLength: mailOptions.html.length
     });
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     appLogger.info('✅ Email sent successfully', {
       messageId: info.messageId,
       to: email,
@@ -290,6 +425,8 @@ export async function sendAccountActivationEmail(
   });
 
   const activationUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/account/activate?token=${activationToken}`;
+  const instructionsUrl = portalLink('/instructions');
+  const supportUrl = portalLink('/support/create');
   const { getEmailConfig } = await import('./email-config');
   const emailConfig = await getEmailConfig();
   const expiryDate = expiresAt.toLocaleDateString('en-US', {
@@ -302,21 +439,29 @@ export async function sendAccountActivationEmail(
     timeZoneName: 'short'
   });
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject: 'Set Up Your Account Password - Cal Poly Pomona Student SOC',
-    html: `
+  const resolved = await resolveContent(
+    'account.activation',
+    {
+      name: escapeHtml(name),
+      adUsername: escapeHtml(ldapUsername),
+      activationUrl,
+      expiryDate,
+      instructionsUrl,
+      supportUrl,
+    },
+    {
+      subject: 'Set Up Your Account Password - Cal Poly Pomona Student SOC',
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>Account Created - Set Your Password</h2>
         <p>Hello ${escapeHtml(name)},</p>
         <p>Your access request has been approved and your Active Directory account has been created!</p>
-        
+
         <div style="background-color: #f0fdf4; padding: 16px; border-left: 4px solid #059669; border-radius: 4px; margin: 16px 0;">
           <h3 style="margin-top: 0; color: #059669;">Your Account Details</h3>
           <table style="width: 100%; border-collapse: collapse;">
             <tr>
-              <td style="padding: 8px; font-weight: bold;">AD Username:</td>
+              <td style="padding: 8px; font-weight: bold;">Directory username:</td>
               <td style="padding: 8px; font-family: monospace; background-color: #fff; border-radius: 3px;">${escapeHtml(ldapUsername)}</td>
             </tr>
           </table>
@@ -336,7 +481,7 @@ export async function sendAccountActivationEmail(
           <h4 style="margin-top: 0;">Important Information:</h4>
           <ul style="margin: 8px 0; padding-left: 20px;">
             <li>This activation link expires on <strong>${expiryDate}</strong> (7 days)</li>
-            <li>You will need to confirm your AD username when setting your password</li>
+            <li>You will need to confirm your directory username when setting your password</li>
             <li>Choose a strong password that meets our security requirements</li>
             <li>If the link expires, you can use the "Forgot Password" feature to set your password</li>
           </ul>
@@ -344,26 +489,32 @@ export async function sendAccountActivationEmail(
 
         <div style="background-color: #eff6ff; padding: 16px; border-left: 4px solid #3b82f6; border-radius: 4px; margin: 16px 0;">
           <h4 style="margin-top: 0; color: #1e40af;">After Setting Your Password:</h4>
-          <p style="margin: 8px 0;">You can access the SOC User Access Request Portal at:</p>
-          <p style="margin: 8px 0;">
-            <a href="https://portal.sdc.cpp" style="color: #059669; font-weight: bold;">portal.sdc.cpp</a>
-          </p>
+          <p style="margin: 8px 0;">Use the UAR Portal instructions for current VPN and service setup steps:</p>
+          <p style="margin: 8px 0;"><a href="${instructionsUrl}" style="color: #059669; font-weight: bold;">View setup instructions</a></p>
         </div>
 
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 12px;">
-          If you did not request this account, please contact the IT department immediately.
+          If you did not request this account, <a href="${supportUrl}" style="color: #059669;">submit a support ticket</a> immediately.
         </p>
         <p style="color: #666; font-size: 12px;">
           This is an automated email. Please do not reply to this message.
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     appLogger.info('Attempting to send activation email via SMTP...');
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     appLogger.info('✅ Activation email sent successfully', {
       messageId: info.messageId,
       to: email,
@@ -394,25 +545,34 @@ export async function sendAccountActivationSuccessEmail(
     ldapUsername
   });
 
-  const loginUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/login`;
+  const loginUrl = portalLink('/login');
+  const instructionsUrl = portalLink('/instructions');
+  const supportUrl = portalLink('/support/create');
   const { getEmailConfig } = await import('./email-config');
   const emailConfig = await getEmailConfig();
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject: 'Password Set Successfully - Cal Poly Pomona Student SOC',
-    html: `
+  const resolved = await resolveContent(
+    'account.activation_success',
+    {
+      name: escapeHtml(name),
+      adUsername: escapeHtml(ldapUsername),
+      loginUrl,
+      instructionsUrl,
+      supportUrl,
+    },
+    {
+      subject: 'Password Set Successfully - Cal Poly Pomona Student SOC',
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>Password Set Successfully</h2>
         <p>Hello ${escapeHtml(name)},</p>
         <p>Your password has been set successfully! Your account is now fully activated and ready to use.</p>
-        
+
         <div style="background-color: #f0fdf4; padding: 16px; border-left: 4px solid #059669; border-radius: 4px; margin: 16px 0;">
           <h3 style="margin-top: 0; color: #059669;">Your Login Information</h3>
           <table style="width: 100%; border-collapse: collapse;">
             <tr>
-              <td style="padding: 8px; font-weight: bold;">AD Username:</td>
+              <td style="padding: 8px; font-weight: bold;">Directory username:</td>
               <td style="padding: 8px; font-family: monospace; background-color: #fff; border-radius: 3px;">${escapeHtml(ldapUsername)}</td>
             </tr>
             <tr>
@@ -424,10 +584,8 @@ export async function sendAccountActivationSuccessEmail(
 
         <div style="background-color: #eff6ff; padding: 16px; border-left: 4px solid #3b82f6; border-radius: 4px; margin: 16px 0;">
           <h3 style="margin-top: 0; color: #1e40af;">Access our Portal</h3>
-          <p style="margin: 8px 0;">While connected to the VPN, you can now log in to the SOC User Access Request Portal: </p>
-          <p style="margin: 8px 0;">
-            <a href="https://portal.sdc.cpp" style="color: #059669; font-weight: bold; font-size: 16px;">portal.sdc.cpp</a>
-          </p>
+          <p style="margin: 8px 0;">Use the UAR Portal instructions for current VPN and service setup steps:</p>
+          <p style="margin: 8px 0;"><a href="${instructionsUrl}" style="color: #059669; font-weight: bold; font-size: 16px;">View setup instructions</a></p>
         </div>
 
         <a href="${loginUrl}" style="display: inline-block; padding: 12px 24px; background-color: #059669; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
@@ -439,21 +597,29 @@ export async function sendAccountActivationSuccessEmail(
           <ul style="margin: 8px 0; padding-left: 20px;">
             <li>Never share your password with anyone</li>
             <li>Use the "Forgot Password" feature if you need to reset your password</li>
-            <li>Contact IT if you notice any suspicious activity on your account</li>
+            <li>Submit a support ticket if you notice suspicious account activity</li>
           </ul>
         </div>
 
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 12px;">
-          If you have any questions, please contact the IT department.
+          Need help? <a href="${supportUrl}" style="color: #059669;">Submit a support ticket</a> through the UAR Portal.
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     appLogger.info('Attempting to send activation success email via SMTP...');
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     appLogger.info('✅ Activation success email sent', {
       messageId: info.messageId,
       to: email
@@ -484,26 +650,42 @@ export async function sendManualAssignmentLinkedEmail(params: {
   const { getEmailConfig } = await import('./email-config');
   const emailConfig = await getEmailConfig();
 
-  const portalUrl = 'https://mgmt.sdc.cpp.edu';
-  const supportUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/support/create`;
+  const instructionsUrl = portalLink('/instructions');
+  const loginUrl = portalLink('/login');
+  const supportUrl = portalLink('/support/create');
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject: 'Your Account Has Been Linked - Cal Poly Pomona Student SOC',
-    html: `
+  const resolved = await resolveContent(
+    'request.manual_assignment_linked',
+    {
+      name: escapeHtml(name),
+      adUsername: escapeHtml(ldapUsername),
+      linkedBy: escapeHtml(linkedBy),
+      linkTypeDescription: isGrandfathered ? 'Grandfathered account (existing directory user without email)' : 'Manual assignment to existing directory account',
+      instructionsUrl,
+      loginUrl,
+      notesBlock: notes ? `
+          <div style=\"background-color: #fef3c7; padding: 16px; border-left: 4px solid #f59e0b; border-radius: 6px; margin-bottom: 20px;\">
+            <h3 style=\"margin: 0 0 12px 0; color: #d97706;\">Notes from the Team</h3>
+            <p style=\"margin: 0; white-space: pre-wrap;\">${escapeHtml(notes)}</p>
+          </div>
+        ` : '',
+      supportUrl,
+    },
+    {
+      subject: 'Your Account Has Been Linked - Cal Poly Pomona Student SOC',
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;">
         <h2 style="margin-bottom: 8px;">Existing Account Linked Successfully</h2>
         <p style="margin: 0 0 16px 0;">Hello ${escapeHtml(name)},</p>
         <p style="margin: 0 0 16px 0;">
-          We've confirmed that an existing SDC Domain account already belongs to you and have connected it to your recent access request.
+          We've confirmed that an existing account in Active Directory already belongs to you and connected this directory account to your recent access request.
           You can continue signing in with your current credentials—no password reset was required.
         </p>
         <div style="background-color: #f0fdf4; padding: 16px; border-left: 4px solid #059669; border-radius: 6px; margin-bottom: 20px;">
           <h3 style="margin: 0 0 12px 0; color: #047857;">Account Details</h3>
           <table style="width: 100%; border-collapse: collapse;">
             <tr>
-              <td style="padding: 8px; font-weight: bold; width: 35%;">AD Username</td>
+              <td style="padding: 8px; font-weight: bold; width: 35%;">Directory username</td>
               <td style="padding: 8px; font-family: monospace; background-color: #fff; border-radius: 4px;">${escapeHtml(ldapUsername)}</td>
             </tr>
             <tr>
@@ -516,15 +698,15 @@ export async function sendManualAssignmentLinkedEmail(params: {
             </tr>
             <tr>
               <td style="padding: 8px; font-weight: bold;">Link Type</td>
-              <td style="padding: 8px;">${isGrandfathered ? 'Grandfathered account (existing AD user without email)' : 'Manual assignment to existing AD account'}</td>
+              <td style="padding: 8px;">${isGrandfathered ? 'Grandfathered account (existing directory user without email)' : 'Manual assignment to existing directory account'}</td>
             </tr>
           </table>
         </div>
         <div style="background-color: #eef2ff; padding: 16px; border-left: 4px solid #6366f1; border-radius: 6px; margin-bottom: 20px;">
           <h3 style="margin: 0 0 12px 0; color: #4338ca;">Next Steps</h3>
           <ol style="margin: 0; padding-left: 20px; color: #312e81;">
-            <li style="margin-bottom: 8px;">Use <a href="${portalUrl}" style="color: #4338ca; font-weight: bold;">${portalUrl.replace('https://', '')}</a> as the gateway address to get on the VPN.</li>
-            <li style="margin-bottom: 8px;">Login to <a href="https://portal.sdc.cpp" style="color: #4338ca; font-weight: bold;">portal.sdc.cpp</a>.</li>
+            <li style="margin-bottom: 8px;"><a href="${instructionsUrl}" style="color: #4338ca; font-weight: bold;">Review current setup instructions</a>.</li>
+            <li style="margin-bottom: 8px;"><a href="${loginUrl}" style="color: #4338ca; font-weight: bold;">Sign in to the UAR Portal</a>.</li>
           </ol>
         </div>
         ${notes ? `
@@ -542,9 +724,17 @@ export async function sendManualAssignmentLinkedEmail(params: {
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
-  await transporter.sendMail(mailOptions);
+  await (await getTransporter()).sendMail(mailOptions);
 }
 
 export async function sendCredentialsEmail(
@@ -563,21 +753,31 @@ export async function sendCredentialsEmail(
 
   const { getEmailConfig } = await import('./email-config');
   const emailConfig = await getEmailConfig();
+  const instructionsUrl = portalLink('/instructions');
+  const supportUrl = portalLink('/support/create');
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject: 'Your VPN Account Credentials - Cal Poly Pomona Student SOC',
-    html: `
+  const resolved = await resolveContent(
+    'account.credentials',
+    {
+      name: escapeHtml(name),
+      adUsername: escapeHtml(ldapUsername),
+      password: escapeHtml(password),
+      expiryDate: escapeHtml(expiresAt.toLocaleDateString()),
+      instructionsUrl,
+      supportUrl,
+    },
+    {
+      subject: 'Your Directory Account Credentials - Cal Poly Pomona Student SOC',
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <h2>VPN Account Created</h2>
+        <h2>Directory Account Created</h2>
         <p>Hello ${escapeHtml(name)},</p>
-        <p>Your VPN account has been created successfully. Below are your login credentials:</p>
+        <p>Your Active Directory account is ready. Use these credentials for authorized SOC services, including VPN access.</p>
         <div style="background-color: #f0fdf4; padding: 16px; border-left: 4px solid #059669; border-radius: 4px; margin: 16px 0;">
           <h3 style="margin-top: 0; color: #059669;">Your Login Credentials</h3>
           <table style="width: 100%; border-collapse: collapse;">
             <tr>
-              <td style="padding: 8px; font-weight: bold;">AD Username:</td>
+              <td style="padding: 8px; font-weight: bold;">Directory username:</td>
               <td style="padding: 8px; font-family: monospace; background-color: #fff; border-radius: 3px;">${escapeHtml(ldapUsername)}</td>
             </tr>
             <tr>
@@ -592,31 +792,33 @@ export async function sendCredentialsEmail(
           <p style="margin-bottom: 0; color: #c33; font-size: 14px;"><strong>⚠️ Important:</strong> Please save these credentials securely.</p>
         </div>
         <div style="background-color: #f5f5f5; padding: 16px; border-radius: 4px; margin: 16px 0;">
-          <h3>Access Your VPN Portal:</h3>
-          <p style="margin: 8px 0;">
-            <a href="https://vpn.sdc.cpp.edu" 
-               style="color: #059669; font-weight: bold; font-size: 16px;">
-              vpn.sdc.cpp.edu
-            </a>
-          </p>
+          <h3>Set up your access</h3>
+          <p style="margin: 8px 0;"><a href="${instructionsUrl}" style="color: #059669; font-weight: bold; font-size: 16px;">View setup instructions</a></p>
           <h4 style="margin-top: 16px;">Next Steps:</h4>
           <ol style="margin: 8px 0;">
-            <li>Visit the VPN portal above</li>
-            <li>Download and configure the VPN client</li>
-            <li>Use your credentials to connect</li>
+            <li>Review the current VPN and service setup instructions</li>
+            <li>Use your directory credentials when the instructions direct you to sign in</li>
           </ol>
         </div>
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 12px;">
-          If you have any questions, please contact the IT department.
+          Need help? <a href="${supportUrl}" style="color: #059669;">Submit a support ticket</a> through the UAR Portal.
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     appLogger.info('Attempting to send credentials email via SMTP...');
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     appLogger.info('✅ Credentials email sent successfully', {
       messageId: info.messageId,
       to: email
@@ -642,30 +844,64 @@ export async function sendRejectionEmail(
   const { getEmailConfig } = await import('./email-config');
   const emailConfig = await getEmailConfig();
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject: 'Access Request Update - Cal Poly Pomona Student SOC',
-    html: `
+  const safeName = escapeHtml(name);
+  const safeReason = escapeHtml(reason);
+  const supportUrl = portalLink('/support/create');
+  const resolved = await resolveContent(
+    'request.rejection_notice',
+    { name: safeName, reason: safeReason, supportUrl },
+    {
+      subject: 'Access Request Update - Cal Poly Pomona Student SOC',
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>Access Request Status Update</h2>
-        <p>Hello ${escapeHtml(name)},</p>
+        <p>Hello ${safeName},</p>
         <p>Thank you for your interest in accessing the Cal Poly Pomona Student SOC systems.</p>
         <p>After review, your access request has been declined for the following reason:</p>
         <div style="background-color: #fee; padding: 16px; border-left: 4px solid #c33; border-radius: 4px; margin: 16px 0;">
           <p style="margin: 0; color: #c33; font-weight: bold;">Reason:</p>
-          <p style="margin: 8px 0 0 0; color: #333;">${escapeHtml(reason)}</p>
+          <p style="margin: 8px 0 0 0; color: #333;">${safeReason}</p>
         </div>
         <p>If you believe this decision was made in error or if you have any questions, please contact us to discuss your request further.</p>
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 12px;">
-          If you have any questions, please contact the IT department or Student SOC administrators.
+          If you have questions, <a href="${supportUrl}">submit a support ticket</a>.
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
-  await transporter.sendMail(mailOptions);
+  await (await getTransporter()).sendMail(mailOptions);
+}
+
+export async function sendMessageTemplateTest(params: {
+  to: string;
+  subject: string;
+  html: string;
+  text: string;
+}) {
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+  const info = await (await getTransporter()).sendMail({
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: params.to,
+    subject: params.subject,
+    html: params.html,
+    text: params.text,
+    headers: { 'X-UAR-Portal': 'Cal Poly SOC UAR Portal' },
+  });
+  if (info.rejected && info.rejected.length > 0) {
+    throw new Error(`Email rejected by server for recipients: ${info.rejected.join(', ')}`);
+  }
+  return { messageId: info.messageId || null, accepted: info.accepted || [] };
 }
 
 export async function sendPasswordResetEmail(
@@ -695,12 +931,20 @@ export async function sendPasswordResetEmail(
   const notice = options.initiatedByAdmin
     ? 'If you were not expecting this administrator-issued reset link, contact Student SOC support before using it. Your password will remain unchanged unless you complete the reset form.'
     : 'If you did not request a password reset, please ignore this email. Your password will remain unchanged.';
+  const supportUrl = portalLink('/support/create');
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject,
-    html: `
+  const resolved = await resolveContent(
+    options.initiatedByAdmin ? 'account.password_reset_admin' : 'account.password_reset_user',
+    {
+      heading,
+      intro,
+      notice,
+      resetUrl,
+      supportUrl,
+    },
+    {
+      subject,
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>${heading}</h2>
         <p>${intro}</p>
@@ -718,15 +962,23 @@ export async function sendPasswordResetEmail(
         </div>
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 12px;">
-          If you have any questions, please contact the IT department.
+          If you have questions, <a href="${supportUrl}">submit a support ticket</a>.
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     appLogger.info('Attempting to send password reset email via SMTP...');
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     appLogger.info('✅ Password reset email sent successfully', {
       messageId: info.messageId,
       to: email,
@@ -756,11 +1008,15 @@ export async function sendProfileEmailVerification(
 
   const verificationUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/api/profile/verify-email/confirm?token=${verificationToken}`;
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject: 'Verify Your Email Address - Cal Poly Pomona Student SOC',
-    html: `
+  const resolved = await resolveContent(
+    'profile.email_verification',
+    {
+      name: escapeHtml(name),
+      verificationUrl,
+    },
+    {
+      subject: 'Verify Your Email Address - Cal Poly Pomona Student SOC',
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>Hello ${escapeHtml(name)}!</h2>
         <p>You have requested to add this email address to your Student SOC account.</p>
@@ -784,9 +1040,17 @@ export async function sendProfileEmailVerification(
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
-  await transporter.sendMail(mailOptions);
+  await (await getTransporter()).sendMail(mailOptions);
 }
 
 /**
@@ -813,11 +1077,19 @@ export async function sendVPNPendingFacultyNotification(
 
   const adminUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/admin`;
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: facultyEmail,
-    subject: `VPN Account Pending Faculty Approval - ${escapeHtml(accountName)}`,
-    html: `
+  const resolved = await resolveContent(
+    'vpn.pending_faculty',
+    {
+      accountName: escapeHtml(accountName),
+      accountUsername: escapeHtml(accountUsername),
+      accountEmail: escapeHtml(accountEmail),
+      portalType: escapeHtml(portalType),
+      createdBy: escapeHtml(createdBy),
+      adminUrl,
+    },
+    {
+      subject: `VPN Account Pending Faculty Approval - ${escapeHtml(accountName)}`,
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>VPN Account Awaiting Faculty Approval</h2>
         <p>A new VPN account has been created and is pending faculty approval:</p>
@@ -854,11 +1126,19 @@ export async function sendVPNPendingFacultyNotification(
         </a>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: facultyEmail,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     appLogger.info('Attempting to send VPN pending faculty notification...');
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     appLogger.info('✅ VPN pending faculty notification sent successfully', {
       messageId: info.messageId,
       to: facultyEmail,
@@ -876,15 +1156,18 @@ export async function sendVPNPendingFacultyNotification(
 export async function sendStudentDirectorNotification(
   subject: string,
   message: string,
-  details?: Record<string, string>
+  details?: Record<string, string>,
+  recipientsOverride?: string[]
 ) {
   const { getEmailConfig, getStudentDirectorEmails } = await import('./email-config');
   const emailConfig = await getEmailConfig();
 
   console.log('[Email] sendStudentDirectorNotification called with subject:', subject);
 
-  // Get student director emails from database or environment variable
-  const directorEmails = await getStudentDirectorEmails();
+  // Stage-pinned recipients win over the global director list.
+  const normalizedRecipients = (recipientsOverride ?? []).map((r) => r.trim().toLowerCase()).filter(Boolean);
+  const directorEmails =
+    normalizedRecipients.length > 0 ? normalizedRecipients : await getStudentDirectorEmails();
 
   if (directorEmails.length === 0) {
     console.warn('[Email] ⚠️ No student director emails configured');
@@ -902,11 +1185,17 @@ export async function sendStudentDirectorNotification(
     </table>
   ` : '';
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: directorEmails.join(','),
-    subject: `[Student Directors] ${subject}`,
-    html: `
+  const resolved = await resolveContent(
+    'notifications.student_director',
+    {
+      notificationTitle: subject,
+      message: escapeHtml(message),
+      detailsTableBlock: detailsHtml,
+      adminUrl: `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/admin`,
+    },
+    {
+      subject: `[Student Directors] ${subject}`,
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>Student Director Notification</h2>
         <div style="background-color: #ecfdf5; padding: 16px; border-left: 4px solid #10b981; border-radius: 4px; margin: 16px 0;">
@@ -922,11 +1211,19 @@ export async function sendStudentDirectorNotification(
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: directorEmails.join(','),
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     console.log('[Email] Attempting to send student director notification to:', directorEmails);
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     console.log('[Email] ✅ Student director notification sent successfully:', {
       messageId: info.messageId,
       to: directorEmails,
@@ -936,6 +1233,40 @@ export async function sendStudentDirectorNotification(
     console.error('[Email] ❌ Failed to send student director notification:', error);
     throw error;
   }
+}
+
+/** Notify the reviewers for a configured governance stage without assuming a
+ * particular role name or a legacy Director-to-Faculty workflow shape. */
+export async function sendWorkflowStageNotification(params: {
+  recipients: string[];
+  requestId: string;
+  requestName: string;
+  requestEmail: string;
+  stageLabel: string;
+  advancedBy: string;
+}) {
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+  const recipients = Array.from(new Set(params.recipients.map((entry) => entry.trim().toLowerCase()).filter(Boolean)));
+  if (recipients.length === 0) return;
+  const requestUrl = portalLink(`/admin/requests/${encodeURIComponent(params.requestId)}`);
+  return (await getTransporter()).sendMail({
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: recipients.join(','),
+    subject: `Access request ready for ${params.stageLabel}`,
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2>Access request ready for review</h2>
+        <p>An access request has moved to <strong>${escapeHtml(params.stageLabel)}</strong>.</p>
+        <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+          <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Name</td><td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(params.requestName)}</td></tr>
+          <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Email</td><td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(params.requestEmail)}</td></tr>
+          <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Advanced by</td><td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(params.advancedBy)}</td></tr>
+        </table>
+        <a href="${requestUrl}" style="display: inline-block; padding: 12px 24px; background-color: #059669; color: #fff; text-decoration: none; border-radius: 4px;">Review request</a>
+      </div>
+    `,
+  });
 }
 
 /**
@@ -957,7 +1288,8 @@ export async function sendFacultyNotification(
   needsDomainAccount: boolean,
   eventReason?: string,
   eventName?: string,
-  customMessage?: string
+  customMessage?: string,
+  recipientsOverride?: string[]
 ) {
   console.log('[Email] sendFacultyNotification called with:', {
     requestId,
@@ -971,7 +1303,10 @@ export async function sendFacultyNotification(
   const { getEmailConfig } = await import('./email-config');
   const emailConfig = await getEmailConfig();
 
-  const facultyEmail = emailConfig.facultyEmail;
+  // Workflow stages may pin their own reviewer list (ADR-0002); when absent
+  // the global faculty mailbox applies.
+  const normalizedRecipients = (recipientsOverride ?? []).map((r) => r.trim()).filter(Boolean);
+  const facultyEmail = normalizedRecipients.length > 0 ? normalizedRecipients.join(',') : emailConfig.facultyEmail;
 
   if (!facultyEmail) {
     throw new Error('Faculty email not configured. Please set FACULTY_EMAIL environment variable or configure in system settings.');
@@ -979,22 +1314,47 @@ export async function sendFacultyNotification(
 
   const adminUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/admin/requests/${requestId}`;
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: facultyEmail,
-    subject: `Faculty Approval Requested - ${escapeHtml(name)} Access Request`,
-    html: `
+  const resolved = await resolveContent(
+    'request.faculty_notification',
+    {
+      name: escapeHtml(name),
+      customMessageBlock: customMessage ? `
+        <div style="background-color: #fef3c7; padding: 16px; border-left: 4px solid #f59e0b; border-radius: 4px; margin: 16px 0;">
+          <h3 style="margin-top: 0; color: #92400e;">Message from Student Director</h3>
+          <p style="margin: 0; color: #333; white-space: pre-wrap;">${escapeHtml(customMessage)}</p>
+        </div>
+        ` : '',
+      email: escapeHtml(email),
+      studentType: isInternal ? 'Internal Student (@cpp.edu)' : 'External Student',
+      domainAccountNeeded: needsDomainAccount ? 'Required' : 'Not Required',
+      eventNameRowBlock: eventName ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Event:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(eventName)}</td>
+          </tr>
+          ` : '',
+      eventReasonRowBlock: eventReason ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Reason:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(eventReason)}</td>
+          </tr>
+          ` : '',
+      adminUrl,
+    },
+    {
+      subject: `Faculty Approval Requested - ${escapeHtml(name)} Access Request`,
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2 style="color: #059669;">Faculty Approval Requested</h2>
         <p>A student access request has been reviewed by the Student Directors and is now awaiting faculty approval.</p>
-        
+
         ${customMessage ? `
         <div style="background-color: #fef3c7; padding: 16px; border-left: 4px solid #f59e0b; border-radius: 4px; margin: 16px 0;">
           <h3 style="margin-top: 0; color: #92400e;">Message from Student Director</h3>
           <p style="margin: 0; color: #333; white-space: pre-wrap;">${escapeHtml(customMessage)}</p>
         </div>
         ` : ''}
-        
+
         <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
           <tr>
             <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Name:</td>
@@ -1025,16 +1385,16 @@ export async function sendFacultyNotification(
           </tr>
           ` : ''}
         </table>
-        
+
         <div style="background-color: #ecfdf5; padding: 16px; border-left: 4px solid #10b981; border-radius: 4px; margin: 16px 0;">
           <h3 style="margin-top: 0; color: #059669;">Next Steps</h3>
           <p style="margin: 0;">Please review this request in the admin dashboard. You can approve or provide additional guidance to the Student Directors.</p>
         </div>
-        
+
         <a href="${adminUrl}" style="display: inline-block; padding: 12px 24px; background-color: #059669; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
           Review Request
         </a>
-        
+
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 12px;">
           This is an automated notification from the Cal Poly Pomona Student SOC User Access Request system.<br>
@@ -1042,11 +1402,19 @@ export async function sendFacultyNotification(
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: facultyEmail,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     console.log('[Email] Attempting to send faculty notification to:', facultyEmail);
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     console.log('[Email] ✅ Faculty notification sent successfully:', {
       messageId: info.messageId,
       to: facultyEmail,
@@ -1090,17 +1458,57 @@ export async function sendNewTicketNotificationToAdmin(params: {
   }
 
   const ticketUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/admin`;
-  const bodyPreview = body.substring(0, 200) + (body.length > 200 ? '...' : '');
+  // Rich bodies arrive pre-sanitized from the ticket pipeline; previews are
+  // always plain text so tags never leak into the email.
+  const bodyPreviewSource = isTicketHtml(body) ? htmlToPlainText(body) : body;
+  const bodyPreview = bodyPreviewSource.substring(0, 200) + (bodyPreviewSource.length > 200 ? '...' : '');
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: adminEmail,
-    subject: `New Support Ticket: ${subject}`,
-    html: `
+  const resolved = await resolveContent(
+    'ticket.created_admin',
+    {
+      ticketSubject: subject,
+      ticketId,
+      ticketSubjectHtml: escapeHtml(subject),
+      ticketIdHtml: escapeHtml(ticketId),
+      username: escapeHtml(username),
+      userEmailRowBlock: userEmail ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">User Email:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(userEmail)}</td>
+          </tr>
+          ` : '',
+      categoryRowBlock: category ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Category:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(category)}</td>
+          </tr>
+          ` : '',
+      severityRowBlock: severity ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Severity:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">
+              <span style="padding: 4px 8px; border-radius: 4px; background-color: ${severity === 'critical' ? '#fee2e2' :
+          severity === 'high' ? '#fed7aa' :
+            severity === 'medium' ? '#fef3c7' : '#f0fdf4'
+        }; color: ${severity === 'critical' ? '#991b1b' :
+          severity === 'high' ? '#9a3412' :
+            severity === 'medium' ? '#92400e' : '#166534'
+        };">
+                ${escapeHtml(severity.toUpperCase())}
+              </span>
+            </td>
+          </tr>
+          ` : '',
+      bodyPreview: escapeHtml(bodyPreview),
+      ticketUrl,
+    },
+    {
+      subject: `New Support Ticket: ${subject}`,
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2 style="color: #dc2626;">New Support Ticket Created</h2>
         <p>A user has submitted a new support ticket that requires your attention.</p>
-        
+
         <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
           <tr>
             <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Ticket ID:</td>
@@ -1143,27 +1551,35 @@ export async function sendNewTicketNotificationToAdmin(params: {
           </tr>
           ` : ''}
         </table>
-        
+
         <div style="background-color: #f9fafb; padding: 16px; border-radius: 4px; margin: 16px 0;">
           <h3 style="margin-top: 0;">Message Preview:</h3>
           <p style="margin: 0; white-space: pre-wrap; color: #374151;">${escapeHtml(bodyPreview)}</p>
         </div>
-        
+
         <a href="${ticketUrl}" style="display: inline-block; padding: 12px 24px; background-color: #dc2626; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
           View Ticket in Admin Dashboard
         </a>
-        
+
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 12px;">
           This is an automated notification from the Cal Poly Pomona Student SOC User Access Request system.
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: adminEmail,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     console.log('[Email] Attempting to send new ticket notification to admin:', adminEmail);
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     console.log('[Email] ✅ New ticket notification sent successfully:', {
       messageId: info.messageId,
       to: adminEmail,
@@ -1172,6 +1588,235 @@ export async function sendNewTicketNotificationToAdmin(params: {
   } catch (error) {
     console.error('[Email] ❌ Failed to send new ticket notification:', error);
     // Don't throw - we don't want ticket creation to fail if email fails
+  }
+}
+
+/**
+ * Send the creator a receipt confirming their ticket was received (ADR-0007).
+ */
+export async function sendTicketReceiptToCreator(params: {
+  ticketId: string;
+  subject: string;
+  category?: string | null;
+  severity?: string | null;
+  userEmail: string;
+  userName?: string;
+}) {
+  const { ticketId, subject, category, severity, userEmail, userName } = params;
+
+  console.log('[Email] sendTicketReceiptToCreator called with:', {
+    ticketId,
+    subject,
+    userEmail,
+    hasName: !!userName,
+  });
+
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+
+  const ticketUrl = portalLink(`/support/tickets/${ticketId}`);
+
+  const resolved = await resolveContent(
+    'ticket.receipt',
+    {
+      ticketSubject: subject,
+      ticketId,
+      ticketSubjectHtml: escapeHtml(subject),
+      ticketIdHtml: escapeHtml(ticketId),
+      greetingBlock: userName ? `<p>Hello ${escapeHtml(userName)},</p>` : '<p>Hello,</p>',
+      categoryRowBlock: category ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Category:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(category)}</td>
+          </tr>
+          ` : '',
+      severityRowBlock: severity ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Severity:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(severity.toUpperCase())}</td>
+          </tr>
+          ` : '',
+      ticketUrl,
+    },
+    {
+      subject: `We Received Your Support Ticket: ${subject}`,
+      html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2 style="color: #2563eb;">Support Ticket Received</h2>
+        ${userName ? `<p>Hello ${escapeHtml(userName)},</p>` : '<p>Hello,</p>'}
+        <p>We have received your support ticket and will send you updates as it is worked on.</p>
+
+        <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Ticket ID:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(ticketId)}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Subject:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(subject)}</td>
+          </tr>
+          ${category ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Category:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(category)}</td>
+          </tr>
+          ` : ''}
+          ${severity ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Severity:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(severity.toUpperCase())}</td>
+          </tr>
+          ` : ''}
+        </table>
+
+        <a href="${ticketUrl}" style="display: inline-block; padding: 12px 24px; background-color: #2563eb; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
+          View Your Ticket
+        </a>
+
+        <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
+        <p style="color: #666; font-size: 12px;">
+          No action is needed from you right now. You will receive an email when your ticket is updated.
+        </p>
+      </div>
+    `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: userEmail,
+    subject: resolved.subject,
+    html: resolved.html,
+  };
+
+  try {
+    console.log('[Email] Attempting to send ticket receipt to creator:', userEmail);
+    const info = await (await getTransporter()).sendMail(mailOptions);
+    console.log('[Email] ✅ Ticket receipt sent successfully:', {
+      messageId: info.messageId,
+      to: userEmail,
+    });
+    return info;
+  } catch (error) {
+    console.error('[Email] ❌ Failed to send ticket receipt:', error);
+    // Don't throw - receipt delivery must never fail ticket creation
+  }
+}
+
+/**
+ * Notify resolved assignees that a ticket has been assigned to them or changed
+ * ownership (ADR-0007).
+ */
+export async function sendTicketAssignedNotificationToAssignees(params: {
+  ticketId: string;
+  subject: string;
+  recipientEmails: string[];
+  targetLabels: string[];
+  assignedBy: string;
+  assigned: boolean;
+}) {
+  const { ticketId, subject, recipientEmails, targetLabels, assignedBy, assigned } = params;
+
+  if (!Array.isArray(recipientEmails) || recipientEmails.length === 0) {
+    console.warn('[Email] sendTicketAssignedNotificationToAssignees called without recipients; skipping.', {
+      ticketId,
+    });
+    return;
+  }
+
+  console.log('[Email] sendTicketAssignedNotificationToAssignees called with:', {
+    ticketId,
+    subject,
+    recipientCount: recipientEmails.length,
+    assigned,
+  });
+
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+
+  const adminUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/admin`;
+
+  const heading = assigned ? 'Support Ticket Assigned' : 'Support Ticket Assignment Removed';
+  const accent = assigned ? '#2563eb' : '#6b7280';
+  const actionLine = assigned
+    ? 'A support ticket has been assigned to you or a group you belong to. You are now responsible for responding to it.'
+    : 'Your assignment on the following support ticket has been removed.';
+
+  const resolved = await resolveContent(
+    'ticket.assigned',
+    {
+      ticketSubject: subject,
+      ticketId,
+      assignmentTag: assigned ? '[Assigned]' : '[Unassigned]',
+      ticketSubjectHtml: escapeHtml(subject),
+      ticketIdHtml: escapeHtml(ticketId),
+      accentColor: accent,
+      heading,
+      actionLine: escapeHtml(actionLine),
+      assignmentTargets: escapeHtml(targetLabels.join(', ')),
+      changedBy: escapeHtml(assignedBy),
+      adminUrl,
+    },
+    {
+      subject: `${assigned ? '[Assigned]' : '[Unassigned]'} Support Ticket: ${subject}`,
+      html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2 style="color: ${accent};">${heading}</h2>
+        <p>${escapeHtml(actionLine)}</p>
+
+        <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Ticket ID:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(ticketId)}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Subject:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(subject)}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Assignment:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(targetLabels.join(', '))}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Changed By:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(assignedBy)}</td>
+          </tr>
+        </table>
+
+        <a href="${adminUrl}" style="display: inline-block; padding: 12px 24px; background-color: ${accent}; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
+          Open Support Dashboard
+        </a>
+
+        <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
+        <p style="color: #666; font-size: 12px;">
+          This is an automated notification from the Cal Poly Pomona Student SOC User Access Request system.
+        </p>
+      </div>
+    `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: recipientEmails,
+    subject: resolved.subject,
+    html: resolved.html,
+  };
+
+  try {
+    console.log('[Email] Attempting to send assignment notification:', {
+      ticketId,
+      recipientCount: recipientEmails.length,
+    });
+    const info = await (await getTransporter()).sendMail(mailOptions);
+    console.log('[Email] ✅ Assignment notification sent successfully:', {
+      messageId: info.messageId,
+      accepted: info.accepted,
+    });
+    return info;
+  } catch (error) {
+    console.error('[Email] ❌ Failed to send assignment notification:', error);
+    // Don't throw - assignment state must not depend on email delivery
   }
 }
 
@@ -1185,31 +1830,58 @@ export async function sendTicketResponseToUser(params: {
   userName?: string;
   responseMessage: string;
   staffUsername: string;
+  /** False when the responder is an assignee-group member, not staff. */
+  responderIsStaff?: boolean;
 }) {
-  const { ticketId, subject, userEmail, userName, responseMessage, staffUsername } = params;
+  const { ticketId, subject, userEmail, userName, responseMessage, staffUsername, responderIsStaff = true } = params;
 
   console.log('[Email] sendTicketResponseToUser called with:', {
     ticketId,
     subject,
     userEmail,
     staffUsername,
+    responderIsStaff,
   });
 
   const { getEmailConfig } = await import('./email-config');
   const emailConfig = await getEmailConfig();
 
-  const ticketUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/support/tickets/${ticketId}`;
+  const ticketUrl = portalLink(`/support/tickets/${ticketId}`);
+  const supportUrl = portalLink('/support/create');
+  const heading = responderIsStaff
+    ? 'Staff Response to Your Support Ticket'
+    : 'New Response on Your Support Ticket';
+  const introLine = responderIsStaff
+    ? 'A staff member has responded to your support ticket.'
+    : 'Someone handling your ticket has responded.';
+  // Rich bodies are already sanitized by the ticket pipeline and render as
+  // HTML in the email; legacy plain text stays escaped.
+  const responseMessageHtml = isTicketHtml(responseMessage)
+    ? sanitizeTicketHtml(responseMessage)
+    : escapeHtml(responseMessage);
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: userEmail,
-    subject: `Response to Your Support Ticket: ${subject}`,
-    html: `
+  const resolved = await resolveContent(
+    'ticket.staff_response',
+    {
+      ticketSubject: subject,
+      ticketId,
+      ticketSubjectHtml: escapeHtml(subject),
+      heading,
+      greetingBlock: userName ? `<p>Hello ${escapeHtml(userName)},</p>` : '<p>Hello,</p>',
+      introLine,
+      respondedBy: escapeHtml(staffUsername),
+      responseMessage: responseMessageHtml,
+      ticketUrl,
+      supportUrl,
+    },
+    {
+      subject: `Response to Your Support Ticket: ${subject}`,
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <h2 style="color: #059669;">Staff Response to Your Support Ticket</h2>
+        <h2 style="color: #059669;">${heading}</h2>
         ${userName ? `<p>Hello ${escapeHtml(userName)},</p>` : '<p>Hello,</p>'}
-        <p>A staff member has responded to your support ticket.</p>
-        
+        <p>${introLine}</p>
+
         <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
           <tr>
             <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Ticket Subject:</td>
@@ -1220,28 +1892,36 @@ export async function sendTicketResponseToUser(params: {
             <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(staffUsername)}</td>
           </tr>
         </table>
-        
+
         <div style="background-color: #ecfdf5; padding: 16px; border-left: 4px solid #10b981; border-radius: 4px; margin: 16px 0;">
           <h3 style="margin-top: 0; color: #059669;">Response:</h3>
-          <p style="margin: 0; white-space: pre-wrap; color: #374151;">${escapeHtml(responseMessage)}</p>
+          <div style="color: #374151; line-height: 1.5;">${responseMessageHtml}</div>
         </div>
-        
+
         <a href="${ticketUrl}" style="display: inline-block; padding: 12px 24px; background-color: #059669; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
           View Full Ticket
         </a>
-        
+
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 12px;">
           You can reply to this ticket by logging into the support portal.<br>
-          If you did not submit this ticket, please contact the IT department immediately.
+          If you did not submit this ticket, <a href="${supportUrl}">report it through the support portal</a>.
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: userEmail,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     console.log('[Email] Attempting to send ticket response to user:', userEmail);
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     console.log('[Email] ✅ Ticket response sent successfully:', {
       messageId: info.messageId,
       to: userEmail,
@@ -1283,17 +1963,33 @@ export async function sendUserResponseNotificationToAdmin(params: {
   }
 
   const ticketUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/admin`;
-  const responsePreview = responseMessage.substring(0, 200) + (responseMessage.length > 200 ? '...' : '');
+  const responsePreviewSource = isTicketHtml(responseMessage) ? htmlToPlainText(responseMessage) : responseMessage;
+  const responsePreview = responsePreviewSource.substring(0, 200) + (responsePreviewSource.length > 200 ? '...' : '');
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: adminEmail,
-    subject: `User Response on Ticket: ${subject}`,
-    html: `
+  const resolved = await resolveContent(
+    'ticket.user_reply_admin',
+    {
+      ticketSubject: subject,
+      ticketId,
+      ticketSubjectHtml: escapeHtml(subject),
+      ticketIdHtml: escapeHtml(ticketId),
+      username: escapeHtml(username),
+      userEmailRowBlock: userEmail ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">User Email:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(userEmail)}</td>
+          </tr>
+          ` : '',
+      responsePreview: escapeHtml(responsePreview),
+      ticketUrl,
+    },
+    {
+      subject: `User Response on Ticket: ${subject}`,
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2 style="color: #2563eb;">User Response on Support Ticket</h2>
         <p>A user has replied to an existing support ticket.</p>
-        
+
         <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
           <tr>
             <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Ticket ID:</td>
@@ -1314,30 +2010,159 @@ export async function sendUserResponseNotificationToAdmin(params: {
           </tr>
           ` : ''}
         </table>
-        
+
         <div style="background-color: #eff6ff; padding: 16px; border-left: 4px solid #3b82f6; border-radius: 4px; margin: 16px 0;">
           <h3 style="margin-top: 0; color: #1e40af;">Response Preview:</h3>
           <p style="margin: 0; white-space: pre-wrap; color: #374151;">${escapeHtml(responsePreview)}</p>
         </div>
-        
+
         <a href="${ticketUrl}" style="display: inline-block; padding: 12px 24px; background-color: #2563eb; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
           View Ticket in Admin Dashboard
         </a>
-        
+
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 12px;">
           This is an automated notification from the Cal Poly Pomona Student SOC User Access Request system.
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: adminEmail,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     console.log('[Email] Attempting to send user response notification to admin:', adminEmail);
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     console.log('[Email] ✅ User response notification sent successfully:', {
       messageId: info.messageId,
       to: adminEmail,
+    });
+    return info;
+  } catch (error) {
+    console.error('[Email] ❌ Failed to send user response notification:', error);
+    // Don't throw - we don't want response creation to fail if email fails
+  }
+}
+
+/**
+ * Notify active assignees when the ticket creator replies (ADR-0007).
+ */
+export async function sendUserResponseNotificationToAssignees(params: {
+  ticketId: string;
+  subject: string;
+  recipientEmails: string[];
+  username: string;
+  userEmail?: string | null;
+  responseMessage: string;
+}) {
+  const { ticketId, subject, recipientEmails, username, userEmail, responseMessage } = params;
+
+  if (!Array.isArray(recipientEmails) || recipientEmails.length === 0) {
+    console.warn('[Email] sendUserResponseNotificationToAssignees called without recipients; skipping.', {
+      ticketId,
+    });
+    return;
+  }
+
+  console.log('[Email] sendUserResponseNotificationToAssignees called with:', {
+    ticketId,
+    subject,
+    recipientCount: recipientEmails.length,
+    username,
+  });
+
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+
+  const adminUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/admin`;
+  const responsePreviewSource = isTicketHtml(responseMessage) ? htmlToPlainText(responseMessage) : responseMessage;
+  const responsePreview = responsePreviewSource.substring(0, 200) + (responsePreviewSource.length > 200 ? '...' : '');
+
+  const resolved = await resolveContent(
+    'ticket.user_reply_assignees',
+    {
+      ticketSubject: subject,
+      ticketId,
+      ticketSubjectHtml: escapeHtml(subject),
+      ticketIdHtml: escapeHtml(ticketId),
+      username: escapeHtml(username),
+      userEmailRowBlock: userEmail ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">User Email:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(userEmail)}</td>
+          </tr>
+          ` : '',
+      responsePreview: escapeHtml(responsePreview),
+      adminUrl,
+    },
+    {
+      subject: `User Response on Assigned Ticket: ${subject}`,
+      html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2 style="color: #2563eb;">User Response on Your Assigned Ticket</h2>
+        <p>The creator of a ticket assigned to you has replied.</p>
+
+        <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Ticket ID:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(ticketId)}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Subject:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(subject)}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Username:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(username)}</td>
+          </tr>
+          ${userEmail ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">User Email:</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(userEmail)}</td>
+          </tr>
+          ` : ''}
+        </table>
+
+        <div style="background-color: #eff6ff; padding: 16px; border-left: 4px solid #3b82f6; border-radius: 4px; margin: 16px 0;">
+          <h3 style="margin-top: 0; color: #1e40af;">Response Preview:</h3>
+          <p style="margin: 0; white-space: pre-wrap; color: #374151;">${escapeHtml(responsePreview)}</p>
+        </div>
+
+        <a href="${adminUrl}" style="display: inline-block; padding: 12px 24px; background-color: #2563eb; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
+          Open Support Dashboard
+        </a>
+
+        <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
+        <p style="color: #666; font-size: 12px;">
+          This is an automated notification from the Cal Poly Pomona Student SOC User Access Request system.
+        </p>
+      </div>
+    `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: recipientEmails,
+    subject: resolved.subject,
+    html: resolved.html,
+  };
+
+  try {
+    console.log('[Email] Attempting to send user response notification to assignees:', {
+      ticketId,
+      recipientCount: recipientEmails.length,
+    });
+    const info = await (await getTransporter()).sendMail(mailOptions);
+    console.log('[Email] ✅ User response notification sent successfully:', {
+      messageId: info.messageId,
+      accepted: info.accepted,
     });
     return info;
   } catch (error) {
@@ -1375,16 +2200,45 @@ export async function sendTicketStatusChangeToUser(params: {
   const ticketUrl = `${getRequiredEnv('NEXT_PUBLIC_APP_URL')}/support/tickets/${ticketId}`;
   const isClosed = newStatus === 'closed';
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: userEmail,
-    subject: `Ticket ${isClosed ? 'Closed' : 'Status Updated'}: ${subject}`,
-    html: `
+  const resolved = await resolveContent(
+    'ticket.status_change',
+    {
+      ticketSubject: subject,
+      ticketId,
+      statusWord: isClosed ? 'Closed' : 'Status Updated',
+      ticketSubjectHtml: escapeHtml(subject),
+      statusAccentColor: isClosed ? '#dc2626' : '#2563eb',
+      statusHeading: isClosed ? 'Closed' : 'Status Updated',
+      greetingBlock: userName ? `<p>Hello ${escapeHtml(userName)},</p>` : '<p>Hello,</p>',
+      oldStatusLabel: escapeHtml(oldStatus.replace('_', ' ').toUpperCase()),
+      newStatusLabel: escapeHtml(newStatus.replace('_', ' ').toUpperCase()),
+      newStatusColor: isClosed ? '#dc2626' : '#059669',
+      changedBy: escapeHtml(changedBy),
+      statusNoticeBlock: isClosed ? `
+        <div style="background-color: #fee2e2; padding: 16px; border-left: 4px solid #dc2626; border-radius: 4px; margin: 16px 0;">
+          <h3 style="margin-top: 0; color: #991b1b;">Ticket Closed</h3>
+          <p style="margin: 0; color: #374151;">
+            Your ticket has been closed. If you need further assistance with this issue, you can reopen the ticket or create a new one.
+          </p>
+        </div>
+        ` : `
+        <div style="background-color: #dbeafe; padding: 16px; border-left: 4px solid #3b82f6; border-radius: 4px; margin: 16px 0;">
+          <h3 style="margin-top: 0; color: #1e40af;">Status Updated</h3>
+          <p style="margin: 0; color: #374151;">
+            Your ticket status has been updated. Please check the ticket for any new responses or information.
+          </p>
+        </div>
+        `,
+      ticketUrl,
+    },
+    {
+      subject: `Ticket ${isClosed ? 'Closed' : 'Status Updated'}: ${subject}`,
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2 style="color: ${isClosed ? '#dc2626' : '#2563eb'};">Support Ticket ${isClosed ? 'Closed' : 'Status Updated'}</h2>
         ${userName ? `<p>Hello ${escapeHtml(userName)},</p>` : '<p>Hello,</p>'}
         <p>The status of your support ticket has been updated.</p>
-        
+
         <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
           <tr>
             <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Ticket Subject:</td>
@@ -1407,7 +2261,7 @@ export async function sendTicketStatusChangeToUser(params: {
             <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(changedBy)}</td>
           </tr>
         </table>
-        
+
         ${isClosed ? `
         <div style="background-color: #fee2e2; padding: 16px; border-left: 4px solid #dc2626; border-radius: 4px; margin: 16px 0;">
           <h3 style="margin-top: 0; color: #991b1b;">Ticket Closed</h3>
@@ -1423,22 +2277,30 @@ export async function sendTicketStatusChangeToUser(params: {
           </p>
         </div>
         `}
-        
+
         <a href="${ticketUrl}" style="display: inline-block; padding: 12px 24px; background-color: ${isClosed ? '#dc2626' : '#2563eb'}; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
           View Ticket
         </a>
-        
+
         <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 12px;">
           This is an automated notification from the Cal Poly Pomona Student SOC User Access Request system.
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: userEmail,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
   try {
     console.log('[Email] Attempting to send ticket status change to user:', userEmail);
-    const info = await transporter.sendMail(mailOptions);
+    const info = await (await getTransporter()).sendMail(mailOptions);
     console.log('[Email] ✅ Ticket status change sent successfully:', {
       messageId: info.messageId,
       to: userEmail,
@@ -1472,11 +2334,23 @@ export async function sendOffboardInitialEmail(params: {
     timeZoneName: 'short',
   });
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject: 'Action Required: Confirm Continued Account Access',
-    html: `
+  const resolved = await resolveContent(
+    'offboard.initial',
+    {
+      name: escapeHtml(name),
+      adUsername: escapeHtml(adUsername),
+      vpnUsernameRowBlock: vpnUsername ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">VPN Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(vpnUsername)}</td>
+          </tr>
+          ` : '',
+      deadlineText: escapeHtml(deadlineText),
+      verificationUrl,
+    },
+    {
+      subject: 'Action Required: Confirm Continued Account Access',
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;">
         <h2>Confirm Continued Access</h2>
         <p>Hello ${escapeHtml(name)},</p>
@@ -1509,9 +2383,17 @@ export async function sendOffboardInitialEmail(params: {
         </p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
-  const info = await transporter.sendMail(mailOptions);
+  const info = await (await getTransporter()).sendMail(mailOptions);
   if (info.rejected && info.rejected.length > 0) {
     throw new Error(`Email rejected by server for recipients: ${info.rejected.join(', ')}`);
   }
@@ -1541,11 +2423,25 @@ export async function sendOffboardReminderEmail(params: {
     timeZoneName: 'short',
   });
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject: `Reminder: Confirm Continued Account Access by ${deadline.toLocaleDateString('en-US')}`,
-    html: `
+  const resolved = await resolveContent(
+    'offboard.reminder',
+    {
+      name: escapeHtml(name),
+      reminderDay: String(reminderDay),
+      adUsername: escapeHtml(adUsername),
+      vpnUsernameRowBlock: vpnUsername ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">VPN Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(vpnUsername)}</td>
+          </tr>
+          ` : '',
+      deadlineText: escapeHtml(deadlineText),
+      deadlineDate: deadline.toLocaleDateString('en-US'),
+      verificationUrl,
+    },
+    {
+      subject: `Reminder: Confirm Continued Account Access by ${deadline.toLocaleDateString('en-US')}`,
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;">
         <h2>Access Confirmation Reminder</h2>
         <p>Hello ${escapeHtml(name)},</p>
@@ -1574,9 +2470,17 @@ export async function sendOffboardReminderEmail(params: {
         <p style="word-break: break-all; color: #666;">${verificationUrl}</p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
-  const info = await transporter.sendMail(mailOptions);
+  const info = await (await getTransporter()).sendMail(mailOptions);
   if (info.rejected && info.rejected.length > 0) {
     throw new Error(`Email rejected by server for recipients: ${info.rejected.join(', ')}`);
   }
@@ -1618,20 +2522,44 @@ async function sendOffboardExtensionNotification(params: {
     timeZoneName: 'short',
   });
 
-  const mailOptions = {
-    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
-    to: email,
-    subject: reminder
-      ? `Reminder: Extended Account Confirmation Deadline ${deadline.toLocaleDateString('en-US')}`
-      : 'Your Account Confirmation Deadline Has Been Extended',
-    html: `
+  const resolved = await resolveContent(
+    reminder ? 'offboard.extension_reminder' : 'offboard.extension',
+    {
+      heading: reminder ? 'Extended Deadline Reminder' : 'Account Confirmation Deadline Extended',
+      introSentence: reminder
+        ? 'This is a reminder that your extended deadline to confirm continued Student SOC account access is approaching.'
+        : 'An administrator extended the deadline for you to confirm continued Student SOC account access.',
+      name: escapeHtml(name),
+      adUsername: escapeHtml(adUsername),
+      vpnUsernameRowBlock: vpnUsername ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">VPN Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(vpnUsername)}</td>
+          </tr>
+          ` : '',
+      previousDeadlineRowBlock: previousDeadline && !reminder ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Previous Deadline</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(formatDeadline(previousDeadline))}</td>
+          </tr>
+          ` : '',
+      deadlineText: escapeHtml(formatDeadline(deadline)),
+      deadlineDate: deadline.toLocaleDateString('en-US'),
+      noteBlock: note && !reminder ? `<p><strong>Administrator note:</strong> ${escapeHtml(note)}</p>` : '',
+      verificationUrl,
+    },
+    {
+      subject: reminder
+        ? `Reminder: Extended Account Confirmation Deadline ${deadline.toLocaleDateString('en-US')}`
+        : 'Your Account Confirmation Deadline Has Been Extended',
+      html: `
       <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;">
         <h2>${reminder ? 'Extended Deadline Reminder' : 'Account Confirmation Deadline Extended'}</h2>
         <p>Hello ${escapeHtml(name)},</p>
         <p>
           ${reminder
-            ? 'This is a reminder that your extended deadline to confirm continued Student SOC account access is approaching.'
-            : 'An administrator extended the deadline for you to confirm continued Student SOC account access.'}
+        ? 'This is a reminder that your extended deadline to confirm continued Student SOC account access is approaching.'
+        : 'An administrator extended the deadline for you to confirm continued Student SOC account access.'}
         </p>
         <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
           <tr>
@@ -1664,9 +2592,17 @@ async function sendOffboardExtensionNotification(params: {
         <p style="word-break: break-all; color: #666;">${verificationUrl}</p>
       </div>
     `,
+    }
+  );
+
+  const mailOptions = {
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
   };
 
-  const info = await transporter.sendMail(mailOptions);
+  const info = await (await getTransporter()).sendMail(mailOptions);
   if (info.rejected && info.rejected.length > 0) {
     throw new Error(`Email rejected by server for recipients: ${info.rejected.join(', ')}`);
   }
@@ -1697,6 +2633,83 @@ export async function sendOffboardExtensionReminderEmail(params: {
   return sendOffboardExtensionNotification({ ...params, reminder: true });
 }
 
+/**
+ * Notify an account holder after a direct offboarding action has completed.
+ * This sender runs only after the caller has recorded successful AD disable
+ * and, when applicable, linked VPN revocation.
+ */
+export async function sendOffboardDirectCompletedEmail(params: {
+  email: string;
+  name: string;
+  adUsername: string;
+  vpnUsername?: string | null;
+}) {
+  const { email, name, adUsername, vpnUsername } = params;
+  const { getEmailConfig } = await import('./email-config');
+  const emailConfig = await getEmailConfig();
+  const requestUrl = portalLink('/request');
+  const supportUrl = portalLink('/support/create');
+  const hasVpnRecord = Boolean(vpnUsername);
+
+  const resolved = await resolveContent(
+    'offboard.direct_completed',
+    {
+      name: escapeHtml(name),
+      adUsername: escapeHtml(adUsername),
+      vpnUsernameRowBlock: hasVpnRecord ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">VPN Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(vpnUsername!)}</td>
+          </tr>
+          ` : '',
+      vpnRevokedNoticeBlock: hasVpnRecord
+        ? '<p>Your linked VPN access has also been revoked.</p>'
+        : '',
+      requestUrl,
+      supportUrl,
+    },
+    {
+      subject: 'Your Student SOC Access Has Been Offboarded',
+      html: `
+      <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;">
+        <h2>Your Student SOC Access Has Been Offboarded</h2>
+        <p>Hello ${escapeHtml(name)},</p>
+        <p>Your Student SOC access has been removed. Your Active Directory account has been disabled.</p>
+        <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">AD Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(adUsername)}</td>
+          </tr>
+          ${hasVpnRecord ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">VPN Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(vpnUsername!)}</td>
+          </tr>
+          ` : ''}
+        </table>
+        ${hasVpnRecord ? '<p>Your linked VPN access has also been revoked.</p>' : ''}
+        <p>If you need access again in the future, submit a new account request. A new request is required; this offboarded account cannot be reactivated through this notice.</p>
+        <a href="${requestUrl}" style="display: inline-block; padding: 12px 24px; background-color: #059669; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
+          Submit a New Account Request
+        </a>
+        <p>If you have questions, <a href="${supportUrl}">submit a support ticket</a>.</p>
+      </div>
+    `,
+    }
+  );
+
+  const info = await (await getTransporter()).sendMail({
+    from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
+    to: email,
+    subject: resolved.subject,
+    html: resolved.html,
+  });
+  if (info.rejected && info.rejected.length > 0) {
+    throw new Error(`Email rejected by server for recipients: ${info.rejected.join(', ')}`);
+  }
+  return info;
+}
+
 export async function sendMassEmail(params: {
   to: string;
   subject: string;
@@ -1718,7 +2731,7 @@ export async function sendMassEmail(params: {
     },
   };
 
-  const info = await transporter.sendMail(mailOptions);
+  const info = await (await getTransporter()).sendMail(mailOptions);
   if (info.rejected && info.rejected.length > 0) {
     throw new Error(`Email rejected by server for recipients: ${info.rejected.join(', ')}`);
   }
@@ -1756,44 +2769,66 @@ export async function sendPasswordExpirationReminderEmail(
     ? 'Action Required: Your SDC Account Password Must Be Changed'
     : `Reminder: Your SDC Account Password Expires Soon`;
 
-  const html = `
-    <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;">
-      <h2>${isExpired ? 'Password Change Required' : 'Password Expiration Reminder'}</h2>
-      <p>Hello ${escapeHtml(params.displayName || params.username)},</p>
-      <p>${escapeHtml(urgencyText)}</p>
-      <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
-        <tr>
-          <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">AD Username</td>
-          <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(params.username)}</td>
-        </tr>
-        <tr>
-          <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Status</td>
-          <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(params.status.replace(/_/g, ' '))}</td>
-        </tr>
-        ${expiryDate ? `
+  const resolved = await resolveContent(
+    'password.expiration_reminder',
+    {
+      subjectLine: subject,
+      heading: isExpired ? 'Password Change Required' : 'Password Expiration Reminder',
+      recipientName: escapeHtml(params.displayName || params.username),
+      urgencyMessage: escapeHtml(urgencyText),
+      username: escapeHtml(params.username),
+      statusLabel: escapeHtml(params.status.replace(/_/g, ' ')),
+      expiryDateRowBlock: expiryDate ? `
         <tr>
           <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Password Expires</td>
           <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(expiryDate)}</td>
         </tr>
-        ` : ''}
-      </table>
-      <p>
-        Go to the portal sign-in page and sign in with your current password. If Active Directory requires a change,
-        the portal will show the password update form before completing sign-in.
-      </p>
-      <a href="${loginUrl}" style="display: inline-block; padding: 12px 24px; background-color: #111827; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
-        Sign In and Update Password
-      </a>
-      <p style="margin-top: 16px;">
-        If you do not know your current password, use the forgot password flow instead:
-        <a href="${forgotPasswordUrl}" style="color: #2563eb; font-weight: bold;">${forgotPasswordUrl}</a>
-      </p>
-      <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
-      <p style="color: #666; font-size: 12px;">
-        This message was sent by the Student SOC User Access Request portal. Never share your password with anyone.
-      </p>
-    </div>
-  `;
+        ` : '',
+      loginUrl,
+      forgotPasswordUrl,
+    },
+    {
+      subject,
+      html: `
+      <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;">
+        <h2>${isExpired ? 'Password Change Required' : 'Password Expiration Reminder'}</h2>
+        <p>Hello ${escapeHtml(params.displayName || params.username)},</p>
+        <p>${escapeHtml(urgencyText)}</p>
+        <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">AD Username</td>
+            <td style="padding: 8px; border: 1px solid #ddd; font-family: monospace;">${escapeHtml(params.username)}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Status</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(params.status.replace(/_/g, ' '))}</td>
+          </tr>
+          ${expiryDate ? `
+          <tr>
+            <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f5f5f5;">Password Expires</td>
+            <td style="padding: 8px; border: 1px solid #ddd;">${escapeHtml(expiryDate)}</td>
+          </tr>
+          ` : ''}
+        </table>
+        <p>
+          Go to the portal sign-in page and sign in with your current password. If Active Directory requires a change,
+          the portal will show the password update form before completing sign-in.
+        </p>
+        <a href="${loginUrl}" style="display: inline-block; padding: 12px 24px; background-color: #111827; color: #ffffff; text-decoration: none; border-radius: 4px; margin: 16px 0; font-weight: bold;">
+          Sign In and Update Password
+        </a>
+        <p style="margin-top: 16px;">
+          If you do not know your current password, use the forgot password flow instead:
+          <a href="${forgotPasswordUrl}" style="color: #2563eb; font-weight: bold;">${forgotPasswordUrl}</a>
+        </p>
+        <hr style="margin: 24px 0; border: none; border-top: 1px solid #ddd;">
+        <p style="color: #666; font-size: 12px;">
+          This message was sent by the Student SOC User Access Request portal. Never share your password with anyone.
+        </p>
+      </div>
+    `,
+    }
+  );
 
   const text = [
     `Hello ${params.displayName || params.username},`,
@@ -1806,11 +2841,11 @@ export async function sendPasswordExpirationReminderEmail(
     `If you do not know your current password, use forgot password: ${forgotPasswordUrl}`,
   ].filter(Boolean).join('\n');
 
-  const info = await transporter.sendMail({
+  const info = await (await getTransporter()).sendMail({
     from: emailConfig.emailFrom || getRequiredEnv('EMAIL_FROM'),
     to: email,
-    subject,
-    html,
+    subject: resolved.subject,
+    html: resolved.html,
     text,
   });
 

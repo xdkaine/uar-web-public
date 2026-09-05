@@ -106,10 +106,10 @@ function formatDate(timestamp: number | null): string {
 
 function getStatusBadgeClass(status: RateLimitStatus): string {
   const classes: Record<RateLimitStatus, string> = {
-    limited: 'bg-red-100 text-red-800 border-red-200',
-    at_limit: 'bg-amber-100 text-amber-800 border-amber-200',
-    tracking: 'bg-green-50 text-green-700 border-green-200',
-    unknown: 'bg-gray-100 text-gray-700 border-gray-200',
+    limited: 'bg-red-100 dark:bg-red-950/60 text-red-800 border-red-200 dark:border-red-900',
+    at_limit: 'bg-amber-100 dark:bg-amber-950/60 text-amber-800 border-amber-200 dark:border-amber-900',
+    tracking: 'bg-green-50 dark:bg-green-950/40 text-green-700 dark:text-green-200 border-green-200 dark:border-green-900',
+    unknown: 'bg-muted text-muted-foreground border-border',
   };
 
   return classes[status];
@@ -124,7 +124,7 @@ async function readErrorMessage(response: Response, fallback: string): Promise<s
   }
 }
 
-export default function RateLimitManagementTab() {
+function useRateLimitManagement() {
   const [sessions, setSessions] = useState<RateLimitSession[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -230,6 +230,58 @@ export default function RateLimitManagementTab() {
     }
   };
 
+  return {
+    clearFilters,
+    error,
+    fetchRateLimits,
+    filteredSessions,
+    handleRelease,
+    hideToast,
+    isLoading,
+    isRefreshing,
+    isReleasing,
+    limitedCount,
+    atLimitCount,
+    releaseTarget,
+    searchQuery,
+    sessions,
+    setReleaseTarget,
+    setSearchQuery,
+    setStatusFilter,
+    setStorageFilter,
+    statusFilter,
+    storageFilter,
+    toast,
+    trackingCount,
+  };
+}
+
+export default function RateLimitManagementTab() {
+  const {
+    clearFilters,
+    error,
+    fetchRateLimits,
+    filteredSessions,
+    handleRelease,
+    hideToast,
+    isLoading,
+    isRefreshing,
+    isReleasing,
+    limitedCount,
+    atLimitCount,
+    releaseTarget,
+    searchQuery,
+    sessions,
+    setReleaseTarget,
+    setSearchQuery,
+    setStatusFilter,
+    setStorageFilter,
+    statusFilter,
+    storageFilter,
+    toast,
+    trackingCount,
+  } = useRateLimitManagement();
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -254,37 +306,37 @@ export default function RateLimitManagementTab() {
       )}
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <div className="rounded-lg border bg-white p-4">
+        <div className="rounded-lg border bg-card p-4">
           <div className="flex items-center justify-between gap-3">
             <span className="text-sm font-medium text-muted-foreground">Total Buckets</span>
             <Gauge className="h-4 w-4 text-slate-500" />
           </div>
           <p className="mt-2 text-2xl font-semibold">{sessions.length.toLocaleString()}</p>
         </div>
-        <div className="rounded-lg border bg-white p-4">
+        <div className="rounded-lg border bg-card p-4">
           <div className="flex items-center justify-between gap-3">
             <span className="text-sm font-medium text-muted-foreground">Limited</span>
-            <ShieldAlert className="h-4 w-4 text-red-600" />
+            <ShieldAlert className="h-4 w-4 text-red-600 dark:text-red-400" />
           </div>
-          <p className="mt-2 text-2xl font-semibold text-red-700">{limitedCount.toLocaleString()}</p>
+          <p className="mt-2 text-2xl font-semibold text-red-700 dark:text-red-200">{limitedCount.toLocaleString()}</p>
         </div>
-        <div className="rounded-lg border bg-white p-4">
+        <div className="rounded-lg border bg-card p-4">
           <div className="flex items-center justify-between gap-3">
             <span className="text-sm font-medium text-muted-foreground">At Limit</span>
-            <TimerReset className="h-4 w-4 text-amber-600" />
+            <TimerReset className="h-4 w-4 text-amber-600 dark:text-amber-400" />
           </div>
-          <p className="mt-2 text-2xl font-semibold text-amber-700">{atLimitCount.toLocaleString()}</p>
+          <p className="mt-2 text-2xl font-semibold text-amber-700 dark:text-amber-200">{atLimitCount.toLocaleString()}</p>
         </div>
-        <div className="rounded-lg border bg-white p-4">
+        <div className="rounded-lg border bg-card p-4">
           <div className="flex items-center justify-between gap-3">
             <span className="text-sm font-medium text-muted-foreground">Tracking</span>
-            <RefreshCw className="h-4 w-4 text-green-600" />
+            <RefreshCw className="h-4 w-4 text-green-600 dark:text-green-400" />
           </div>
-          <p className="mt-2 text-2xl font-semibold text-green-700">{trackingCount.toLocaleString()}</p>
+          <p className="mt-2 text-2xl font-semibold text-green-700 dark:text-green-200">{trackingCount.toLocaleString()}</p>
         </div>
       </div>
 
-      <div className="rounded-lg border bg-white p-4">
+      <div className="rounded-lg border bg-card p-4">
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_180px_180px_auto] lg:items-end">
           <div className="space-y-2">
             <label className="text-sm font-medium" htmlFor="rate-limit-search">Search</label>
@@ -301,9 +353,9 @@ export default function RateLimitManagementTab() {
           </div>
 
           <div className="space-y-2">
-            <label className="text-sm font-medium">Status</label>
+            <label className="text-sm font-medium" htmlFor="rate-limit-status">Status</label>
             <Select value={statusFilter} onValueChange={(value) => setStatusFilter(value as 'all' | RateLimitStatus)}>
-              <SelectTrigger>
+              <SelectTrigger id="rate-limit-status">
                 <SelectValue placeholder="All Statuses" />
               </SelectTrigger>
               <SelectContent>
@@ -317,9 +369,9 @@ export default function RateLimitManagementTab() {
           </div>
 
           <div className="space-y-2">
-            <label className="text-sm font-medium">Storage</label>
+            <label className="text-sm font-medium" htmlFor="rate-limit-storage">Storage</label>
             <Select value={storageFilter} onValueChange={(value) => setStorageFilter(value as 'all' | 'redis' | 'memory')}>
-              <SelectTrigger>
+              <SelectTrigger id="rate-limit-storage">
                 <SelectValue placeholder="All Storage" />
               </SelectTrigger>
               <SelectContent>
@@ -336,10 +388,10 @@ export default function RateLimitManagementTab() {
         </div>
       </div>
 
-      <div className="overflow-hidden rounded-lg border bg-white">
+      <div className="overflow-hidden rounded-lg border bg-card">
         <div className="overflow-x-auto">
           <Table>
-            <TableHeader className="bg-gray-50">
+            <TableHeader className="bg-muted/50">
               <TableRow>
                 <TableHead className="min-w-[260px]">Scope</TableHead>
                 <TableHead className="min-w-[220px]">Identifier</TableHead>
@@ -441,7 +493,7 @@ export default function RateLimitManagementTab() {
             </AlertDialogDescription>
           </AlertDialogHeader>
           {releaseTarget && (
-            <div className="rounded-md border bg-gray-50 p-3 text-sm">
+            <div className="rounded-md border bg-muted/50 p-3 text-sm">
               <div className="break-all font-medium">{releaseTarget.scope}</div>
               <div className="mt-1 break-all font-mono text-xs text-muted-foreground">{releaseTarget.key}</div>
             </div>

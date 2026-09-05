@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { requireModuleEnabled } from '@/lib/modules/guards';
+
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 
 export async function GET(
@@ -12,6 +15,9 @@ export async function GET(
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const resolvedParams = await params;
@@ -41,7 +47,12 @@ export async function POST(
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
+    const vpnModuleGuard = await requireModuleEnabled('vpn.management');
+    if (vpnModuleGuard) return vpnModuleGuard;
     const resolvedParams = await params;
     const body = await request.json();
     const { comment } = body;
@@ -56,6 +67,7 @@ export async function POST(
     const newComment = await prisma.vPNAccountComment.create({
       data: {
         accountId: resolvedParams.id,
+        liveAccountId: resolvedParams.id,
         comment: comment.trim(),
         author: admin.username,
       },

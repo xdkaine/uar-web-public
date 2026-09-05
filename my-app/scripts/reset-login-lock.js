@@ -1,93 +1,138 @@
 #!/usr/bin/env node
+/* eslint-disable @typescript-eslint/no-require-imports */
 
 /**
- * Reset Login Lock Script
- * 
- * This script resets the login disabled state and manual override lock
- * when direct database access is needed to re-enable logins.
- * 
- * Usage: npm run reset-login-lock
- * 
- * 
- * Note: This serves as a contingecy for situations of which the Admin Page is somehow compomised, killing all sessions and login attempts to prevent additional writing to the AD Environment. -Tommy
+ * Break-glass recovery for a manual login lock.
+ *
+ * This command clears only manualOverride. loginDisabled deliberately remains
+ * true until an authenticated administrator re-enables logins through the
+ * settings API, which creates the normal application audit trail.
  */
 
 const { PrismaClient } = require('@prisma/client');
 
-const prisma = new PrismaClient();
+function requiredMetadata(environment = process.env) {
+  const operator = environment.LOGIN_LOCK_RECOVERY_OPERATOR?.trim();
+  const approver = environment.LOGIN_LOCK_RECOVERY_APPROVER?.trim();
+  const ticket = environment.LOGIN_LOCK_RECOVERY_TICKET?.trim();
+  const settingsId = environment.LOGIN_LOCK_RECOVERY_SETTINGS_ID?.trim();
+  const expectedUpdatedAt = environment.LOGIN_LOCK_RECOVERY_EXPECTED_UPDATED_AT?.trim();
+  const action = environment.LOGIN_LOCK_RECOVERY_ACTION?.trim();
 
-async function resetLoginLock() {
-  try {
-    console.log('🔍 Checking current system settings...\n');
+  if (!operator || !approver || !ticket || !settingsId || !expectedUpdatedAt || !action) {
+    throw new Error(
+      'Operator, approver, ticket, settings ID, expected updatedAt, and action recovery variables are required'
+    );
+  }
 
-    // Get current settings
-    const currentSettings = await prisma.systemSettings.findFirst({
-      orderBy: { createdAt: 'desc' },
+  if (operator.toLowerCase() === approver.toLowerCase()) {
+    throw new Error('Recovery operator and approver must be different people');
+  }
+
+  if (!['unlock', 'restore'].includes(action)) {
+    throw new Error('LOGIN_LOCK_RECOVERY_ACTION must be unlock or restore');
+  }
+
+  const updatedAt = new Date(expectedUpdatedAt);
+  if (Number.isNaN(updatedAt.getTime())) {
+    throw new Error('LOGIN_LOCK_RECOVERY_EXPECTED_UPDATED_AT must be an ISO timestamp');
+  }
+
+  return { operator, approver, ticket, settingsId, expectedUpdatedAt: updatedAt, action };
+}
+
+async function clearManualOverride(prisma, metadata) {
+  return prisma.$transaction(async transaction => {
+    const currentSettings = await transaction.systemSettings.findUnique({
+      where: { id: metadata.settingsId },
     });
 
     if (!currentSettings) {
-      console.log('⚠️  No system settings found. Creating default settings...');
-      await prisma.systemSettings.create({
-        data: {
-          loginDisabled: false,
-          internalRegistrationDisabled: false,
-          externalRegistrationDisabled: false,
-          manualOverride: false,
-          lastModifiedBy: 'reset-script',
-        },
-      });
-      console.log('✅ Default settings created successfully!');
-      return;
+      throw new Error('No SystemSettings row exists; recovery requires manual investigation');
     }
 
-    console.log('Current Settings:');
-    console.log('├─ Login Disabled:', currentSettings.loginDisabled);
-    console.log('├─ Manual Override:', currentSettings.manualOverride);
-    console.log('├─ Last Modified By:', currentSettings.lastModifiedBy || 'N/A');
-    console.log('└─ Last Updated:', currentSettings.updatedAt.toISOString());
-    console.log('');
-
-    if (!currentSettings.loginDisabled && !currentSettings.manualOverride) {
-      console.log('ℹ️  Logins are already enabled and not locked. No action needed.');
-      return;
+    if (metadata.action === 'unlock' && !currentSettings.manualOverride) {
+      return { changed: false, settings: currentSettings };
     }
 
-    console.log('🔓 Resetting login lock...\n');
-
-    // Update settings
-    const updatedSettings = await prisma.systemSettings.update({
-      where: { id: currentSettings.id },
+    const attribution = `break-glass:${metadata.operator}:${metadata.ticket}`;
+    const restore = metadata.action === 'restore';
+    const updateResult = await transaction.systemSettings.updateMany({
+      where: {
+        id: currentSettings.id,
+        updatedAt: metadata.expectedUpdatedAt,
+        ...(restore ? {} : { manualOverride: true, loginDisabled: true }),
+      },
       data: {
-        loginDisabled: false,
-        manualOverride: false,
-        lastModifiedBy: 'reset-script',
+        manualOverride: restore,
+        loginDisabled: true,
+        lastModifiedBy: attribution,
       },
     });
 
-    console.log('✅ Login lock reset successfully!\n');
-    console.log('Updated Settings:');
-    console.log('├─ Login Disabled:', updatedSettings.loginDisabled);
-    console.log('├─ Manual Override:', updatedSettings.manualOverride);
-    console.log('├─ Last Modified By:', updatedSettings.lastModifiedBy);
-    console.log('└─ Last Updated:', updatedSettings.updatedAt.toISOString());
-    console.log('');
-    console.log('🎉 Users can now log in to the application!');
+    if (updateResult.count !== 1) {
+      throw new Error('System settings changed concurrently or the login lock invariant was not satisfied');
+    }
 
-  } catch (error) {
-    console.error('❌ Error resetting login lock:');
-    console.error(error);
-    process.exit(1);
+    const updatedSettings = await transaction.systemSettings.findUnique({
+      where: { id: currentSettings.id },
+    });
+
+    await transaction.auditLog.create({
+      data: {
+        action: restore
+          ? 'break_glass_restore_manual_login_override'
+          : 'break_glass_clear_manual_login_override',
+        category: 'settings',
+        username: metadata.operator,
+        actorType: 'admin',
+        targetId: currentSettings.id,
+        targetType: 'SystemSettings',
+        eventKind: 'security',
+        outcome: restore ? 'rollback' : 'pending',
+        success: true,
+        details: JSON.stringify({
+          ticket: metadata.ticket,
+          approver: metadata.approver,
+          manualOverride: restore,
+          loginDisabled: true,
+          nextStep: restore ? 'incident_review' : 'authenticated_admin_reenable',
+        }),
+      },
+    });
+
+    return { changed: true, settings: updatedSettings };
+  });
+}
+
+async function main() {
+  const metadata = requiredMetadata();
+  const prisma = new PrismaClient();
+
+  try {
+    const result = await clearManualOverride(prisma, metadata);
+    if (!result.changed) {
+      console.log('Manual override is already clear; no database change was made.');
+      return;
+    }
+
+    console.log(metadata.action === 'restore'
+      ? 'Manual override restored with loginDisabled true.'
+      : 'Manual override cleared with loginDisabled still true.');
+    if (metadata.action === 'unlock') {
+      console.log('A different authenticated administrator must now re-enable logins through the settings page.');
+    }
+    console.log(`Recovery ticket: ${metadata.ticket}`);
   } finally {
     await prisma.$disconnect();
   }
 }
 
-// Run the script
-resetLoginLock()
-  .then(() => {
-    process.exit(0);
-  })
-  .catch((error) => {
-    console.error('Unexpected error:', error);
-    process.exit(1);
+if (require.main === module) {
+  main().catch(error => {
+    console.error('Login-lock recovery failed:', error instanceof Error ? error.message : 'Unknown error');
+    process.exitCode = 1;
   });
+}
+
+module.exports = { clearManualOverride, requiredMetadata };

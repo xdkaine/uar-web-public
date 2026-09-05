@@ -38,6 +38,11 @@ export async function verifyTurnstileToken(token: string): Promise<boolean> {
       body: formData,
     });
 
+    if (!result.ok) {
+      appLogger.warn('Turnstile verification request failed', { status: result.status });
+      return false;
+    }
+
     const outcome: TurnstileResponse = await result.json();
 
     if (!outcome.success) {

@@ -6,11 +6,11 @@ import Link from "next/link";
 
 const Footer: React.FC = () => {
   return (
-    <footer className="bg-black text-white p-8 text-center shadow-lg">
+    <footer className="bg-neutral-950 text-white p-8 text-center shadow-lg">
       <div className="container mx-auto">
         <div className="mb-6">
           <div className="w-24 h-12 relative mx-auto mb-4">
-            <Image src="/logo3og.png" alt="SOC Logo" fill className="object-contain" />
+            <Image src="/logo3og.png" alt="SOC Logo" fill sizes="96px" className="object-contain" />
           </div>
         </div>
         <div className="flex justify-center space-x-8 mb-4">
@@ -39,7 +39,7 @@ const Footer: React.FC = () => {
             <span>GitHub</span>
           </a>
         </div>
-        <div className="text-sm text-gray-400 flex items-center justify-center gap-2">
+        <div className="flex items-center justify-center gap-2 text-sm text-neutral-300">
           <span>Made by</span>
           <a href="https://www.linkedin.com/in/thomasphao" target="_blank" rel="noopener noreferrer" className="hover:text-blue-400 transition-colors">Tommy</a>
           <Image src="/love_sticker.gif" unoptimized alt="Love" width={24} height={24} className="object-contain" />

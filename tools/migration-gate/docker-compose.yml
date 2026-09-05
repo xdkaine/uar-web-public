@@ -1,0 +1,28 @@
+services:
+  migration-gate-db:
+    image: postgres:16-alpine
+    working_dir: /gate
+    entrypoint: ["psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", "${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}"]
+    environment:
+      DATABASE_URL: ${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}
+    volumes:
+      - ./:/gate:ro
+
+  migration-gate-portal:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: prisma-tool
+    entrypoint: ["./node_modules/.bin/prisma"]
+    environment:
+      DATABASE_URL: ${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}
+
+  migration-gate-auth:
+    build:
+      context: ../..
+      dockerfile: services/auth-service/Dockerfile
+      target: builder
+    working_dir: /app
+    environment:
+      DATABASE_URL: ${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}
+      AUTH_CLIENT_SECRET_ENC_KEY: ${AUTH_CLIENT_SECRET_ENC_KEY:-}

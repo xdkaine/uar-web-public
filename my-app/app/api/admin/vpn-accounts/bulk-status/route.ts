@@ -1,8 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { Prisma } from '@prisma/client';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { requireModuleEnabled } from '@/lib/modules/guards';
+
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 import { prisma } from '@/lib/prisma';
 import { secureJsonResponse } from '@/lib/apiResponse';
+
+const VALID_VPN_STATUSES = ['active', 'pending_faculty', 'disabled'] as const;
 
 /**
  * PATCH /api/admin/vpn-accounts/bulk-status
@@ -15,7 +21,12 @@ export async function PATCH(request: NextRequest) {
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
+    const vpnModuleGuard = await requireModuleEnabled('vpn.management');
+    if (vpnModuleGuard) return vpnModuleGuard;
     const body = await request.json();
     const { accountIds, newStatus, reason, createdByFaculty } = body;
 
@@ -34,10 +45,9 @@ export async function PATCH(request: NextRequest) {
       );
     }
 
-    const validStatuses = ['active', 'pending_faculty', 'disabled'];
-    if (!validStatuses.includes(newStatus)) {
+    if (!VALID_VPN_STATUSES.includes(newStatus)) {
       return NextResponse.json(
-        { error: `Invalid status. Must be one of: ${validStatuses.join(', ')}` },
+        { error: `Invalid status. Must be one of: ${VALID_VPN_STATUSES.join(', ')}` },
         { status: 400 }
       );
     }
@@ -57,7 +67,7 @@ export async function PATCH(request: NextRequest) {
     }
 
     // Perform bulk update in a transaction
-    const result = await prisma.$transaction(async (tx: any) => {
+    const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const updates = [];
       const logs = [];
       
@@ -66,7 +76,7 @@ export async function PATCH(request: NextRequest) {
 
         // Special case: updating faculty approval without changing status
         if (oldStatus === newStatus && typeof createdByFaculty === 'boolean' && account.createdByFaculty !== createdByFaculty) {
-          const updateData: any = {
+          const updateData: Prisma.VPNAccountUpdateInput = {
             createdByFaculty,
           };
           
@@ -84,6 +94,7 @@ export async function PATCH(request: NextRequest) {
           await tx.vPNAccountStatusLog.create({
             data: {
               accountId: account.id,
+              liveAccountId: account.id,
               oldStatus,
               newStatus,
               changedBy: admin.username,
@@ -109,7 +120,7 @@ export async function PATCH(request: NextRequest) {
         // Validate state transitions
         if (newStatus === 'active' && oldStatus === 'pending_faculty') {
           // Approving pending faculty accounts
-          const updateData: any = {
+          const updateData: Prisma.VPNAccountUpdateInput = {
             status: 'active',
           };
           
@@ -131,6 +142,7 @@ export async function PATCH(request: NextRequest) {
           await tx.vPNAccountStatusLog.create({
             data: {
               accountId: account.id,
+              liveAccountId: account.id,
               oldStatus,
               newStatus: 'active',
               changedBy: admin.username,
@@ -147,7 +159,7 @@ export async function PATCH(request: NextRequest) {
           });
         } else if (newStatus === 'disabled' || newStatus === 'pending_faculty') {
           // Other status changes
-          const updateData: any = { status: newStatus };
+          const updateData: Prisma.VPNAccountUpdateInput = { status: newStatus };
           
           if (newStatus === 'disabled') {
             updateData.disabledAt = new Date();
@@ -173,6 +185,7 @@ export async function PATCH(request: NextRequest) {
           await tx.vPNAccountStatusLog.create({
             data: {
               accountId: account.id,
+              liveAccountId: account.id,
               oldStatus,
               newStatus,
               changedBy: admin.username,
@@ -189,7 +202,7 @@ export async function PATCH(request: NextRequest) {
           });
         } else if (newStatus === 'active') {
           // Handle active status from other states
-          const updateData: any = { status: 'active' };
+          const updateData: Prisma.VPNAccountUpdateInput = { status: 'active' };
           
           // Update faculty approval if provided
           if (typeof createdByFaculty === 'boolean') {
@@ -209,6 +222,7 @@ export async function PATCH(request: NextRequest) {
           await tx.vPNAccountStatusLog.create({
             data: {
               accountId: account.id,
+              liveAccountId: account.id,
               oldStatus,
               newStatus: 'active',
               changedBy: admin.username,

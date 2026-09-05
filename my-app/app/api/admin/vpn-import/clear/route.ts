@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { requireModuleEnabled } from '@/lib/modules/guards';
+
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 
 /**
@@ -14,7 +17,12 @@ export async function DELETE(request: NextRequest) {
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
+    const vpnModuleGuard = await requireModuleEnabled('vpn.management');
+    if (vpnModuleGuard) return vpnModuleGuard;
     // Count records before deletion for logging
     const importCount = await prisma.vPNImport.count();
     const recordCount = await prisma.vPNImportRecord.count();

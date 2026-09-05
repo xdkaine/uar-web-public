@@ -8,7 +8,7 @@ vi.mock('./utils', async (importOriginal) => {
   };
 });
 
-import { resolveLDAPGroupMembersFromClient } from './groups';
+import { resolveLDAPGroupAncestorDNsFromClient, resolveLDAPGroupMembersFromClient } from './groups';
 
 const ROOT_GROUP_DN = 'CN=Root,OU=Groups,DC=example,DC=test';
 const NESTED_GROUP_DN = 'CN=Nested,OU=Groups,DC=example,DC=test';
@@ -66,9 +66,12 @@ describe('resolveLDAPGroupMembersFromClient', () => {
       search: vi.fn(async (dn: string, options: { attributes?: string[] }) => {
         const attributeKey = options.attributes?.[0] === 'member' ? 'member' : 'objectClass';
         const entry = searches[`${dn}|${attributeKey}`];
-        return { searchEntries: entry ? [entry] : [] };
+        return {
+          searchEntries: entry ? [entry as { dn: string } & Record<string, unknown>] : [],
+          searchReferences: [] as string[],
+        };
       }),
-    };
+    } as unknown as Parameters<typeof resolveLDAPGroupMembersFromClient>[0];
 
     const members = await resolveLDAPGroupMembersFromClient(client, ROOT_GROUP_DN);
 
@@ -82,5 +85,45 @@ describe('resolveLDAPGroupMembersFromClient', () => {
       accountEnabled: false,
     });
     expect(client.search).toHaveBeenCalledWith(NESTED_GROUP_DN, expect.objectContaining({ attributes: ['member'] }));
+  });
+});
+
+describe('resolveLDAPGroupAncestorDNsFromClient', () => {
+  it('walks transitive parents and terminates safely on cycles', async () => {
+    const protectedParentDN = 'CN=Domain Admins,CN=Users,DC=example,DC=test';
+    const client = {
+      search: vi.fn(async (dn: string) => ({
+        searchEntries: [{
+          dn,
+          objectClass: ['top', 'group'],
+          memberOf: dn === ROOT_GROUP_DN
+            ? [NESTED_GROUP_DN]
+            : dn === NESTED_GROUP_DN
+              ? [protectedParentDN]
+              : [ROOT_GROUP_DN],
+        }],
+        searchReferences: [] as string[],
+      })),
+    } as unknown as Parameters<typeof resolveLDAPGroupAncestorDNsFromClient>[0];
+
+    await expect(resolveLDAPGroupAncestorDNsFromClient(client, ROOT_GROUP_DN)).resolves.toEqual([
+      NESTED_GROUP_DN,
+      protectedParentDN,
+    ]);
+    expect(client.search).toHaveBeenCalledTimes(3);
+  });
+
+  it('fails closed when a parent group cannot be resolved', async () => {
+    const client = {
+      search: vi.fn(async (dn: string) => ({
+        searchEntries: dn === ROOT_GROUP_DN
+          ? [{ dn, objectClass: ['group'], memberOf: [NESTED_GROUP_DN] }]
+          : [],
+        searchReferences: [] as string[],
+      })),
+    } as unknown as Parameters<typeof resolveLDAPGroupAncestorDNsFromClient>[0];
+
+    await expect(resolveLDAPGroupAncestorDNsFromClient(client, ROOT_GROUP_DN))
+      .rejects.toThrow('not uniquely resolvable');
   });
 });

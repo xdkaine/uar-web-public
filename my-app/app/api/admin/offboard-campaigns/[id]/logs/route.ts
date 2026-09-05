@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { listOffboardCampaignLogs } from '@/lib/offboard-campaign';
 
 const SORT_KEYS = new Set(['createdAt', 'level', 'eventType', 'actor', 'message']);
@@ -12,6 +13,9 @@ export async function GET(
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!actorHasPermission(admin, 'offboard.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const { id } = await params;

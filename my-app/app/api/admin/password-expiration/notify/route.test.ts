@@ -19,7 +19,7 @@ import { POST } from './route';
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.checkAdminAuthWithRateLimit.mockResolvedValue({
-    admin: { username: 'admin' },
+    admin: { username: 'admin', permissions: new Set(['password_expiration.manage']) },
   });
 });
 

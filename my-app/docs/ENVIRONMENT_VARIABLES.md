@@ -93,5 +93,20 @@ Used for sending notifications.
 | Variable | Description | Required |
 | :--- | :--- | :--- |
 | `NEXT_PUBLIC_APP_URL` | The public URL of the application (e.g., `https://portal.example.com`). | Yes |
-| `CRON_SECRET` | Bearer token required by cron processing endpoints, including lifecycle and mass email queues. | Yes for scheduled processing |
+| `CRON_SECRET` | Bearer token required by cron processing endpoints, including lifecycle, mass email, and ticket-group directory sync. | Yes for scheduled processing |
 | `NODE_ENV` | `development` or `production`. | Yes |
+
+## Ticket Group Sync Scheduler
+
+Refreshes AD membership/mail snapshots for allowed ticket groups (ADR-0007) so
+ticket forms and assignment notifications never perform live LDAP searches.
+
+| Variable | Description | Required |
+| :--- | :--- | :--- |
+| `TICKET_GROUP_SYNC_ENABLED` | `true` enables the snapshot scheduler container. Default `false`. | No |
+| `TICKET_GROUP_SYNC_INTERVAL_SECONDS` | Seconds between sync runs. Must be 300–86400 when set; default `3600`. | No |
+| `TICKET_GROUP_SYNC_INITIAL_DELAY_SECONDS` | Delay before the first run after start; default `45`. | No |
+| `TICKET_GROUP_SYNC_HEALTH_MAX_AGE_SECONDS` | Scheduler healthcheck tolerance; default `14400`. | No |
+
+Syncs can also be triggered manually from System Configuration → Support & Routing;
+the scheduler stays disabled until groups are configured there.

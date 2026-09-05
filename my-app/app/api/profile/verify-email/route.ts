@@ -7,6 +7,17 @@ import { parseJsonWithLimit, MAX_REQUEST_BODY_SIZE, validateStringLength, INPUT_
 import { sendProfileEmailVerification } from '@/lib/email';
 import { searchLDAPUser } from '@/lib/ldap';
 import { appLogger } from '@/lib/logger';
+import {
+  activateDeliveredProfileEmailToken,
+  createIssuingProfileEmailToken,
+  markProfileEmailDeliveryFailed,
+} from '@/lib/profile-email-verification';
+import type { Prisma } from '@prisma/client';
+import {
+  acquireDirectoryOwnershipFence,
+  directoryObjectIdentity,
+  directoryObjectIdentityMatches,
+} from '@/lib/directory-ownership-fence';
 
 interface RequestBody {
   email?: string;
@@ -94,6 +105,13 @@ export async function POST(request: NextRequest) {
         { status: 404 }
       );
     }
+    const verifiedDirectoryIdentity = directoryObjectIdentity(userInfo);
+    if (!verifiedDirectoryIdentity) {
+      return NextResponse.json(
+        { error: 'Your directory account has no immutable identity evidence and cannot be linked safely.' },
+        { status: 409 }
+      );
+    }
 
     const mailAttr = userInfo.attributes.find(attr => attr.type === 'mail');
     if (mailAttr && mailAttr.values && mailAttr.values.length > 0 && mailAttr.values[0]) {
@@ -172,68 +190,131 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Check if there's already a pending verification for this user
-    const pendingRequest = await prisma.accessRequest.findFirst({
-      where: {
-        ldapUsername: session.username,
-        isVerified: false,
-        isGrandfatheredAccount: true,
-      },
-    });
-
     // Generate verification token
     const verificationToken = nanoid(32);
 
     const displayNameAttr = userInfo.attributes.find(attr => attr.type === 'cn');
     const displayName = displayNameAttr?.values[0] || session.username;
 
-    if (pendingRequest) {
-      // Update existing pending request
-      await prisma.accessRequest.update({
-        where: { id: pendingRequest.id },
-        data: {
-          email: normalizedEmail,
-          verificationToken,
-          verificationAttempts: 0,
-          updatedAt: new Date(),
+    const ownership = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await acquireDirectoryOwnershipFence(tx, session.username);
+      const currentDirectoryUser = await searchLDAPUser(session.username);
+      if (!directoryObjectIdentityMatches(verifiedDirectoryIdentity, currentDirectoryUser)) {
+        throw new Error('Directory identity changed while profile ownership was being reserved');
+      }
+      const pendingRequest = await tx.accessRequest.findFirst({
+        where: {
+          ldapUsername: session.username,
+          isVerified: false,
+          isGrandfatheredAccount: true,
         },
       });
+      if (pendingRequest) return { request: pendingRequest, created: false };
 
-      appLogger.info('Updated pending email verification request', {
-        username: session.username,
-        requestId: pendingRequest.id,
-      });
-    } else {
-      // Create new access request for grandfathered account
-      // Extract VPN username from email (the part before @cpp.edu)
       const vpnUsername = extractBronconame(normalizedEmail) || session.username;
-      
-      await prisma.accessRequest.create({
+      const createdRequest = await tx.accessRequest.create({
         data: {
           name: displayName,
           email: normalizedEmail,
-          isInternal: true, // Assuming they have VPN access means they're internal
-          needsDomainAccount: false, // They already have an account
+          isInternal: true,
+          needsDomainAccount: false,
           ldapUsername: session.username,
-          vpnUsername: vpnUsername, // VPN username is the email prefix (emailname from emailname@cpp.edu)
+          vpnUsername,
           isVerified: false,
-          verificationToken,
+          verificationToken: null,
+          verificationTokenExpiresAt: null,
           status: 'pending_verification',
           isGrandfatheredAccount: true,
-          // Pre-fill approval info since they already have access
-          accountCreatedAt: new Date(), // Mark as already created
+          accountCreatedAt: new Date(),
         },
       });
-
+      return { request: createdRequest, created: true };
+    });
+    const pendingRequest = ownership.created ? null : ownership.request;
+    const accessRequestId = ownership.request.id;
+    const expectedRequestVersion = ownership.request.version;
+    const createdNewRequest = ownership.created;
+    if (createdNewRequest) {
       appLogger.info('Created email verification request for grandfathered account', {
         username: session.username,
         email: normalizedEmail,
-        vpnUsername,
+        vpnUsername: extractBronconame(normalizedEmail) || session.username,
       });
     }
 
-    // Send verification email
-    await sendProfileEmailVerification(normalizedEmail, displayName, verificationToken);
+    if (pendingRequest) {
+      const activeConfirmation = await prisma.profileEmailVerificationToken.findFirst({
+        where: {
+          accessRequestId: pendingRequest.id,
+          OR: [
+            { status: { in: ['directory_applied', 'reconciliation_required'] } },
+            { status: 'claimed', claimedUntil: { gt: new Date() } },
+          ],
+        },
+        select: { status: true },
+      });
+      if (activeConfirmation) {
+        return NextResponse.json(
+          {
+            error: activeConfirmation.status === 'reconciliation_required'
+              ? 'This verification needs support reconciliation before another link can be issued.'
+              : 'A verification is already being finalized. Wait a moment and try the existing link again.',
+          },
+          { status: 409 }
+        );
+      }
+    }
+
+    const issuedToken = await createIssuingProfileEmailToken({
+      accessRequestId,
+      rawToken: verificationToken,
+      desiredEmail: normalizedEmail,
+    });
+
+    try {
+      await sendProfileEmailVerification(normalizedEmail, displayName, verificationToken);
+    } catch (error) {
+      await markProfileEmailDeliveryFailed(
+        issuedToken.id,
+        error instanceof Error ? error.message : 'Verification email delivery failed'
+      ).catch(() => undefined);
+      if (createdNewRequest) {
+        await prisma.accessRequest.updateMany({
+          where: { id: accessRequestId, isVerified: false },
+          data: {
+            status: 'verification_email_failed',
+            provisioningState: 'verification_email_failed',
+            provisioningError: 'Profile verification email delivery failed',
+          },
+        }).catch(() => undefined);
+      }
+      throw error;
+    }
+
+    try {
+      await activateDeliveredProfileEmailToken({
+        tokenId: issuedToken.id,
+        accessRequestId,
+        desiredEmail: normalizedEmail,
+        expectedRequestVersion,
+      });
+    } catch (error) {
+      await markProfileEmailDeliveryFailed(
+        issuedToken.id,
+        error instanceof Error ? error.message : 'Verification token activation failed'
+      ).catch(() => undefined);
+      appLogger.error('Profile verification email delivered but activation state failed', {
+        requestId: accessRequestId,
+        tokenRecordId: issuedToken.id,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      return NextResponse.json(
+        {
+          message: 'Verification email was delivered, but the link is not active yet. Request a new link before using it.',
+        },
+        { status: 202 }
+      );
+    }
 
     return NextResponse.json({
       message: 'Verification email sent. Please check your inbox and click the verification link.',

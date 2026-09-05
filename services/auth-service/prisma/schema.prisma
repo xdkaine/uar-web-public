@@ -1,0 +1,187 @@
+// Minimal data ownership boundary for the auth service (ADR-0012, refined by
+// the portal de-merge). Tables live in the SHARED database; this service owns
+// and migrates its own tables (AuthAdminLocalAccount, AuthBrandingProfile,
+// OidcClient)
+// and only INSERTs into AuditLog.
+// Session rows remain written ONLY by the portal.
+//
+// NOTE: this schema intentionally does NOT declare PasswordChangeChallenge.
+// That table is owned and migrated solely by the portal (which uses
+// used/usedAt/ipAddress/userAgent columns); declaring a divergent copy here
+// caused drift against the shared database.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Connection URL lives in prisma.config.ts (Prisma 7 requirement).
+datasource db {
+  provider = "postgresql"
+}
+
+// Auth Manager recovery accounts are deliberately separate from the portal's
+// LocalAccount table. They may authenticate only /admin and can never become
+// OIDC subjects. credentialVersion invalidates every existing admin cookie on
+// password rotation or state change.
+model AuthAdminLocalAccount {
+  id                String    @id @default(cuid())
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  username          String    @unique
+  passwordHash      String // scrypt$N$r$p$saltB64$keyB64 - never plaintext
+  isActive          Boolean   @default(true)
+  credentialVersion Int       @default(1)
+  createdBy         String
+  updatedBy         String
+  passwordChangedAt DateTime  @default(now())
+  lastUsedAt        DateTime?
+  lastUsedIp        String?
+
+  @@index([isActive])
+}
+
+// Per-OIDC-client branding for the login interaction pages (ADR-0012
+// follow-up). Documents are authored in the portal editor and written ONLY
+// through this service's internal token-guarded API; the renderer treats the
+// stored JSON as untrusted input and re-validates on every read.
+model AuthBrandingProfile {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  clientId  String   @unique // "default" or an OIDC client_id
+  version   Int      @default(1) // branding document schema version
+  doc       Json     // BrandingDoc payload (validated on read)
+  updatedBy String   // admin identity from the portal audit context
+}
+
+// Immutable drafts and published snapshots for safe preview, publication,
+// and rollback. AuthBrandingProfile remains the hot-path live document.
+model AuthBrandingRevision {
+  id             String    @id @default(cuid())
+  clientId       String
+  revision       Int
+  status         String    @default("draft") // draft | published | archived
+  doc            Json
+  createdBy      String
+  createdAt      DateTime  @default(now())
+  publishedAt    DateTime?
+
+  @@unique([clientId, revision])
+  @@index([clientId, status, createdAt])
+}
+
+// Login audit rows share the portal's AuditLog TABLE so operators read one
+// trail (ADR-0012). This service only INSERTS identity/login events; the
+// portal owns every other write path against this table.
+model AuditLog {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  action    String
+  category  String
+  username  String
+  actorType String?
+  subjectUsername String?
+  eventKind String?
+  outcome   String?
+  targetId  String?
+  clientId  String?
+  providerSid String?
+  riskLevel String?
+  details   String?
+  ipAddress String?
+  userAgent String?
+  success   Boolean  @default(true)
+
+  @@index([username])
+  @@index([action])
+  @@index([createdAt])
+  @@index([clientId, createdAt])
+  @@index([riskLevel, createdAt])
+  @@index([outcome, createdAt])
+}
+
+// Dynamically registered OIDC relying parties (Auth Manager). Since the
+// portal's de-merge (its migration 20260825100000 dropped its copy) this
+// TABLE is created and migrated by THIS service
+// (20260826000000_auth_service_owns_oidc_client_registry).
+model OidcClient {
+  id                String    @id @default(cuid())
+  clientId          String    @unique
+  name              String
+  secret            String
+  redirectUris      Json
+  postLogoutRedirectUris Json @default("[]")
+  backchannelLogoutUri String?
+  scope             String    @default("openid email profile")
+  enabled           Boolean   @default(true)
+  // Per-application provider-session lifetime (seconds). NULL => default/env.
+  sessionTtlSeconds Int?
+  createdBy         String
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  catalogEntry      ApplicationCatalogEntry?
+
+  @@index([enabled])
+}
+
+// Public application directory. OIDC protocol registrations are never
+// published automatically; external links use the same curated roster.
+model ApplicationCatalogEntry {
+  id           String   @id @default(cuid())
+  slug         String   @unique
+  name         String
+  description  String?
+  launchUrl    String
+  iconUrl      String?
+  kind         String   @default("external") // oidc | external
+  oidcClientId String?  @unique
+  oidcClient   OidcClient? @relation(fields: [oidcClientId], references: [clientId], onDelete: Restrict, onUpdate: Cascade)
+  visibility   String   @default("hidden") // public | hidden
+  sortOrder    Int      @default(0)
+  publishedAt  DateTime?
+  createdBy    String
+  updatedBy    String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([visibility, publishedAt, sortOrder])
+}
+
+// One-year first-party device evidence. High-entropy component output is
+// hashed before persistence; this data is never an authentication factor by
+// itself and never enters OIDC tokens.
+model DeviceObservation {
+  id                 String   @id @default(cuid())
+  username           String
+  clientId           String?
+  providerSid        String?
+  deviceCookieHash   String?
+  fingerprintHash    String?
+  fingerprintVersion Int
+  signals            Json
+  ipAddress          String?
+  userAgent          String?
+  riskScore          Int      @default(0)
+  riskLevel          String   @default("low")
+  riskReasons        Json
+  enforcement        String   @default("evidence")
+  observedAt         DateTime @default(now())
+  expiresAt          DateTime
+
+  @@index([username, observedAt])
+  @@index([deviceCookieHash, observedAt])
+  @@index([fingerprintHash, observedAt])
+  @@index([riskLevel, observedAt])
+  @@index([expiresAt])
+}
+
+// Per-admin customizable dashboard layout for the Auth Manager console
+// (ADR-0012 follow-up). Widgets are a validated ordered key list; the
+// console owns this table outright like the rest of its registry state.
+model AdminConsoleLayout {
+  id            String   @id @default(cuid())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  adminUsername String   @unique
+  widgets       Json     // ordered widget key list (validated on read/write)
+}

@@ -1,22 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { getSessionFromCookies } from '@/lib/session';
+import { checkSupportAuth, supportAuthHasPermission } from '@/lib/support-auth';
+import { requireModuleEnabled } from '@/lib/modules/guards';
+import { resolveTicketMutationAccess, resolveTicketViewAccess } from '@/lib/support/ticket-access';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 import { checkRateLimitAsync, isRateLimitUnavailable } from '@/lib/ratelimit';
-import { INPUT_LIMITS, isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit, validateStringLength } from '@/lib/validation';
+import { isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit } from '@/lib/validation';
+import { htmlToPlainText, validateTicketRichText } from '@/lib/ticket-content';
+import { notifyActiveAdministrators, notifyUser } from '@/lib/notifications';
 
 interface TicketResponseBody {
   message?: unknown;
-}
-
-async function checkUserAuth() {
-  const session = await getSessionFromCookies();
-
-  if (!session) {
-    return null;
-  }
-
-  return { username: session.username, isAdmin: session.isAdmin };
+  replyHtml?: unknown;
+  bodyHtml?: unknown;
 }
 
 // Get all responses for a ticket
@@ -25,10 +21,13 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await checkUserAuth();
+    const { auth, response } = await checkSupportAuth();
 
     if (!auth) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+      return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!supportAuthHasPermission(auth, 'tickets.read')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const resolvedParams = await params;
@@ -42,7 +41,8 @@ export async function GET(
       return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
     }
 
-    if (ticket.username !== auth.username && !auth.isAdmin) {
+    const access = await resolveTicketViewAccess(ticket, auth);
+    if (!access) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
@@ -67,11 +67,17 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await checkUserAuth();
+    const { auth, response: authResponse } = await checkSupportAuth();
 
     if (!auth) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+      return authResponse || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!supportAuthHasPermission(auth, 'tickets.respond')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    const moduleGuard = await requireModuleEnabled('support.tickets');
+    if (moduleGuard) return moduleGuard;
 
     const resolvedParams = await params;
     const rateLimitResult = await checkRateLimitAsync('support-ticket-response', {
@@ -99,8 +105,13 @@ export async function POST(
     }
 
     const body = await parseJsonWithLimit<TicketResponseBody>(request, MAX_REQUEST_BODY_SIZE.MEDIUM);
-    const { message } = body;
-    const normalizedMessage = typeof message === 'string' ? message.trim() : '';
+    const { message, replyHtml, bodyHtml } = body;
+    // Rich-text clients send replyHtml (portal) or bodyHtml (admin); the
+    // legacy `message` field stays valid for plain-text callers.
+    const rawMessageSource = [replyHtml, bodyHtml, message].find(
+      (candidate): candidate is string => typeof candidate === 'string' && candidate.trim().length > 0
+    );
+    const normalizedMessage = (rawMessageSource ?? '').trim();
 
     if (!normalizedMessage) {
       return NextResponse.json(
@@ -109,10 +120,11 @@ export async function POST(
       );
     }
 
-    const messageValidation = validateStringLength(normalizedMessage, 'Message', INPUT_LIMITS.MESSAGE, 1);
+    const messageValidation = validateTicketRichText(normalizedMessage, 'Message');
     if (!messageValidation.valid) {
       return NextResponse.json({ error: messageValidation.error }, { status: 400 });
     }
+    const sanitizedMessage = messageValidation.sanitized;
 
     // Verify the ticket exists and user has access
     const ticket = await prisma.supportTicket.findUnique({
@@ -123,23 +135,74 @@ export async function POST(
       return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
     }
 
-    if (ticket.username !== auth.username && !auth.isAdmin) {
+    const access = await resolveTicketMutationAccess(ticket, auth);
+    if (!access) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
+    const isCreator = access === 'owner';
 
-    const response = await prisma.ticketResponse.create({
-      data: {
-        ticketId: resolvedParams.id,
-        message: normalizedMessage,
-        author: auth.username,
-        isStaff: auth.isAdmin,
-      },
-    });
+    const idempotencyKey = request.headers.get('x-idempotency-key')?.trim() || null;
+    if (idempotencyKey && idempotencyKey.length > 100) {
+      return NextResponse.json({ error: 'Idempotency key must be at most 100 characters' }, { status: 400 });
+    }
+    const matchesRequest = (existing: { author: string; message: string }) =>
+      existing.author.toLowerCase() === auth.username.toLowerCase() && existing.message === sanitizedMessage;
+    let result;
+    try {
+      result = await prisma.$transaction(async (tx) => {
+        if (idempotencyKey) {
+          const existing = await tx.ticketResponse.findUnique({
+            where: { ticketId_clientRequestId: { ticketId: resolvedParams.id, clientRequestId: idempotencyKey } },
+          });
+          if (existing) return { response: existing, created: false, conflict: !matchesRequest(existing) };
+        }
+        const created = await tx.ticketResponse.create({
+          data: {
+            ticketId: resolvedParams.id,
+            message: sanitizedMessage,
+            author: auth.username,
+            isStaff: auth.isAdmin,
+            clientRequestId: idempotencyKey,
+          },
+        });
+        await tx.supportTicket.update({ where: { id: resolvedParams.id }, data: { updatedAt: new Date() } });
+        return { response: created, created: true, conflict: false };
+      });
+    } catch (error) {
+      if (!idempotencyKey || (error as { code?: string }).code !== 'P2002') throw error;
+      const existing = await prisma.ticketResponse.findUnique({
+        where: { ticketId_clientRequestId: { ticketId: resolvedParams.id, clientRequestId: idempotencyKey } },
+      });
+      if (!existing) throw error;
+      result = { response: existing, created: false, conflict: !matchesRequest(existing) };
+    }
+    if (result.conflict) {
+      return NextResponse.json({ error: 'Idempotency key was already used for a different response' }, { status: 409 });
+    }
+    const response = result.response;
 
-    // Update ticket's updatedAt timestamp
-    await prisma.supportTicket.update({
-      where: { id: resolvedParams.id },
-      data: { updatedAt: new Date() },
+    if (!result.created) {
+      return NextResponse.json({ message: 'Response already added', response }, { status: 200 });
+    }
+
+    const notification = auth.isAdmin || !isCreator
+      ? notifyUser({
+          username: ticket.username,
+          dedupeKey: `ticket-response:${response.id}`,
+          kind: 'support_ticket' as const,
+          title: `New response on ${ticket.subject}`,
+          message: `${auth.username} responded to your support ticket.`,
+          href: `/support/tickets/${ticket.id}`,
+        })
+      : notifyActiveAdministrators({
+          dedupeKey: `ticket-response:${response.id}`,
+          kind: 'support_ticket' as const,
+          title: `Customer response: ${ticket.subject}`,
+          message: `${auth.username} added a response.`,
+          href: `/admin/support/tickets/${ticket.id}`,
+        });
+    notification.catch((error) => {
+      console.error('[Ticket Response] Failed to create in-app notifications:', error);
     });
 
     // Log the ticket response (only if admin)
@@ -152,7 +215,7 @@ export async function POST(
         targetType: 'SupportTicket',
         details: {
           subject: ticket.subject,
-          responsePreview: normalizedMessage.substring(0, 100),
+          responsePreview: htmlToPlainText(sanitizedMessage).substring(0, 100),
         },
         ipAddress: getIpAddress(request),
         userAgent: getUserAgent(request),
@@ -193,30 +256,72 @@ export async function POST(
     if (auth.isAdmin && userEmail) {
       // Staff responded - notify the user
       import('@/lib/email').then(({ sendTicketResponseToUser }) => {
-        sendTicketResponseToUser({
+        return sendTicketResponseToUser({
           ticketId: ticket.id,
           subject: ticket.subject,
           userEmail: userEmail!,
           userName: userName || undefined,
-          responseMessage: normalizedMessage,
+          responseMessage: sanitizedMessage,
           staffUsername: auth.username,
-        }).catch((error) => {
-          console.error('[Ticket Response] Failed to send user notification:', error);
         });
+      }).catch((error) => {
+        console.error('[Ticket Response] Failed to send user notification:', error);
       });
-    } else if (!auth.isAdmin) {
-      // User responded - notify admin
-      import('@/lib/email').then(({ sendUserResponseNotificationToAdmin }) => {
-        sendUserResponseNotificationToAdmin({
+    } else if (!auth.isAdmin && isCreator) {
+      // Creator responded - route to active assignees when the ticket is owned;
+      // otherwise notify the default queue as before (ADR-0007).
+      import('@/lib/support/routing').then(async ({ resolveTicketNotificationRecipients }) => {
+        const recipients = await resolveTicketNotificationRecipients(ticket.id);
+        if (!recipients.usedQueueFallback && recipients.emails.length > 0) {
+          const { sendUserResponseNotificationToAssignees } = await import('@/lib/email');
+          return sendUserResponseNotificationToAssignees({
+            ticketId: ticket.id,
+            subject: ticket.subject,
+            recipientEmails: recipients.emails,
+            username: auth.username,
+            userEmail,
+            responseMessage: sanitizedMessage,
+          });
+        }
+        const { sendUserResponseNotificationToAdmin } = await import('@/lib/email');
+        return sendUserResponseNotificationToAdmin({
           ticketId: ticket.id,
           subject: ticket.subject,
           username: auth.username,
           userEmail,
-          responseMessage: normalizedMessage,
-        }).catch((error) => {
-          console.error('[Ticket Response] Failed to send admin notification:', error);
+          responseMessage: sanitizedMessage,
         });
+      }).catch((error) => {
+        console.error('[Ticket Response] Failed to send assignee/admin notification:', error);
       });
+    } else if (!auth.isAdmin && !isCreator && userEmail) {
+      // Assignee-group member responded - notify the creator (ADR-0007).
+      import('@/lib/email').then(({ sendTicketResponseToUser }) => {
+        return sendTicketResponseToUser({
+          ticketId: ticket.id,
+          subject: ticket.subject,
+          userEmail: userEmail!,
+          userName: userName || undefined,
+          responseMessage: sanitizedMessage,
+          staffUsername: auth.username,
+          responderIsStaff: false,
+        });
+      }).catch((error) => {
+        console.error('[Ticket Response] Failed to send creator notification:', error);
+      });
+    }
+
+    // Visual workflow graphs observe ticket replies (ADR-0013).
+    try {
+      const { emitFlowEvent } = await import('@/lib/flow/engine');
+      await emitFlowEvent('ticket_replied', `ticket_reply:${response.id}`, {
+        ticketId: ticket.id,
+        ticketSubject: ticket.subject,
+        username: auth.username,
+        isStaff: auth.isAdmin,
+      });
+    } catch (flowError) {
+      console.error('[Ticket Response] Flow emission failed:', flowError);
     }
 
     return NextResponse.json(

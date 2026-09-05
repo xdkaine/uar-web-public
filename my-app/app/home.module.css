@@ -1,0 +1,212 @@
+.home {
+  isolation: isolate;
+  --landing-cursor-fill: #111827;
+  --landing-cursor-fill-active: #0f172a;
+  --landing-cursor-stroke: #f8fafc;
+  --landing-cursor-shadow: rgb(15 23 42 / 0.25);
+  --landing-field-active: #ffffff;
+  --landing-field-idle: #f9fafb;
+}
+
+:global(.dark) .home {
+  background-color: var(--background);
+  background-image: none;
+  color: var(--foreground);
+  --landing-cursor-fill: var(--foreground);
+  --landing-cursor-fill-active: var(--foreground);
+  --landing-cursor-stroke: var(--background);
+  --landing-cursor-shadow: rgb(0 0 0 / 0.55);
+  --landing-field-active: var(--accent);
+  --landing-field-idle: var(--muted);
+}
+
+/*
+ * The landing workflow predates the portal's semantic color tokens. Keep its
+ * original light palette unchanged and translate only those legacy utilities
+ * when the root theme is dark.
+ */
+:global(.dark) .home :global(.bg-white) {
+  background-color: var(--card);
+}
+
+:global(.dark) .home [class~='bg-white/95'] {
+  background-color: color-mix(in oklch, var(--card) 96%, transparent);
+}
+
+:global(.dark) .home :global(.bg-gray-50) {
+  background-color: var(--muted);
+}
+
+:global(.dark) .home [class~='bg-gray-50/80'] {
+  background-color: color-mix(in oklch, var(--muted) 82%, transparent);
+}
+
+:global(.dark) .home :global(.bg-gray-100) {
+  background-color: var(--accent);
+}
+
+:global(.dark) .home :global(.bg-gray-900) {
+  background-color: var(--foreground);
+}
+
+:global(.dark) .home :global(.bg-gray-900):global(.text-white) {
+  color: var(--background);
+}
+
+:global(.dark) .home :global(.bg-black) {
+  background-color: var(--muted);
+}
+
+:global(.dark) .home :global(.text-gray-900) {
+  color: var(--foreground);
+}
+
+:global(.dark) .home :global(.text-gray-700) {
+  color: color-mix(in oklch, var(--foreground) 82%, var(--background));
+}
+
+:global(.dark) .home :global(.text-gray-600),
+:global(.dark) .home :global(.text-gray-500) {
+  color: var(--muted-foreground);
+}
+
+:global(.dark) .home :global(.border-gray-200) {
+  border-color: var(--border);
+}
+
+:global(.dark) .home :global(.border-gray-300) {
+  border-color: var(--input);
+}
+
+:global(.dark) .home :global(.border-gray-900) {
+  border-color: var(--foreground);
+}
+
+:global(.dark) .home :global(.placeholder-gray-400)::placeholder {
+  color: #9ca3af;
+}
+
+:global(.dark) .home :global(.bg-blue-50) {
+  background-color: rgb(23 37 84 / 0.72);
+}
+
+:global(.dark) .home :global(.border-blue-100) {
+  border-color: #1e3a8a;
+}
+
+:global(.dark) .home :global(.text-blue-900) {
+  color: #dbeafe;
+}
+
+:global(.dark) .home :global(.text-blue-800),
+:global(.dark) .home :global(.text-blue-700),
+:global(.dark) .home :global(.text-blue-600) {
+  color: #93c5fd;
+}
+
+:global(.dark) .home :global(.bg-emerald-50) {
+  background-color: rgb(2 44 34 / 0.72);
+}
+
+:global(.dark) .home :global(.bg-emerald-100) {
+  background-color: #064e3b;
+}
+
+:global(.dark) .home :global(.border-emerald-100),
+:global(.dark) .home :global(.border-emerald-200) {
+  border-color: #065f46;
+}
+
+:global(.dark) .home :global(.text-emerald-900) {
+  color: #d1fae5;
+}
+
+:global(.dark) .home :global(.text-emerald-800),
+:global(.dark) .home :global(.text-emerald-700) {
+  color: #6ee7b7;
+}
+
+:global(.dark) .home :global(.bg-amber-50) {
+  background-color: rgb(69 26 3 / 0.72);
+}
+
+:global(.dark) .home :global(.bg-amber-100) {
+  background-color: #78350f;
+}
+
+:global(.dark) .home :global(.border-amber-100),
+:global(.dark) .home :global(.border-amber-200) {
+  border-color: #92400e;
+}
+
+:global(.dark) .home :global(.text-amber-900) {
+  color: #fef3c7;
+}
+
+:global(.dark) .home :global(.text-amber-800),
+:global(.dark) .home :global(.text-amber-700) {
+  color: #fcd34d;
+}
+
+:global(.dark) .home :global(.bg-indigo-50) {
+  background-color: rgb(30 27 75 / 0.72);
+}
+
+:global(.dark) .home :global(.border-indigo-100) {
+  border-color: #3730a3;
+}
+
+:global(.dark) .home :global(.text-indigo-900) {
+  color: #e0e7ff;
+}
+
+:global(.dark) .home :global(.text-indigo-800),
+:global(.dark) .home :global(.text-indigo-600) {
+  color: #a5b4fc;
+}
+
+:global(.dark) .home input:disabled {
+  color: var(--foreground);
+  -webkit-text-fill-color: var(--foreground);
+  opacity: 1;
+}
+
+/*
+ * The global `input::placeholder` rule in globals.css is unlayered, so it beats
+ * Tailwind's layered `placeholder-gray-400` and renders the demo placeholders at
+ * full opacity in near-body ink — the empty fields read as already filled in.
+ * Ghost them back so it is obvious the cursor types the values.
+ */
+.home [data-workflow-demo] input::placeholder {
+  color: #9ca3af;
+  opacity: 0.6;
+}
+
+/*
+ * will-change keeps the progress sweep on its own compositor layer so it
+ * never repaints the surrounding card while the page scrolls.
+ */
+.home [data-workflow-progress] {
+  animation: workflow-progress 10s linear forwards;
+  animation-play-state: running;
+  transform: scaleX(0);
+  will-change: transform;
+}
+
+.home [data-workflow-progress][data-paused='true'] {
+  animation-play-state: paused;
+}
+
+@keyframes workflow-progress {
+  to {
+    transform: scaleX(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home [data-workflow-progress] {
+    animation: none;
+    transform: scaleX(1);
+    will-change: auto;
+  }
+}

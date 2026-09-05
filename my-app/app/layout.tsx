@@ -5,10 +5,16 @@ import "./globals.css";
 import Navbar from "@/components/Navbar";
 import Footer from "@/components/Footer";
 import NotificationBanner from "@/components/NotificationBanner";
-import { StructuredData, getOrganizationStructuredData, getWebApplicationStructuredData } from "@/components/seo/StructuredData";
+import { ThemeProvider } from "@/components/theme-provider";
+import { AppearanceThemeBridge } from "@/components/appearance/AppearanceThemeBridge";
+import { ReducedMotionProvider } from "@/components/ReducedMotionProvider";
+import { ActionImpactDialogProvider } from '@/components/admin/ActionImpactDialog';
+import { StructuredData } from "@/components/seo/StructuredData";
+import { getOrganizationStructuredData, getWebApplicationStructuredData } from "@/components/seo/seoDocuments";
+import { getMetadataBase } from '@/lib/metadata-base';
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || 'https://portal.calpolysoc.org'),
+  metadataBase: getMetadataBase(process.env.NEXT_PUBLIC_APP_URL),
   title: {
     default: "User Access Request (UAR) Portal - Cal Poly Pomona SOC",
     template: "%s | User Access Request (UAR) Portal"
@@ -77,6 +83,12 @@ export const metadata: Metadata = {
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
+  // Matches the --background token in each mode (globals.css) so the browser
+  // chrome follows the theme instead of flashing white in dark mode.
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#0a0a0a" },
+  ],
 };
 
 export default function RootLayout({
@@ -85,7 +97,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <head>
         <StructuredData data={getOrganizationStructuredData()} />
         <StructuredData data={getWebApplicationStructuredData()} />
@@ -94,18 +106,24 @@ export default function RootLayout({
         className={`${GeistSans.variable} ${GeistMono.variable} antialiased flex flex-col min-h-screen`}
         suppressHydrationWarning
       >
-        <a
-          href="#main-content"
-          className="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:top-4 focus:left-4 focus:px-6 focus:py-3 focus:bg-background focus:text-foreground focus:border focus:border-border focus:shadow-lg focus:rounded-md focus:font-medium transition-colors"
-        >
-          Skip to main content
-        </a>
-        <Navbar />
-        <NotificationBanner />
-        <main id="main-content" className="grow">
-          {children}
-        </main>
-        <Footer />
+        <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+          <ReducedMotionProvider>
+          <AppearanceThemeBridge />
+          <ActionImpactDialogProvider />
+          <a
+            href="#main-content"
+            className="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:top-4 focus:left-4 focus:px-6 focus:py-3 focus:bg-background focus:text-foreground focus:border focus:border-border focus:shadow-lg focus:rounded-md focus:font-medium transition-colors"
+          >
+            Skip to main content
+          </a>
+          <Navbar />
+          <NotificationBanner />
+          <main id="main-content" className="grow">
+            {children}
+          </main>
+          <Footer />
+          </ReducedMotionProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

@@ -8,7 +8,6 @@ export interface LDAPUser {
   accountExpires: string | null;
   whenCreated: string;
   memberOf: string[];
-  extensionAttribute15?: string;
   pwdLastSet?: string;
   lastLogon?: string;
 }

@@ -19,6 +19,13 @@ const mocks = vi.hoisted(() => ({
     accessRequest: {
       findUnique: vi.fn(),
     },
+    offboardOperationRun: {
+      findUnique: vi.fn(),
+      updateMany: vi.fn(),
+    },
+    systemConfigEntry: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
   },
   searchLDAPUser: vi.fn(),
 }));
@@ -45,9 +52,72 @@ vi.mock('@/lib/audit-log', () => ({
 }));
 
 import {
+  executeOffboardOperation,
+  OffboardOperationError,
   previewOffboardDeadlineExtension,
   previewProcessAllOffboardCampaign,
 } from './offboard-campaign';
+
+describe('executeOffboardOperation idempotency scope', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns a completed duplicate before expiry or drift checks', async () => {
+    const completed = {
+      id: 'preview-1', campaignId: 'campaign-1', kind: 'activation', actor: 'admin1', digest: 'digest-1',
+      status: 'completed', expiresAt: new Date('2020-01-01T00:00:00.000Z'), idempotencyKey: 'retry-key',
+    };
+    mocks.prisma.offboardOperationRun.findUnique.mockResolvedValue(completed);
+
+    const result = await executeOffboardOperation({
+      campaignId: 'campaign-1', kind: 'activation', actor: 'admin1', previewId: 'preview-1', digest: 'digest-1', idempotencyKey: 'retry-key',
+    });
+
+    expect(result).toEqual({ duplicate: true, run: completed, campaign: null });
+    expect(mocks.prisma.offboardCampaign.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('rejects reuse of an idempotency key outside its exact operation scope', async () => {
+    mocks.prisma.offboardOperationRun.findUnique.mockResolvedValue({
+      id: 'other-preview', campaignId: 'campaign-2', kind: 'rollback', actor: 'other-admin', digest: 'other-digest',
+      status: 'completed', expiresAt: new Date('2030-01-01T00:00:00.000Z'), idempotencyKey: 'retry-key',
+    });
+
+    await expect(executeOffboardOperation({
+      campaignId: 'campaign-1', kind: 'activation', actor: 'admin1', previewId: 'preview-1', digest: 'digest-1', idempotencyKey: 'retry-key',
+    })).rejects.toMatchObject({ code: 'PREVIEW_CONFLICT' } satisfies Partial<OffboardOperationError>);
+  });
+
+  it('moves an expired execution claim to reconciliation instead of replaying external work', async () => {
+    mocks.prisma.offboardOperationRun.findUnique.mockResolvedValue({
+      id: 'preview-1', campaignId: 'campaign-1', kind: 'activation', actor: 'admin1', digest: 'digest-1',
+      status: 'claimed', claimedUntil: new Date('2020-01-01T00:00:00.000Z'), idempotencyKey: 'retry-key',
+    });
+    mocks.prisma.offboardOperationRun.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(executeOffboardOperation({
+      campaignId: 'campaign-1', kind: 'activation', actor: 'admin1', previewId: 'preview-1', digest: 'digest-1', idempotencyKey: 'retry-key',
+    })).rejects.toMatchObject({ code: 'RECONCILIATION_REQUIRED' } satisfies Partial<OffboardOperationError>);
+
+    expect(mocks.prisma.offboardOperationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: 'preview-1', status: 'claimed' }),
+      data: { status: 'reconciliation_required', claimedUntil: null },
+    }));
+    expect(mocks.prisma.offboardCampaign.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('reports an active claim as in progress instead of already processed', async () => {
+    mocks.prisma.offboardOperationRun.findUnique.mockResolvedValue({
+      id: 'preview-1', campaignId: 'campaign-1', kind: 'activation', actor: 'admin1', digest: 'digest-1',
+      status: 'claimed', claimedUntil: new Date('2030-01-01T00:00:00.000Z'), idempotencyKey: 'retry-key',
+    });
+
+    await expect(executeOffboardOperation({
+      campaignId: 'campaign-1', kind: 'activation', actor: 'admin1', previewId: 'preview-1', digest: 'digest-1', idempotencyKey: 'retry-key',
+    })).rejects.toMatchObject({ code: 'OPERATION_IN_PROGRESS' } satisfies Partial<OffboardOperationError>);
+  });
+});
 
 describe('previewOffboardDeadlineExtension', () => {
   beforeEach(() => {
@@ -55,6 +125,7 @@ describe('previewOffboardDeadlineExtension', () => {
     mocks.prisma.offboardCampaign.findUnique.mockResolvedValue({
       id: 'campaign-1',
       status: 'active',
+      workflowMode: 'verification',
       cancelledAt: null,
       emergencyStoppedAt: null,
     });

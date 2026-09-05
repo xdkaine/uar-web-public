@@ -4,10 +4,41 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  --foreground-rgb: 17, 24, 39;
-  --background-start-rgb: 255, 255, 255;
-  --background-end-rgb: 243, 244, 246;
+  color-scheme: light;
+  --brand-accent: #F2B705;
   --radius: 0.625rem;
+  /* Semantic operational tones. Brand accent is deliberately excluded so
+     appearance changes cannot redefine lifecycle or security meaning. */
+  --tone-neutral-bg: oklch(0.97 0 0);
+  --tone-neutral-fg: oklch(0.32 0 0);
+  --tone-neutral-border: oklch(0.82 0 0);
+  --tone-neutral-solid: oklch(0.32 0 0);
+  --tone-neutral-solid-fg: oklch(0.985 0 0);
+  --tone-info-bg: oklch(0.96 0.03 250);
+  --tone-info-fg: oklch(0.36 0.16 255);
+  --tone-info-border: oklch(0.78 0.11 250);
+  --tone-info-solid: oklch(0.48 0.19 255);
+  --tone-info-solid-fg: oklch(0.985 0 0);
+  --tone-success-bg: oklch(0.96 0.04 165);
+  --tone-success-fg: oklch(0.34 0.12 165);
+  --tone-success-border: oklch(0.76 0.11 165);
+  --tone-success-solid: oklch(0.43 0.13 165);
+  --tone-success-solid-fg: oklch(0.985 0 0);
+  --tone-warning-bg: oklch(0.97 0.05 85);
+  --tone-warning-fg: oklch(0.39 0.11 70);
+  --tone-warning-border: oklch(0.79 0.13 80);
+  --tone-warning-solid: oklch(0.52 0.14 65);
+  --tone-warning-solid-fg: oklch(0.99 0.01 85);
+  --tone-danger-bg: oklch(0.96 0.035 25);
+  --tone-danger-fg: oklch(0.41 0.17 25);
+  --tone-danger-border: oklch(0.77 0.13 25);
+  --tone-danger-solid: oklch(0.5 0.2 25);
+  --tone-danger-solid-fg: oklch(0.985 0 0);
+  --tone-critical-bg: oklch(0.95 0.045 330);
+  --tone-critical-fg: oklch(0.37 0.17 330);
+  --tone-critical-border: oklch(0.73 0.14 330);
+  --tone-critical-solid: oklch(0.45 0.2 330);
+  --tone-critical-solid-fg: oklch(0.985 0 0);
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -81,14 +112,6 @@
   --radius-xl: calc(var(--radius) + 4px);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --foreground-rgb: 243, 244, 246;
-    --background-start-rgb: 17, 24, 39;
-    --background-end-rgb: 31, 41, 55;
-  }
-}
-
 body {
   min-height: 100vh;
 }
@@ -109,16 +132,27 @@ body {
 }
 
 .gradient-text {
-  background: linear-gradient(90deg, #059669, #10b981);
+  background: linear-gradient(90deg, oklch(0.596 0.145 163.225), oklch(0.723 0.191 149.579));
   -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.dark .gradient-text {
+  background: linear-gradient(90deg, oklch(0.723 0.191 149.579), oklch(0.795 0.184 86.047));
+  -webkit-background-clip: text;
+  background-clip: text;
   -webkit-text-fill-color: transparent;
 }
 
 .team-member {
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--card-foreground);
   padding: 16px;
   margin: 16px;
   text-align: center;
+  border-radius: var(--radius);
 }
 
 .team-member img {
@@ -129,52 +163,61 @@ body {
 
 .social-media a {
   margin: 0 8px;
-  color: #000;
+  color: var(--foreground);
 }
 
 .social-media a:hover {
-  color: #0073b1;
+  color: oklch(0.623 0.214 259.815);
 }
 
-/* Custom scrollbar styles */
+/* Custom scrollbar styles follow theme tokens in both modes. */
 .scrollbar-thin::-webkit-scrollbar {
   height: 6px;
 }
 
 .scrollbar-thin::-webkit-scrollbar-track {
-  background: #f1f1f1;
+  background: var(--muted);
   border-radius: 10px;
 }
 
 .scrollbar-thin::-webkit-scrollbar-thumb {
-  background: #d1d5db;
+  background: var(--border);
   border-radius: 10px;
 }
 
 .scrollbar-thin::-webkit-scrollbar-thumb:hover {
-  background: #9ca3af;
+  background: var(--ring);
 }
 
 /* Firefox scrollbar */
 .scrollbar-thin {
   scrollbar-width: thin;
-  scrollbar-color: #d1d5db #f1f1f1;
+  scrollbar-color: var(--border) var(--muted);
 }
 
-/* Global placeholder text styling - darker for better readability */
+/* Placeholder + control text follow theme tokens so both modes stay legible. */
+:root {
+  --placeholder-color: oklch(0.45 0 0);
+}
+
+.dark {
+  --placeholder-color: oklch(0.72 0 0);
+}
+
 input::placeholder,
 textarea::placeholder,
 select::placeholder {
-  color: #4b5563 !important; /* gray-600 */
+  color: var(--placeholder-color);
   opacity: 1;
 }
 
 input:focus::placeholder,
 textarea:focus::placeholder {
-  color: #6b7280 !important; /* gray-500 when focused */
+  color: var(--placeholder-color);
+  opacity: 0.85;
 }
 
-/* Override browser autofill yellow background and ensure text visibility */
+/* Override browser autofill yellow background with themed surfaces */
 input:-webkit-autofill,
 input:-webkit-autofill:hover,
 input:-webkit-autofill:focus,
@@ -187,30 +230,30 @@ select:-webkit-autofill,
 select:-webkit-autofill:hover,
 select:-webkit-autofill:focus,
 select:-webkit-autofill:active {
-  -webkit-box-shadow: 0 0 0 30px white inset !important;
-  box-shadow: 0 0 0 30px white inset !important;
-  -webkit-text-fill-color: #111827 !important; /* gray-900 for dark, readable text */
-  color: #111827 !important;
-  caret-color: #111827 !important;
+  -webkit-box-shadow: 0 0 0 30px var(--background) inset !important;
+  -webkit-text-fill-color: var(--foreground) !important;
+  color: var(--foreground) !important;
+  caret-color: var(--foreground) !important;
   transition: background-color 5000s ease-in-out 0s;
 }
 
-/* Ensure text remains visible and dark on all input fields */
+/* Keep controls on token colors (no forced light-mode ink) */
 input,
 textarea,
 select {
-  color: #111827 !important; /* gray-900 */
+  color: var(--foreground);
 }
 
 /* Make sure disabled inputs are still readable */
 input:disabled,
 textarea:disabled,
 select:disabled {
-  color: #6b7280 !important; /* gray-500 for disabled state */
+  color: var(--muted-foreground);
   opacity: 0.7;
 }
 
 .dark {
+  color-scheme: dark;
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.205 0 0);
@@ -242,6 +285,47 @@ select:disabled {
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.556 0 0);
+  --tone-neutral-bg: oklch(0.27 0 0);
+  --tone-neutral-fg: oklch(0.9 0 0);
+  --tone-neutral-border: oklch(0.48 0 0);
+  --tone-neutral-solid: oklch(0.76 0 0);
+  --tone-neutral-solid-fg: oklch(0.18 0 0);
+  --tone-info-bg: oklch(0.28 0.08 255);
+  --tone-info-fg: oklch(0.86 0.09 250);
+  --tone-info-border: oklch(0.55 0.14 255);
+  --tone-info-solid: oklch(0.68 0.15 250);
+  --tone-info-solid-fg: oklch(0.16 0.03 255);
+  --tone-success-bg: oklch(0.27 0.065 165);
+  --tone-success-fg: oklch(0.86 0.1 165);
+  --tone-success-border: oklch(0.52 0.11 165);
+  --tone-success-solid: oklch(0.7 0.13 165);
+  --tone-success-solid-fg: oklch(0.16 0.03 165);
+  --tone-warning-bg: oklch(0.3 0.07 70);
+  --tone-warning-fg: oklch(0.9 0.12 85);
+  --tone-warning-border: oklch(0.58 0.13 75);
+  --tone-warning-solid: oklch(0.78 0.14 80);
+  --tone-warning-solid-fg: oklch(0.2 0.04 65);
+  --tone-danger-bg: oklch(0.28 0.08 25);
+  --tone-danger-fg: oklch(0.87 0.1 25);
+  --tone-danger-border: oklch(0.55 0.15 25);
+  --tone-danger-solid: oklch(0.7 0.17 25);
+  --tone-danger-solid-fg: oklch(0.17 0.03 25);
+  --tone-critical-bg: oklch(0.27 0.09 330);
+  --tone-critical-fg: oklch(0.87 0.11 330);
+  --tone-critical-border: oklch(0.54 0.16 330);
+  --tone-critical-solid: oklch(0.72 0.17 330);
+  --tone-critical-solid-fg: oklch(0.17 0.03 330);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }
 
 @layer base {
@@ -253,28 +337,39 @@ select:disabled {
   }
 }
 
-/* ── Accessible focus indicators (WCAG 2.2 §2.4.7) ── */
+/* ── Accessible focus indicators (WCAG 2.2 §2.4.7) ──
+   Ring colors are tokenized so they flip with the theme; surfaces that are
+   permanently dark (brand navbar/footer) invert via their own scope below. */
+:root {
+  --focus-outline-color: oklch(0.145 0 0);
+  --focus-halo-color: oklch(1 0 0);
+}
+
+.dark {
+  --focus-outline-color: oklch(0.985 0 0);
+  --focus-halo-color: oklch(0.205 0 0);
+}
+
+/* Text controls retain their component focus ring (or native outline for raw
+   controls), including inputs that explicitly set tabindex. */
 a:focus-visible,
 button:focus-visible,
-input:focus-visible,
-select:focus-visible,
-textarea:focus-visible,
-[tabindex]:focus-visible,
+[tabindex]:not(input):not(select):not(textarea):focus-visible,
 [role="button"]:focus-visible,
 [role="tab"]:focus-visible,
 [role="link"]:focus-visible {
-  outline: 2px solid #000 !important;
+  outline: 2px solid var(--focus-outline-color) !important;
   outline-offset: 2px !important;
-  box-shadow: 0 0 0 4px #fff, 0 0 0 6px #000 !important;
+  box-shadow: 0 0 0 4px var(--focus-halo-color), 0 0 0 6px var(--focus-outline-color) !important;
   border-radius: 4px;
 }
 
-/* Dark-background overrides (navbar & footer) */
+/* Permanently dark brand surfaces (navbar & footer) always use inverted rings */
 nav a:focus-visible,
 nav button:focus-visible,
 nav [role="button"]:focus-visible,
 footer a:focus-visible,
 footer button:focus-visible {
-  outline-color: #fff !important;
-  box-shadow: 0 0 0 4px #000, 0 0 0 6px #fff !important;
+  outline-color: oklch(0.985 0 0) !important;
+  box-shadow: 0 0 0 4px oklch(0.205 0 0), 0 0 0 6px oklch(0.985 0 0) !important;
 }

@@ -1,10 +1,16 @@
-import { formatRequestDescription, listUsersInOU, tagAccountWithAccessRequestId, updateUserAttributes } from './ldap';
+import { listUsersInOU, searchLDAPUser } from './ldap';
 import type { Prisma } from '@prisma/client';
 import { extractBronconame } from './validation';
 import { prisma } from './prisma';
 import { appLogger } from './logger';
 import { logActionHistoryEvent } from '@/lib/action-history';
 import { AuditActions, AuditCategories } from '@/lib/audit-log';
+import { isModuleEnabled } from '@/lib/modules/core';
+import { randomBytes, randomUUID } from 'node:crypto';
+import {
+  acquireDirectoryOwnershipFence,
+  findBatchDirectoryOwnershipClaims,
+} from './directory-ownership-fence';
 
 export interface InfrastructureSyncResult {
   syncId: string;
@@ -26,6 +32,7 @@ export interface InfrastructureSyncResult {
     syncMatchId?: string | null;
     errorMessage?: string;
   }>;
+  tagging?: { completed: number; failed: number };
   error?: string;
 }
 
@@ -40,6 +47,20 @@ export async function syncInfrastructureAccounts(
   const { triggeredBy, dryRun = false } = options;
 
   appLogger.info('Starting infrastructure sync', { triggeredBy, dryRun });
+
+  const leaseOwner = randomUUID();
+  const leaseStartedAt = new Date();
+  const acquired = await prisma.$queryRaw<Array<{ owner: string }>>`
+    INSERT INTO "OperationalLease" ("key", "owner", "expiresAt", "updatedAt")
+    VALUES ('infrastructure-sync', ${leaseOwner}, ${new Date(leaseStartedAt.getTime() + 5 * 60_000)}, ${leaseStartedAt})
+    ON CONFLICT ("key") DO UPDATE SET
+      "owner" = EXCLUDED."owner", "expiresAt" = EXCLUDED."expiresAt", "updatedAt" = EXCLUDED."updatedAt"
+    WHERE "OperationalLease"."expiresAt" <= ${leaseStartedAt}
+    RETURNING "owner"
+  `;
+  if (acquired.length !== 1) {
+    throw new Error('Another infrastructure sync is already running');
+  }
 
   const syncRecord = await prisma.aDAccountSync.create({
     data: {
@@ -98,6 +119,7 @@ export async function syncInfrastructureAccounts(
         correlationId,
       });
 
+      await prisma.operationalLease.deleteMany({ where: { key: 'infrastructure-sync', owner: leaseOwner } }).catch(() => undefined);
       return {
         syncId: syncRecord.id,
         status: 'completed',
@@ -120,7 +142,16 @@ export async function syncInfrastructureAccounts(
         let skippedDuplicates = 0;
         let errors = 0;
 
-        for (const adUser of cppAdUsers) {
+        for (let userIndex = 0; userIndex < cppAdUsers.length; userIndex += 1) {
+          const adUser = cppAdUsers[userIndex];
+          if (userIndex > 0 && userIndex % 25 === 0) {
+            const renewedAt = new Date();
+            const renewed = await tx.operationalLease.updateMany({
+              where: { key: 'infrastructure-sync', owner: leaseOwner },
+              data: { expiresAt: new Date(renewedAt.getTime() + 5 * 60_000) },
+            });
+            if (renewed.count !== 1) throw new Error('Infrastructure sync lease was lost');
+          }
           try {
             const bronconame = extractBronconame(adUser.email);
             
@@ -139,23 +170,92 @@ export async function syncInfrastructureAccounts(
               continue;
             }
 
+            if (!dryRun) {
+              const canonicalAdUsername = bronconame.trim().toLowerCase();
+              await acquireDirectoryOwnershipFence(tx, canonicalAdUsername);
+              const currentDirectoryUser = await searchLDAPUser(bronconame);
+              if (!currentDirectoryUser) {
+                appLogger.warn(`Skipping ${bronconame} - directory account disappeared after inventory`);
+                records.push({
+                  adUsername: bronconame,
+                  adEmail: adUser.email,
+                  adDisplayName: adUser.displayName,
+                  action: 'error',
+                  accessRequestId: null,
+                  vpnAccountId: null,
+                  errorMessage: 'Directory account disappeared after inventory; no portal ownership record was created',
+                });
+                errors++;
+                continue;
+              }
+            }
+
             const existingAccessRequest = await tx.accessRequest.findFirst({
               where: {
                 OR: [
-                  { email: adUser.email.toLowerCase() },
-                  { ldapUsername: bronconame },
-                  { vpnUsername: bronconame },
-                  { linkedAdUsername: bronconame },
+                  { email: { equals: adUser.email.toLowerCase(), mode: 'insensitive' } },
+                  { ldapUsername: { equals: bronconame, mode: 'insensitive' } },
+                  { vpnUsername: { equals: bronconame, mode: 'insensitive' } },
+                  { linkedAdUsername: { equals: bronconame, mode: 'insensitive' } },
                 ],
-                status: { notIn: ['rejected', 'offboarded'] },
+                status: { not: 'rejected' },
               },
             });
+
+            const batchAdOwners = dryRun
+              ? await tx.batchAccountItem.findMany({
+                  where: {
+                    accountType: 'AD',
+                    lifecycleOwnerKind: 'batch_item',
+                    accessRequestId: null,
+                    status: { in: ['processing', 'completed', 'reconciliation_required'] },
+                    ldapUsername: { equals: bronconame, mode: 'insensitive' },
+                    OR: [{ adAccountStatus: null }, { adAccountStatus: { not: 'deleted' } }],
+                  },
+                  select: { id: true, batchId: true, accountType: true, status: true },
+                  take: 2,
+                })
+              : await findBatchDirectoryOwnershipClaims(tx, bronconame, 'AD');
+
+            if (batchAdOwners.length > 0) {
+              appLogger.info(`Skipping ${bronconame} - account is governed by batch ${batchAdOwners[0].batchId}`);
+              records.push({
+                adUsername: bronconame,
+                adEmail: adUser.email,
+                adDisplayName: adUser.displayName,
+                action: 'skipped_duplicate',
+                accessRequestId: null,
+                vpnAccountId: null,
+              });
+              skippedDuplicates++;
+              continue;
+            }
 
             const existingVPNAccount = await tx.vPNAccount.findFirst({
               where: {
                 username: bronconame,
               },
             });
+
+            // VPN record creation only happens while VPN management is
+            // enabled; otherwise sync reconciles AD-only.
+            const vpnModuleEnabled = await isModuleEnabled('vpn.management');
+
+            // Offboarding is durable lifecycle state, not an absent onboarding
+            // record. Never recreate active portal/VPN state for that identity.
+            if (existingAccessRequest?.status === 'offboarded') {
+              appLogger.info(`Skipping ${bronconame} - access request is offboarded`);
+              records.push({
+                adUsername: bronconame,
+                adEmail: adUser.email,
+                adDisplayName: adUser.displayName,
+                action: 'skipped_duplicate',
+                accessRequestId: existingAccessRequest.id,
+                vpnAccountId: existingVPNAccount?.id || null,
+              });
+              skippedDuplicates++;
+              continue;
+            }
 
             if (existingAccessRequest && existingVPNAccount) {
               appLogger.info(`Skipping ${bronconame} - both records already exist`);
@@ -173,8 +273,14 @@ export async function syncInfrastructureAccounts(
 
             if (dryRun) {
               const wouldCreate = [];
-              if (!existingAccessRequest) wouldCreate.push('AccessRequest');
-              if (!existingVPNAccount) wouldCreate.push('VPNAccount');
+              if (!existingAccessRequest) {
+                wouldCreate.push('AccessRequest');
+                newAccessRequests += 1;
+              }
+              if (vpnModuleEnabled && !existingVPNAccount) {
+                wouldCreate.push('VPNAccount');
+                newVPNAccounts += 1;
+              }
               
               appLogger.info(`[DRY RUN] Would create ${wouldCreate.join(' and ')} for ${bronconame}`);
               records.push({
@@ -201,12 +307,12 @@ export async function syncInfrastructureAccounts(
                   verifiedAt: new Date(),
                   isManuallyAssigned: true,
                   linkedAdUsername: bronconame,
-                  linkedVpnUsername: bronconame,
+                  ...(vpnModuleEnabled ? { linkedVpnUsername: bronconame } : {}),
                   manuallyAssignedBy: triggeredBy,
                   manuallyAssignedAt: new Date(),
                   manualAssignmentNotes: `Auto-created during infrastructure sync - existing AD account ${bronconame}@cpp.edu`,
                   ldapUsername: bronconame,
-                  vpnUsername: bronconame,
+                  ...(vpnModuleEnabled ? { vpnUsername: bronconame } : {}),
                   approvedAt: new Date(),
                   approvedBy: triggeredBy,
                   approvalMessage: 'Auto-approved - existing AD infrastructure account',
@@ -219,47 +325,11 @@ export async function syncInfrastructureAccounts(
               newAccessRequests++;
               appLogger.info(`Created AccessRequest for ${bronconame}`);
 
-              // LDAP tagging runs after commit so a directory timeout does not roll back the sync record.
-              setImmediate(async () => {
-                try {
-                  await updateUserAttributes(bronconame, {
-                    description: formatRequestDescription(newAccessRequest.id),
-                  });
-                  appLogger.info(`Updated AD description for ${bronconame}`);
-                } catch (descUpdateError) {
-                  appLogger.warn(`Failed to update AD description for ${bronconame}`, { error: descUpdateError });
-                }
-                
-                try {
-                  await tagAccountWithAccessRequestId(bronconame, newAccessRequest.id);
-                  appLogger.info(`Tagged AD account ${bronconame} with Request ID`);
-                } catch (tagError) {
-                  appLogger.warn(`Failed to tag AD account ${bronconame} with Access Request ID`, { error: tagError });
-                }
-              });
-            } else {
-              setImmediate(async () => {
-                try {
-                  await updateUserAttributes(bronconame, {
-                    description: formatRequestDescription(existingAccessRequest.id),
-                  });
-                  appLogger.info(`Updated AD description for existing request ${bronconame}`);
-                } catch (descUpdateError) {
-                  appLogger.warn(`Failed to update AD description for existing account ${bronconame}`, { error: descUpdateError });
-                }
-                
-                try {
-                  await tagAccountWithAccessRequestId(bronconame, existingAccessRequest.id);
-                  appLogger.info(`Tagged existing AD account ${bronconame}`);
-                } catch (tagError) {
-                  appLogger.warn(`Failed to tag existing AD account ${bronconame}`, { error: tagError });
-                }
-              });
             }
 
             let vpnAccountId = existingVPNAccount?.id || null;
-            if (!existingVPNAccount) {
-              const placeholderPassword = `InfraSync-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+            if (vpnModuleEnabled && !existingVPNAccount) {
+              const placeholderPassword = `InfraSync-${randomBytes(24).toString('base64url')}`;
               
               const newVPNAccount = await tx.vPNAccount.create({
                 data: {
@@ -285,6 +355,7 @@ export async function syncInfrastructureAccounts(
               await tx.vPNAccountStatusLog.create({
                 data: {
                   accountId: newVPNAccount.id,
+                  liveAccountId: newVPNAccount.id,
                   oldStatus: null,
                   newStatus: 'active',
                   changedBy: triggeredBy,
@@ -363,6 +434,8 @@ export async function syncInfrastructureAccounts(
       }
     );
 
+    const tagging = { completed: 0, failed: 0 };
+
     appLogger.info('Infrastructure sync completed successfully', {
       syncId: syncRecord.id,
       stats: {
@@ -420,7 +493,7 @@ export async function syncInfrastructureAccounts(
       correlationId,
     });
 
-    return {
+    const response: InfrastructureSyncResult = {
       syncId: syncRecord.id,
       status: result.errors === 0 ? 'completed' : 'partial',
       stats: {
@@ -431,9 +504,12 @@ export async function syncInfrastructureAccounts(
         errors: result.errors,
       },
       records: result.records,
+      tagging,
     };
+    await prisma.operationalLease.deleteMany({ where: { key: 'infrastructure-sync', owner: leaseOwner } }).catch(() => undefined);
+    return response;
   } catch (error) {
-    appLogger.error('Infrastructure sync failed - transaction rolled back', error);
+    appLogger.error('Infrastructure sync database transaction failed', error);
 
     const errorMessage = error instanceof Error ? error.message : String(error);
 
@@ -443,8 +519,8 @@ export async function syncInfrastructureAccounts(
         data: {
           status: 'failed',
           completedAt: new Date(),
-          errorMessage: `${errorMessage} - All changes were rolled back`,
-          notes: 'Transaction failed - no changes were persisted to database',
+          errorMessage: `${errorMessage} - database writes were rolled back`,
+          notes: 'Database transaction failed. External directory reads are not transactional.',
         },
       });
     } catch (updateError) {
@@ -462,10 +538,11 @@ export async function syncInfrastructureAccounts(
       outcome: 'rollback',
       success: false,
       errorMessage,
-      details: { dryRun, note: 'Transaction failed - no changes were persisted to database' },
+      details: { dryRun, note: 'Database writes were rolled back; external reads are not transactional' },
       correlationId,
     });
 
+    await prisma.operationalLease.deleteMany({ where: { key: 'infrastructure-sync', owner: leaseOwner } }).catch(() => undefined);
     return {
       syncId: syncRecord.id,
       status: 'failed',
@@ -494,6 +571,9 @@ export async function getLatestInfrastructureSync() {
       matches: {
         orderBy: { createdAt: 'asc' },
       },
+      taggingTasks: {
+        orderBy: { createdAt: 'asc' },
+      },
     },
   });
 }
@@ -520,6 +600,9 @@ export async function getInfrastructureSyncById(syncId: string) {
     where: { id: syncId },
     include: {
       matches: {
+        orderBy: { createdAt: 'asc' },
+      },
+      taggingTasks: {
         orderBy: { createdAt: 'asc' },
       },
     },

@@ -1,10 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { sendRejectionEmail } from '@/lib/email';
-import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { checkReviewAccessWithRateLimit } from '@/lib/adminAuth';
 import { deleteLDAPUser, disableLDAPUser, setLDAPUserExpiration } from '@/lib/ldap';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { isModuleEnabled } from '@/lib/modules/core';
+import { actorCanActOnStage } from '@/lib/rbac/core';
+import { findStageIndexByStatus, resolveWorkflowForRequest, workflowIntegrityConflict } from '@/lib/workflow/core';
 import { isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit } from '@/lib/validation';
+import { toSafeAccessRequestResponse } from '@/lib/access-request-response';
+import {
+  revokeLinkedVpnForRejection,
+  VpnRejectionConflictError,
+} from '@/lib/vpn-rejection-retention';
 
 const REJECTION_STATE_IN_PROGRESS = 'rejection_in_progress';
 const REJECTION_STATE_FAILED = 'rejection_failed';
@@ -39,7 +47,7 @@ export async function POST(
   let claimedRejection = false;
 
   try {
-    const { admin, response } = await checkAdminAuthWithRateLimit(request);
+    const { admin, response } = await checkReviewAccessWithRateLimit(request);
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
@@ -74,22 +82,81 @@ export async function POST(
         { status: 409 }
       );
     }
+    if (['in_progress', 'reconciliation_required'].includes(accessRequest.accountUpdateState || '')) {
+      return NextResponse.json(
+        { error: 'Account identity reconciliation must finish before rejection' },
+        { status: 409 }
+      );
+    }
+    if (accessRequest.facultyNotificationState === 'sending') {
+      return NextResponse.json(
+        { error: 'Faculty delivery is in progress; its outcome must settle before rejection' },
+        { status: 409 }
+      );
+    }
+    if (accessRequest.provisioningState === 'reconciliation_pending') {
+      return NextResponse.json(
+        { error: 'Directory reconciliation is in progress; wait for it to finish before rejecting this request.' },
+        { status: 409 }
+      );
+    }
+
+    // Governance: rejecting a request under review requires the reviewer role
+    // of the stage it currently sits in. Statuses outside any review stage
+    // (e.g. pre-verification) remain administrator actions.
+    {
+      const workflow = await resolveWorkflowForRequest(accessRequest);
+      const workflowConflict = workflowIntegrityConflict(workflow);
+      if (workflowConflict) {
+        return NextResponse.json({ error: workflowConflict, code: 'WORKFLOW_RECONCILIATION_REQUIRED' }, { status: 409 });
+      }
+      const stageIndex = findStageIndexByStatus(workflow.stages, accessRequest.status);
+      const requiredRoleKey = stageIndex >= 0 ? workflow.stages[stageIndex].reviewerRoleKey : null;
+      if (requiredRoleKey && !actorCanActOnStage(admin, requiredRoleKey)) {
+        return NextResponse.json(
+          {
+            error: 'You do not have the reviewer role required to reject requests at this stage.',
+            code: 'MISSING_STAGE_ROLE',
+          },
+          { status: 403 }
+        );
+      }
+    }
+
+    const vpnModuleEnabled = await isModuleEnabled('vpn.management');
 
     const claimResult = await prisma.accessRequest.updateMany({
       where: {
         id: resolvedParams.id,
         version: accessRequest.version,
         status: { notIn: ['approved', 'rejected'] },
-        OR: [
-          { provisioningState: null },
+        AND: [
           {
-            provisioningState: {
-              notIn: [
-                APPROVAL_STATE_IN_PROGRESS,
-                REJECTION_STATE_IN_PROGRESS,
-                ACCOUNT_CREATION_IN_PROGRESS,
-              ],
-            },
+            OR: [
+              { provisioningState: null },
+              {
+                provisioningState: {
+                  notIn: [
+                    APPROVAL_STATE_IN_PROGRESS,
+                    REJECTION_STATE_IN_PROGRESS,
+                    ACCOUNT_CREATION_IN_PROGRESS,
+                    'reconciliation_pending',
+                  ],
+                },
+              },
+            ],
+          },
+          {
+            OR: [
+              { accountUpdateState: null },
+              { accountUpdateState: { in: ['failed', 'succeeded'] } },
+            ],
+          },
+          {
+            OR: [
+              { facultyNotificationState: null },
+              { facultyNotificationState: { not: 'sending' } },
+            ],
           },
         ],
       },
@@ -111,43 +178,24 @@ export async function POST(
     claimedRejection = true;
     const lockedVersion = accessRequest.version + 1;
 
-    // AUTOMATIC CLEANUP: Delete LDAP accounts and VPN records if they were created
+    // AUTOMATIC CLEANUP: Roll back directory provisioning and revoke VPN records.
+    // VPN rows and credentials are retained until the separately authorized,
+    // confirmed lifecycle deletion path is used.
     // This enables clean retry and prevents orphaned accounts
     // SAFETY: Only deletes accounts that belong to THIS request (verified by request ID)
     const needsLdapCleanup = accessRequest.accountCreatedAt !== null;
     const cleanupResults: Array<{ username: string; success: boolean; method?: string; error?: string }> = [];
 
     // VPN Account Cleanup
-    // Find and delete any VPN account records associated with this request
-    const vpnAccountToDelete = await prisma.vPNAccount.findFirst({
-      where: { accessRequestId: resolvedParams.id },
-    });
-
-    if (vpnAccountToDelete) {
-      try {
-        console.log(`[Rejection Cleanup] Deleting VPN account record: ${vpnAccountToDelete.username} (status: ${vpnAccountToDelete.status})`);
-        
-        // Log the deletion in the status log before deleting
-        await prisma.vPNAccountStatusLog.create({
-          data: {
-            accountId: vpnAccountToDelete.id,
-            oldStatus: vpnAccountToDelete.status,
-            newStatus: 'deleted',
-            changedBy: admin.username,
-            reason: 'Request rejected before account was activated',
-          },
-        });
-
-        // Delete the VPN account record completely since it was never activated
-        await prisma.vPNAccount.delete({
-          where: { id: vpnAccountToDelete.id },
-        });
-
-        console.log(`[Rejection Cleanup] ✅ Successfully deleted VPN account record: ${vpnAccountToDelete.username}`);
-      } catch (vpnError) {
-        console.error(`[Rejection Cleanup] ⚠️ Failed to delete VPN account record:`, vpnError);
-        // Continue with rejection even if VPN cleanup fails
-      }
+    // Revoke and retain any VPN record associated with this request. Request
+    // rejection must never be an alternate permanent-deletion authority.
+    let vpnAccountRevoked: { username: string; status: string } | null = null;
+    if (vpnModuleEnabled) {
+      vpnAccountRevoked = await revokeLinkedVpnForRejection({
+        requestId: resolvedParams.id,
+        requestVersion: lockedVersion,
+        actor: admin.username,
+      });
     }
 
     if (needsLdapCleanup) {
@@ -195,13 +243,13 @@ export async function POST(
       // If any cleanup failed, log it but continue with rejection
       const failedCleanups = cleanupResults.filter(r => !r.success);
       if (failedCleanups.length > 0) {
-        console.error('[Rejection Cleanup] Some LDAP accounts could not be cleaned up:', failedCleanups);
+        console.error('[Rejection Cleanup] Some directory accounts could not be cleaned up:', failedCleanups);
         
         // Log to database for manual follow-up
         await prisma.requestComment.create({
           data: {
             requestId: resolvedParams.id,
-            comment: `⚠️ LDAP cleanup partially failed during rejection. Manual verification needed for: ${
+            comment: `Directory cleanup partially failed during rejection. Manual verification is needed for: ${
               failedCleanups.map(f => `${f.username} (${f.error})`).join(', ')
             }`,
             author: 'System',
@@ -256,15 +304,15 @@ export async function POST(
     let commentText = `Request rejected.\n\nReason: ${rejectionReason}`;
     
     // Add VPN cleanup info to comment
-    if (vpnAccountToDelete) {
-      commentText += `\n\nVPN account record automatically deleted: ${vpnAccountToDelete.username} (status was: ${vpnAccountToDelete.status})`;
+    if (vpnAccountRevoked) {
+      commentText += `\n\nVPN account automatically revoked and retained for governed lifecycle review: ${vpnAccountRevoked.username} (status was: ${vpnAccountRevoked.status})`;
     }
     
-    // Add LDAP cleanup info to comment
+    // Add directory cleanup info to comment
     if (cleanupResults.length > 0) {
       const successfulCleanups = cleanupResults.filter(r => r.success);
       if (successfulCleanups.length > 0) {
-        commentText += `\n\nLDAP accounts automatically cleaned up: ${
+        commentText += `\n\nDirectory accounts automatically cleaned up: ${
           successfulCleanups.map(r => `${r.username} (${r.method})`).join(', ')
         }`;
       }
@@ -315,7 +363,7 @@ export async function POST(
           requestName: updatedRequest.name,
           requestEmail: updatedRequest.email,
           rejectionReason,
-          vpnAccountDeleted: vpnAccountToDelete ? vpnAccountToDelete.username : null,
+          vpnAccountRevoked: vpnAccountRevoked?.username ?? null,
           ldapCleanup: cleanupResults,
           emailSent: false,
           emailFailureState: REJECTION_EMAIL_PENDING,
@@ -332,7 +380,7 @@ export async function POST(
         {
           success: true,
           warning: 'Request rejected, but the rejection email failed. Manual follow-up is required.',
-          request: requestWithFailureState,
+          request: toSafeAccessRequestResponse(requestWithFailureState),
         },
         { status: 202 }
       );
@@ -349,9 +397,9 @@ export async function POST(
         requestName: updatedRequest.name,
         requestEmail: updatedRequest.email,
         rejectionReason,
-        vpnAccountDeleted: vpnAccountToDelete ? vpnAccountToDelete.username : null,
-        ldapCleanup: cleanupResults,
-        emailSent: true,
+          vpnAccountRevoked: vpnAccountRevoked?.username ?? null,
+          ldapCleanup: cleanupResults,
+          emailSent: true,
       },
       ipAddress: getIpAddress(request),
       userAgent: getUserAgent(request),
@@ -359,7 +407,7 @@ export async function POST(
 
     return NextResponse.json({ 
       success: true, 
-      request: updatedRequest 
+      request: toSafeAccessRequestResponse(updatedRequest)
     });
   } catch (error) {
     if (isJsonBodyError(error)) {
@@ -368,6 +416,22 @@ export async function POST(
 
     if (error instanceof HttpError) {
       return NextResponse.json({ error: error.message }, { status: error.status });
+    }
+    if (error instanceof VpnRejectionConflictError) {
+      if (claimedRejection && requestId) {
+        await prisma.accessRequest.updateMany({
+          where: { id: requestId, provisioningState: REJECTION_STATE_IN_PROGRESS },
+          data: {
+            provisioningState: REJECTION_STATE_FAILED,
+            provisioningCompletedAt: new Date(),
+            provisioningError: error.message,
+            version: { increment: 1 },
+          },
+        }).catch((markError: unknown) => {
+          console.error('Failed to mark rejection as failed after VPN conflict:', markError);
+        });
+      }
+      return NextResponse.json({ error: error.message }, { status: 409 });
     }
 
     console.error('Error rejecting request:', error);

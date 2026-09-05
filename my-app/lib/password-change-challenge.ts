@@ -13,6 +13,9 @@ export interface PasswordChangeChallengeRecord {
   id: string;
   username: string;
   reason: PasswordChangeChallengeReason;
+  authProvider: 'ad' | 'ad_manual' | 'ad_outage_fallback';
+  correlationId: string | null;
+  state: 'active' | 'processing' | 'directory_applied' | 'consumed';
   expiresAt: Date;
   attempts: number;
 }
@@ -29,6 +32,9 @@ function toChallengeRecord(record: {
   id: string;
   username: string;
   reason: string;
+  authProvider: string;
+  correlationId: string | null;
+  state: string;
   expiresAt: Date;
   attempts: number;
 }): PasswordChangeChallengeRecord {
@@ -36,6 +42,19 @@ function toChallengeRecord(record: {
     id: record.id,
     username: record.username,
     reason: record.reason === 'password_expired' ? 'password_expired' : 'password_change_required',
+    authProvider: record.authProvider === 'ad_outage_fallback'
+      ? 'ad_outage_fallback'
+      : record.authProvider === 'ad_manual'
+        ? 'ad_manual'
+        : 'ad',
+    correlationId: record.correlationId,
+    state: record.state === 'processing'
+      ? 'processing'
+      : record.state === 'directory_applied'
+        ? 'directory_applied'
+      : record.state === 'consumed'
+        ? 'consumed'
+        : 'active',
     expiresAt: record.expiresAt,
     attempts: record.attempts,
   };
@@ -44,6 +63,8 @@ function toChallengeRecord(record: {
 export async function createPasswordChangeChallenge(input: {
   username: string;
   reason: PasswordChangeChallengeReason;
+  authProvider?: 'ad' | 'ad_manual' | 'ad_outage_fallback';
+  correlationId?: string;
   ipAddress?: string;
   userAgent?: string;
 }): Promise<{ token: string; expiresAt: Date; challenge: PasswordChangeChallengeRecord }> {
@@ -61,6 +82,7 @@ export async function createPasswordChangeChallenge(input: {
     data: {
       used: true,
       usedAt: now,
+      state: 'consumed',
     },
   });
 
@@ -69,6 +91,8 @@ export async function createPasswordChangeChallenge(input: {
       username: input.username,
       tokenHash,
       reason: input.reason,
+      authProvider: input.authProvider ?? 'ad',
+      correlationId: input.correlationId,
       expiresAt,
       ipAddress: input.ipAddress,
       userAgent: input.userAgent,
@@ -119,7 +143,7 @@ export async function getValidPasswordChangeChallenge(
     where: { tokenHash },
   });
 
-  if (!challenge || challenge.used || challenge.expiresAt <= new Date()) {
+  if (!challenge || challenge.used || challenge.state !== 'active' || challenge.expiresAt <= new Date()) {
     return null;
   }
 
@@ -128,6 +152,42 @@ export async function getValidPasswordChangeChallenge(
   }
 
   return toChallengeRecord(challenge);
+}
+
+/** Atomically claim a still-valid challenge before the first AD mutation. */
+export async function claimPasswordChangeChallenge(challengeId: string): Promise<boolean> {
+  const now = new Date();
+  const claimed = await prisma.passwordChangeChallenge.updateMany({
+    where: {
+      id: challengeId,
+      state: 'active',
+      used: false,
+      expiresAt: { gt: now },
+      attempts: { lt: PASSWORD_CHANGE_CHALLENGE_MAX_ATTEMPTS },
+    },
+    data: {
+      state: 'processing',
+      claimedAt: now,
+    },
+  });
+  return claimed.count === 1;
+}
+
+/** Persist recovery evidence immediately after Active Directory changed. */
+export async function markPasswordChangeChallengeDirectoryApplied(
+  challengeId: string
+): Promise<void> {
+  const applied = await prisma.passwordChangeChallenge.updateMany({
+    where: { id: challengeId, state: 'processing', used: false },
+    data: {
+      state: 'directory_applied',
+      used: true,
+      usedAt: new Date(),
+    },
+  });
+  if (applied.count !== 1) {
+    throw new Error('Password change challenge could not record the directory mutation');
+  }
 }
 
 export async function incrementPasswordChangeChallengeAttempts(
@@ -145,6 +205,7 @@ export async function incrementPasswordChangeChallengeAttempts(
       data: {
         used: true,
         usedAt: new Date(),
+        state: 'consumed',
       },
     });
   }
@@ -161,6 +222,7 @@ export async function consumePasswordChangeChallenge(challengeId: string): Promi
     data: {
       used: true,
       usedAt: new Date(),
+      state: 'consumed',
     },
   });
 }

@@ -1,9 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { randomUUID } from 'crypto';
 import { listUsersInOU } from '@/lib/ldap';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { prisma } from '@/lib/prisma';
+import { loadAccountOwnershipRecords } from '@/lib/account-ownership-records';
+import { summarizeAccountOwnership, unavailableAccountOwnership, type AccountOwnershipSummary } from '@/lib/account-ownership';
+import { buildLifecycleAccountInventory } from '@/lib/lifecycle-account-inventory';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 import { getAccountVerificationMap, normalizeOffboardIdentifier } from '@/lib/offboard-campaign';
+import {
+  classifyDirectoryQueryError,
+  DIRECTORY_RESULT_CAP,
+  type DirectoryFetchState,
+} from './directory-fetch-state';
 
 type LdapDirectoryUser = Awaited<ReturnType<typeof listUsersInOU>>[number];
 
@@ -13,13 +23,47 @@ interface VpnDetails {
 }
 
 interface AdminUserListItem extends LdapDirectoryUser {
+  ownership?: AccountOwnershipSummary;
   vpnDetails: VpnDetails | null;
   lastVerifiedAt?: Date | null;
   lastVerifiedSource?: string;
   originalRegistrationAt?: Date | null;
 }
 
+async function logDirectoryFetchFailure(
+  request: NextRequest,
+  username: string,
+  state: Extract<DirectoryFetchState, { state: 'size_limit_error' | 'query_error' }>['state'],
+  includeVpnOnly: boolean,
+): Promise<string | undefined> {
+  const correlationId = randomUUID();
+
+  try {
+    await logAuditAction({
+      action: AuditActions.VIEW_USER_LIST,
+      category: AuditCategories.USER,
+      username,
+      eventKind: 'read',
+      outcome: 'failure',
+      success: false,
+      correlationId,
+      details: {
+        directoryFetchState: state,
+        includeVpnOnly,
+      },
+      ipAddress: getIpAddress(request),
+      userAgent: getUserAgent(request),
+    });
+    return correlationId;
+  } catch {
+    // A diagnostic reference is useful only when its audit record exists.
+    return undefined;
+  }
+}
+
 export async function GET(request: NextRequest) {
+  let auditUsername: string | null = null;
+
   try {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
 
@@ -27,23 +71,57 @@ export async function GET(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
+    if (!actorHasPermission(admin, 'users.read')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    auditUsername = admin.username;
+
     const searchParams = request.nextUrl.searchParams;
     const query = (searchParams.get('q') || '').trim().toLowerCase();
     const requestedLimit = Number(searchParams.get('limit') || 0);
     const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 100) : null;
     const includeVpnOnly = searchParams.get('includeVpnOnly') !== 'false';
 
-    const [ldapUsers, vpnAccounts] = await Promise.all([
-      listUsersInOU(),
-      prisma.vPNAccount.findMany({
-        select: {
-          username: true,
-          status: true,
-          portalType: true,
-          email: true,
-        }
-      })
-    ]);
+    let ldapUsers: Awaited<ReturnType<typeof listUsersInOU>>;
+    try {
+      ldapUsers = await listUsersInOU();
+    } catch (error) {
+      const state = classifyDirectoryQueryError(error);
+      const diagnosticReference = await logDirectoryFetchFailure(
+        request,
+        admin.username,
+        state,
+        includeVpnOnly,
+      );
+      return NextResponse.json(
+        {
+          error: state === 'size_limit_error'
+            ? 'The Active Directory query exceeded its result limit.'
+            : 'The Active Directory query could not be completed.',
+          directory: {
+            state,
+            ...(diagnosticReference ? { diagnosticReference } : {}),
+          },
+        },
+        { status: 503 }
+      );
+    }
+
+    const vpnAccounts = await prisma.vPNAccount.findMany({
+      select: {
+        id: true,
+        name: true,
+        adUsername: true,
+        accessRequestId: true,
+        batchAccountItemId: true,
+        batchId: true,
+        username: true,
+        status: true,
+        portalType: true,
+        email: true,
+      }
+    });
 
     // Create a map of all unique usernames
     const userMap = new Map<string, AdminUserListItem>();
@@ -86,10 +164,17 @@ export async function GET(request: NextRequest) {
       }
     });
 
-    let users = Array.from(userMap.values());
+    const ownershipRecords = await loadAccountOwnershipRecords();
+    const inventory = buildLifecycleAccountInventory({ directoryUsers: ldapUsers, vpnAccounts, ...ownershipRecords });
+    const linkAccess = { requests: actorHasPermission(admin, 'access_requests.read'), batches: actorHasPermission(admin, 'batch.manage') };
+    const ownershipByRef = new Map(inventory.map((account) => [account.accountRef, summarizeAccountOwnership(account, linkAccess)]));
+    let users = Array.from(userMap.values()).map((user) => ({
+      ...user,
+      ownership: ownershipByRef.get(`${user.dn ? 'ad' : 'vpn'}:${user.username.trim().toLowerCase()}`) ?? unavailableAccountOwnership(),
+    }));
     if (query) {
       users = users.filter((user) => (
-        [user.username, user.displayName || '', user.email || '', user.description || '']
+        [user.username, user.displayName || '', user.email || '', user.description || '', user.ownership.requestId || '', user.ownership.batchRunId || '', user.ownership.batchItemId || '']
           .some((value) => value.toLowerCase().includes(query))
       ));
     }
@@ -97,13 +182,16 @@ export async function GET(request: NextRequest) {
       users = users.slice(0, limit);
     }
 
-    const verificationMap = await getAccountVerificationMap(users.map((user) => user.username));
-    users.forEach((user) => {
-      const verification = verificationMap.get(normalizeOffboardIdentifier(user.username));
-      user.lastVerifiedAt = verification?.lastVerifiedAt || null;
-      user.lastVerifiedSource = verification?.lastVerifiedSource || 'none';
-      user.originalRegistrationAt = verification?.originalRegistrationAt || null;
-    });
+    const canReadUsers = actorHasPermission(admin, 'users.read');
+    if (canReadUsers) {
+      const verificationMap = await getAccountVerificationMap(users.map((user) => user.username));
+      users.forEach((user) => {
+        const verification = verificationMap.get(normalizeOffboardIdentifier(user.username));
+        user.lastVerifiedAt = verification?.lastVerifiedAt || null;
+        user.lastVerifiedSource = verification?.lastVerifiedSource || 'none';
+        user.originalRegistrationAt = verification?.originalRegistrationAt || null;
+      });
+    }
 
     // Log viewing the user list
     await logAuditAction({
@@ -121,10 +209,46 @@ export async function GET(request: NextRequest) {
       userAgent: getUserAgent(request),
     });
 
-    return NextResponse.json({ users });
-  } catch (error) {
+    const directory: DirectoryFetchState = ldapUsers.length >= DIRECTORY_RESULT_CAP
+      ? { state: 'result_cap_reached', resultCap: DIRECTORY_RESULT_CAP }
+      : { state: 'success' };
+
+    return NextResponse.json({
+      users: canReadUsers ? users : users.map((user) => ({
+        username: user.username,
+        displayName: user.displayName,
+        email: user.email,
+        accountEnabled: user.accountEnabled,
+        dn: user.dn,
+        vpnDetails: user.vpnDetails,
+      })),
+      directory,
+    });
+  } catch {
+    const diagnosticReference = randomUUID();
+    if (auditUsername) {
+      try {
+        await logAuditAction({
+          action: AuditActions.VIEW_USER_LIST,
+          category: AuditCategories.USER,
+          username: auditUsername,
+          eventKind: 'read',
+          outcome: 'failure',
+          success: false,
+          correlationId: diagnosticReference,
+          details: { dataSource: 'user_directory_aggregation' },
+          ipAddress: getIpAddress(request),
+          userAgent: getUserAgent(request),
+        });
+      } catch {
+        // Do not expose a reference for an audit record that was not written.
+      }
+    }
+
     return NextResponse.json(
-      { error: 'Failed to fetch users from Active Directory', details: error instanceof Error ? error.message : String(error) },
+      {
+        error: 'The user directory data could not be assembled.',
+      },
       { status: 500 }
     );
   }

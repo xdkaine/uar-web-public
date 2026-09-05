@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { runPasswordCleanup } from '@/lib/password-cleanup';
 import { runAllCleanupTasks } from '@/lib/session-cleanup';
 import { secureJsonResponse } from '@/lib/apiResponse';
@@ -11,6 +12,10 @@ export async function POST(request: NextRequest) {
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!actorHasPermission(admin, 'users.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const [passwordResults, cleanupResults] = await Promise.all([

@@ -30,8 +30,8 @@ export default function VPNStatsCards({ stats, isLoading = false }: VPNStatsCard
         {[...Array(5)].map((_, i) => (
           <Card key={i} className="animate-pulse">
             <CardContent className="p-4">
-              <div className="h-6 bg-gray-200 rounded mb-2"></div>
-              <div className="h-8 bg-gray-100 rounded"></div>
+              <div className="h-6 bg-muted rounded mb-2"></div>
+              <div className="h-8 bg-muted rounded"></div>
             </CardContent>
           </Card>
         ))}
@@ -43,25 +43,25 @@ export default function VPNStatsCards({ stats, isLoading = false }: VPNStatsCard
     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
       <Card className="hover:shadow-md transition-shadow">
         <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium text-gray-500">Total Accounts</CardTitle>
+          <CardTitle className="text-sm font-medium text-muted-foreground">Total Accounts</CardTitle>
         </CardHeader>
         <CardContent className="pt-0">
-          <div className="text-2xl font-bold text-gray-900">{stats.total}</div>
-          <div className="text-xs text-gray-500 mt-1 space-x-2">
-            <span className="text-blue-600">{stats.management} Mgmt</span>
-            <span className="text-purple-600">{stats.limited} Ltd</span>
-            <span className="text-orange-600">{stats.external} Ext</span>
+          <div className="text-2xl font-bold text-foreground">{stats.total}</div>
+          <div className="text-xs text-muted-foreground mt-1 space-x-2">
+            <span className="text-blue-600 dark:text-blue-400">{stats.management} Mgmt</span>
+            <span className="text-purple-600 dark:text-purple-400">{stats.limited} Ltd</span>
+            <span className="text-orange-600 dark:text-orange-400">{stats.external} Ext</span>
           </div>
         </CardContent>
       </Card>
 
       <Card className="hover:shadow-md transition-shadow border-l-4 border-l-green-500">
         <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium text-gray-500">Active</CardTitle>
+          <CardTitle className="text-sm font-medium text-muted-foreground">Active</CardTitle>
         </CardHeader>
         <CardContent className="pt-0">
-          <div className="text-2xl font-bold text-green-600">{stats.active}</div>
-          <div className="text-xs text-gray-500 mt-1">
+          <div className="text-2xl font-bold text-green-600 dark:text-green-400">{stats.active}</div>
+          <div className="text-xs text-muted-foreground mt-1">
             {stats.total > 0 ? Math.round((stats.active / stats.total) * 100) : 0}% of total
           </div>
         </CardContent>
@@ -69,11 +69,11 @@ export default function VPNStatsCards({ stats, isLoading = false }: VPNStatsCard
 
       <Card className="hover:shadow-md transition-shadow border-l-4 border-l-yellow-500">
         <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium text-gray-500">Pending Faculty</CardTitle>
+          <CardTitle className="text-sm font-medium text-muted-foreground">Pending Faculty</CardTitle>
         </CardHeader>
         <CardContent className="pt-0">
-          <div className="text-2xl font-bold text-yellow-600">{stats.pendingFaculty}</div>
-          <div className="text-xs text-gray-500 mt-1">
+          <div className="text-2xl font-bold text-yellow-600 dark:text-yellow-400">{stats.pendingFaculty}</div>
+          <div className="text-xs text-muted-foreground mt-1">
             Awaiting approval
           </div>
         </CardContent>
@@ -81,11 +81,11 @@ export default function VPNStatsCards({ stats, isLoading = false }: VPNStatsCard
 
       <Card className="hover:shadow-md transition-shadow border-l-4 border-l-red-500">
         <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium text-gray-500">Disabled</CardTitle>
+          <CardTitle className="text-sm font-medium text-muted-foreground">Disabled</CardTitle>
         </CardHeader>
         <CardContent className="pt-0">
-          <div className="text-2xl font-bold text-red-600">{stats.disabled}</div>
-          <div className="text-xs text-gray-500 mt-1">
+          <div className="text-2xl font-bold text-red-600 dark:text-red-400">{stats.disabled}</div>
+          <div className="text-xs text-muted-foreground mt-1">
             Temporarily disabled
           </div>
         </CardContent>
@@ -93,11 +93,11 @@ export default function VPNStatsCards({ stats, isLoading = false }: VPNStatsCard
 
       <Card className="hover:shadow-md transition-shadow border-l-4 border-l-purple-500">
         <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium text-gray-500">Revoked</CardTitle>
+          <CardTitle className="text-sm font-medium text-muted-foreground">Revoked</CardTitle>
         </CardHeader>
         <CardContent className="pt-0">
-          <div className="text-2xl font-bold text-purple-600">{stats.revoked}</div>
-          <div className="text-xs text-gray-500 mt-1">
+          <div className="text-2xl font-bold text-purple-600 dark:text-purple-400">{stats.revoked}</div>
+          <div className="text-xs text-muted-foreground mt-1">
             Permanently revoked
           </div>
         </CardContent>

@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { requireModuleEnabled } from '@/lib/modules/guards';
+
 import { encryptPassword } from '@/lib/encryption';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 
@@ -21,6 +24,9 @@ export async function GET(request: NextRequest) {
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const { searchParams } = new URL(request.url);
@@ -100,7 +106,12 @@ export async function POST(request: NextRequest) {
         NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
       );
     }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
+    const vpnModuleGuard = await requireModuleEnabled('vpn.management');
+    if (vpnModuleGuard) return vpnModuleGuard;
     const body = await request.json();
     const {
       username,
@@ -157,6 +168,7 @@ export async function POST(request: NextRequest) {
     await prisma.vPNAccountStatusLog.create({
       data: {
         accountId: account.id,
+        liveAccountId: account.id,
         oldStatus: null,
         newStatus: 'pending_faculty',
         changedBy: createdBy,

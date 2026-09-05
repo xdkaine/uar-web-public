@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   clearSessionCookiesOnResponse,
+  getSessionMaxIdleSeconds,
   getSessionMaxAgeSeconds,
   LEGACY_SESSION_COOKIE_NAMES,
   SESSION_COOKIE_NAME,
@@ -43,6 +44,62 @@ describe('getSessionMaxAgeSeconds', () => {
     process.env = { ...ORIGINAL_ENV, AUTH_SESSION_MAX_AGE: '-1' };
 
     expect(getSessionMaxAgeSeconds(true)).toBe(SESSION_TIMEOUTS.admin);
+  });
+
+  it('uses the OIDC session lifetime only for OIDC-backed portal sessions', () => {
+    process.env = {
+      ...ORIGINAL_ENV,
+      AUTH_SESSION_MAX_AGE: undefined,
+      AUTH_OIDC_SESSION_MAX_AGE: '28800',
+    };
+
+    expect(getSessionMaxAgeSeconds(true, 'oidc')).toBe(28800);
+    expect(getSessionMaxAgeSeconds(true, 'ad_manual')).toBe(SESSION_TIMEOUTS.admin);
+    expect(getSessionMaxAgeSeconds(true, 'local')).toBe(SESSION_TIMEOUTS.admin);
+  });
+
+  it('defaults OIDC-backed portal sessions to eight hours', () => {
+    process.env = {
+      ...ORIGINAL_ENV,
+      AUTH_SESSION_MAX_AGE: undefined,
+      AUTH_OIDC_SESSION_MAX_AGE: undefined,
+    };
+
+    expect(getSessionMaxAgeSeconds(true, 'oidc')).toBe(SESSION_TIMEOUTS.oidc);
+  });
+
+  it('does not apply the native/local override to OIDC-backed sessions', () => {
+    process.env = {
+      ...ORIGINAL_ENV,
+      AUTH_SESSION_MAX_AGE: '1800',
+      AUTH_OIDC_SESSION_MAX_AGE: undefined,
+    };
+
+    expect(getSessionMaxAgeSeconds(true, 'oidc')).toBe(SESSION_TIMEOUTS.oidc);
+    expect(getSessionMaxAgeSeconds(true, 'local')).toBe(1800);
+  });
+
+  it.each(['299', '1209601', 'not-a-number'])(
+    'rejects unsafe OIDC session lifetime %s',
+    (configuredLifetime) => {
+      process.env = {
+        ...ORIGINAL_ENV,
+        AUTH_OIDC_SESSION_MAX_AGE: configuredLifetime,
+      };
+
+      expect(() => getSessionMaxAgeSeconds(true, 'oidc')).toThrow(/AUTH_OIDC_SESSION_MAX_AGE/);
+    },
+  );
+
+  it('keeps OIDC idle lifetime aligned with its absolute portal lifetime', () => {
+    process.env = {
+      ...ORIGINAL_ENV,
+      AUTH_OIDC_SESSION_MAX_AGE: '28800',
+    };
+
+    expect(getSessionMaxIdleSeconds('oidc')).toBe(28800);
+    expect(getSessionMaxIdleSeconds('ad_manual')).toBe(SESSION_TIMEOUTS.maxIdle);
+    expect(getSessionMaxIdleSeconds('local')).toBe(SESSION_TIMEOUTS.maxIdle);
   });
 });
 

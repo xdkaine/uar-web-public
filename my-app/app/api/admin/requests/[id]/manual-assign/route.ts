@@ -2,11 +2,30 @@ import { NextRequest, NextResponse } from 'next/server';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorCanActOnStage, actorHasPermission } from '@/lib/rbac/core';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
-import { searchLDAPUser, updateUserAttributes, tagAccountWithAccessRequestId, formatRequestDescription } from '@/lib/ldap';
-import { sendManualAssignmentLinkedEmail } from '@/lib/email';
+import { searchLDAPUser } from '@/lib/ldap';
+import { sendManualAssignmentLinkedEmail, sendWorkflowStageNotification } from '@/lib/email';
+import { getEmailConfig, getStudentDirectorEmails } from '@/lib/email-config';
 import { extractBronconame } from '@/lib/validation';
 import { appLogger } from '@/lib/logger';
+import { isModuleEnabled } from '@/lib/modules/core';
+import { toSafeAccessRequestResponse } from '@/lib/access-request-response';
+import { isProductionCloneReadOnly } from '@/lib/clone-safety';
+import {
+  acquireDirectoryOwnershipFence,
+  directoryObjectIdentity,
+  directoryObjectIdentityMatches,
+  findBatchDirectoryOwnershipClaims,
+  type DirectoryObjectIdentity,
+} from '@/lib/directory-ownership-fence';
+import {
+  findStageIndexByStatus,
+  nextReviewStatusAfter,
+  resolveStageNotificationRecipients,
+  resolveWorkflowForRequest,
+  workflowIntegrityConflict,
+} from '@/lib/workflow/core';
 
 export async function POST(
   request: NextRequest,
@@ -18,6 +37,17 @@ export async function POST(
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'access_requests.provision')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+    if (isProductionCloneReadOnly()) {
+      return NextResponse.json({
+        error: 'Manual directory assignment is disabled in this production-clone environment.',
+        code: 'CLONE_READ_ONLY',
+      }, { status: 409 });
+    }
+
+    const vpnModuleEnabled = await isModuleEnabled('vpn.management');
 
     const resolvedParams = await params;
     const body = await request.json();
@@ -68,6 +98,35 @@ export async function POST(
       );
     }
 
+    if (['in_progress', 'reconciliation_required'].includes(accessRequest.accountUpdateState || '')) {
+      return NextResponse.json(
+        { error: 'Account identity reconciliation must finish before manual assignment can change this request' },
+        { status: 409 }
+      );
+    }
+    if (accessRequest.facultyNotificationState === 'sending') {
+      return NextResponse.json(
+        { error: 'Faculty delivery is in progress; its outcome must settle before manual assignment' },
+        { status: 409 }
+      );
+    }
+
+    const workflow = await resolveWorkflowForRequest(accessRequest);
+    const workflowConflict = workflowIntegrityConflict(workflow);
+    if (workflowConflict) {
+      return NextResponse.json({ error: workflowConflict, code: 'WORKFLOW_RECONCILIATION_REQUIRED' }, { status: 409 });
+    }
+    const currentStageIndex = findStageIndexByStatus(workflow.stages, accessRequest.status);
+    const currentStage = currentStageIndex >= 0 ? workflow.stages[currentStageIndex] : null;
+    if (!currentStage || !actorCanActOnStage(admin, currentStage.reviewerRoleKey)) {
+      return NextResponse.json({ error: 'Manual assignment is unavailable at the current configured review stage.' }, { status: 403 });
+    }
+    const nextStatus = nextReviewStatusAfter(workflow.stages, accessRequest.status);
+    const isFinalStage = nextStatus === null;
+    const nextStage = isFinalStage ? null : workflow.stages[currentStageIndex + 1];
+    const targetStatus = nextStatus ?? 'approved';
+    const vpnTrackingStatus = isFinalStage ? 'active' : targetStatus;
+
     // This stays as a warning because manual assignment is the escape hatch for legacy account mismatches.
     if (accessRequest.isInternal && accessRequest.email && !forceAssignment) {
       const expectedUsername = extractBronconame(accessRequest.email);
@@ -79,7 +138,7 @@ export async function POST(
           providedUsername: linkedAdUsername,
           assignedBy: admin.username,
         });
-        
+
         return NextResponse.json(
           { 
             warning: true,
@@ -95,16 +154,24 @@ export async function POST(
     }
 
     let adDisplayName: string | null = null;
+    let verifiedAdIdentity: DirectoryObjectIdentity | null = null;
     try {
       const adUser = await searchLDAPUser(linkedAdUsername);
       if (!adUser) {
         return NextResponse.json(
-          { error: `Active Directory account "${linkedAdUsername}" not found in LDAP` },
+          { error: `Directory account "${linkedAdUsername}" was not found in Active Directory` },
           { status: 404 }
         );
       }
       const displayNameAttr = adUser.attributes.find(attr => attr.type === 'cn' || attr.type === 'displayName');
       adDisplayName = displayNameAttr?.values[0] || null;
+      verifiedAdIdentity = directoryObjectIdentity(adUser);
+      if (!verifiedAdIdentity) {
+        return NextResponse.json(
+          { error: 'The Active Directory account has no immutable identity evidence and cannot be linked safely.' },
+          { status: 409 }
+        );
+      }
     } catch (ldapError) {
       console.error('LDAP search error:', ldapError);
       return NextResponse.json(
@@ -113,12 +180,12 @@ export async function POST(
       );
     }
 
-    if (!accessRequest.isInternal && linkedVpnUsername && linkedVpnUsername.trim() !== '') {
+    if (vpnModuleEnabled && !accessRequest.isInternal && linkedVpnUsername && linkedVpnUsername.trim() !== '') {
       try {
         const vpnUser = await searchLDAPUser(linkedVpnUsername);
         if (!vpnUser) {
           return NextResponse.json(
-            { error: `VPN account "${linkedVpnUsername}" not found in LDAP` },
+            { error: `VPN account "${linkedVpnUsername}" was not found in Active Directory` },
             { status: 404 }
           );
         }
@@ -131,51 +198,62 @@ export async function POST(
       }
     }
 
-    // Rejected and campaign-offboarded requests do not reserve usernames.
-    const existingRequestWithUsername = await prisma.accessRequest.findFirst({
-      where: {
-        ldapUsername: linkedAdUsername.trim(),
-        id: { not: resolvedParams.id },
-        status: { notIn: ['rejected', 'offboarded'] },
-      },
-      select: { id: true, name: true, email: true, status: true },
-    });
-
-    if (existingRequestWithUsername) {
-      return NextResponse.json(
-        { 
-          error: `Active Directory username "${linkedAdUsername}" is already assigned to another request (${existingRequestWithUsername.name} - ${existingRequestWithUsername.email}, status: ${existingRequestWithUsername.status})` 
-        },
-        { status: 409 }
-      );
-    }
-
-    if (!accessRequest.isInternal) {
-      const vpnUsernameToCheck = linkedVpnUsername?.trim() || linkedAdUsername.trim();
-      const existingRequestWithVpnUsername = await prisma.accessRequest.findFirst({
-        where: {
-          vpnUsername: vpnUsernameToCheck,
-          id: { not: resolvedParams.id },
-          status: { notIn: ['rejected', 'offboarded'] },
-        },
-        select: { id: true, name: true, email: true, status: true },
-      });
-
-      if (existingRequestWithVpnUsername) {
-        return NextResponse.json(
-          { 
-            error: `VPN username "${vpnUsernameToCheck}" is already assigned to another request (${existingRequestWithVpnUsername.name} - ${existingRequestWithVpnUsername.email}, status: ${existingRequestWithVpnUsername.status})` 
-          },
-          { status: 409 }
-        );
-      }
-    }
-
     let updatedRequest;
     
     try {
       const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         console.log(`[Manual Assignment] Starting transaction for request ${resolvedParams.id}`);
+        const canonicalAdUsername = linkedAdUsername.trim().toLowerCase();
+        await acquireDirectoryOwnershipFence(tx, canonicalAdUsername);
+        const currentAdUser = await searchLDAPUser(canonicalAdUsername);
+        if (!verifiedAdIdentity || !directoryObjectIdentityMatches(verifiedAdIdentity, currentAdUser)) {
+          throw new Error(`Active Directory identity "${linkedAdUsername}" changed before portal ownership was reserved.`);
+        }
+        const existingAdOwner = await tx.accessRequest.findFirst({
+          where: {
+            id: { not: resolvedParams.id },
+            status: { notIn: ['rejected', 'offboarded'] },
+            OR: [
+              { ldapUsername: { equals: linkedAdUsername.trim(), mode: 'insensitive' } },
+              { linkedAdUsername: { equals: linkedAdUsername.trim(), mode: 'insensitive' } },
+            ],
+          },
+          select: { id: true },
+        });
+        if (existingAdOwner) {
+          throw new Error(`Active Directory username "${linkedAdUsername}" already has an active portal owner.`);
+        }
+        const batchAdOwners = await findBatchDirectoryOwnershipClaims(tx, canonicalAdUsername, 'AD');
+        if (batchAdOwners.length > 0) {
+          throw new Error(`Active Directory username "${linkedAdUsername}" already has an active batch run owner.`);
+        }
+
+        if (vpnModuleEnabled && !accessRequest.isInternal) {
+          const vpnUsername = linkedVpnUsername?.trim() || linkedAdUsername.trim();
+          const canonicalVpnUsername = vpnUsername.toLowerCase();
+          await tx.$queryRaw<Array<{ lock_acquired: string }>>`
+            SELECT 'locked'::text AS lock_acquired
+            FROM pg_advisory_xact_lock(hashtextextended(${canonicalVpnUsername}, 873212))
+          `;
+          const existingVpnOwner = await tx.accessRequest.findFirst({
+            where: {
+              id: { not: resolvedParams.id },
+              status: { notIn: ['rejected', 'offboarded'] },
+              OR: [
+                { vpnUsername: { equals: vpnUsername, mode: 'insensitive' } },
+                { linkedVpnUsername: { equals: vpnUsername, mode: 'insensitive' } },
+              ],
+            },
+            select: { id: true },
+          });
+          if (existingVpnOwner) {
+            throw new Error(`VPN username "${vpnUsername}" already has an active portal owner.`);
+          }
+          const batchVpnOwners = await findBatchDirectoryOwnershipClaims(tx, canonicalVpnUsername, 'VPN');
+          if (batchVpnOwners.length > 0) {
+            throw new Error(`VPN username "${vpnUsername}" already has an active batch run owner.`);
+          }
+        }
         
         const updateData: Prisma.AccessRequestUpdateManyMutationInput = {
           isManuallyAssigned: true,
@@ -183,15 +261,28 @@ export async function POST(
           manuallyAssignedBy: admin.username,
           linkedAdUsername: linkedAdUsername.trim(),
           manualAssignmentNotes: notes?.trim() || null,
-          status: 'approved',
-          approvedAt: new Date(),
-          approvedBy: admin.username,
+          status: targetStatus,
+          ...(isFinalStage
+            ? { approvedAt: new Date(), approvedBy: admin.username }
+            : {
+                acknowledgedByDirector: true,
+                acknowledgedAt: new Date(),
+                acknowledgedBy: admin.username,
+                stageNotificationState: 'delivery_unknown',
+                stageNotificationStageKey: nextStage!.key,
+                stageNotificationError: `Delivery to ${nextStage!.label} has not been confirmed.`,
+                stageNotificationStateChangedAt: new Date(),
+              }),
           accountCreatedAt: new Date(),
           ldapUsername: linkedAdUsername.trim(),
+          provisioningState: 'reconciliation_pending',
+          provisioningStartedAt: new Date(),
+          provisioningCompletedAt: null,
+          provisioningError: null,
           version: { increment: 1 },
         };
 
-        if (!accessRequest.isInternal) {
+        if (vpnModuleEnabled && !accessRequest.isInternal) {
           updateData.linkedVpnUsername = linkedVpnUsername?.trim() || linkedAdUsername.trim();
           updateData.vpnUsername = linkedVpnUsername?.trim() || linkedAdUsername.trim();
         }
@@ -202,7 +293,18 @@ export async function POST(
           where: { 
             id: resolvedParams.id,
             version: accessRequest.version,
-            status: { in: ['pending_verification', 'pending_student_directors', 'pending_faculty'] },
+            status: accessRequest.status,
+            AND: [{
+              OR: [
+                { accountUpdateState: null },
+                { accountUpdateState: { in: ['failed', 'succeeded'] } },
+              ],
+            }, {
+              OR: [
+                { facultyNotificationState: null },
+                { facultyNotificationState: { not: 'sending' } },
+              ],
+            }],
           },
           data: updateData,
         });
@@ -239,7 +341,7 @@ export async function POST(
 
         console.log(`[Manual Assignment] Creating comment for audit trail`);
         let commentText = `Request manually assigned to existing Active Directory account: ${linkedAdUsername}`;
-        if (accessRequest.isInternal) {
+        if (vpnModuleEnabled && accessRequest.isInternal) {
           const vpnUsername = extractBronconame(accessRequest.email) || linkedAdUsername.trim();
           commentText += `\nVPN account created/updated: ${vpnUsername} (Internal - Limited Portal)`;
           commentText += `\nLinked AD account: ${linkedAdUsername}`;
@@ -248,7 +350,7 @@ export async function POST(
             commentText += `\nNote: Request email (${accessRequest.email}) bronconame differs from AD username (${linkedAdUsername})`;
             commentText += `\nThis is a manual assignment to an existing account.`;
           }
-        } else if (linkedVpnUsername && linkedVpnUsername.trim() !== '') {
+        } else if (vpnModuleEnabled && !accessRequest.isInternal && linkedVpnUsername && linkedVpnUsername.trim() !== '') {
           commentText += `\nLinked VPN account: ${linkedVpnUsername}`;
         }
         if (notes && notes.trim()) {
@@ -265,7 +367,9 @@ export async function POST(
           },
         });
 
-        if (!accessRequest.isInternal) {
+        // VPN tracking updates: skipped entirely when VPN management is
+        // disabled; historical records stay untouched.
+        if (vpnModuleEnabled && !accessRequest.isInternal) {
           const vpnAccountUsername = linkedVpnUsername?.trim() || linkedAdUsername.trim();
           
           console.log(`[Manual Assignment] Checking for VPN account: ${vpnAccountUsername}`);
@@ -280,9 +384,8 @@ export async function POST(
               data: {
                 email: accessRequest.email,
                 name: accessRequest.name,
-                status: 'active',
-                createdByFaculty: true,
-                facultyCreatedAt: new Date(),
+                status: vpnTrackingStatus,
+                ...(isFinalStage ? { createdByFaculty: true, facultyCreatedAt: new Date() } : {}),
                 adUsername: linkedAdUsername.trim(),
               },
             });
@@ -290,8 +393,9 @@ export async function POST(
             await tx.vPNAccountStatusLog.create({
               data: {
                 accountId: vpnAccount.id,
+                liveAccountId: vpnAccount.id,
                 oldStatus: vpnAccount.status,
-                newStatus: 'active',
+                newStatus: vpnTrackingStatus,
                 changedBy: admin.username,
                 reason: 'Manually assigned to access request',
               },
@@ -302,7 +406,7 @@ export async function POST(
           }
         }
 
-        if (accessRequest.isInternal) {
+        if (vpnModuleEnabled && accessRequest.isInternal) {
           console.log(`[Manual Assignment] Creating VPN account record for internal user`);
           try {
             const vpnUsername = extractBronconame(accessRequest.email) || linkedAdUsername.trim();
@@ -323,11 +427,10 @@ export async function POST(
                 data: {
                   email: accessRequest.email,
                   name: vpnAccountName,
-                  status: 'active',
+                  status: vpnTrackingStatus,
                   portalType: 'Limited',
                   isInternal: true,
-                  createdByFaculty: true,
-                  facultyCreatedAt: new Date(),
+                  ...(isFinalStage ? { createdByFaculty: true, facultyCreatedAt: new Date() } : {}),
                   adUsername: linkedAdUsername.trim(),
                 },
               });
@@ -335,8 +438,9 @@ export async function POST(
               await tx.vPNAccountStatusLog.create({
                 data: {
                   accountId: existingVpnAccount.id,
+                  liveAccountId: existingVpnAccount.id,
                   oldStatus: existingVpnAccount.status,
-                  newStatus: 'active',
+                  newStatus: vpnTrackingStatus,
                   changedBy: admin.username,
                   reason: 'Manually assigned to access request',
                 },
@@ -351,11 +455,11 @@ export async function POST(
                   email: accessRequest.email,
                   portalType: 'Limited',
                   isInternal: true,
-                  status: 'active',
+                  status: vpnTrackingStatus,
                   password: '',
                   createdBy: admin.username,
-                  createdByFaculty: true,
-                  facultyCreatedAt: new Date(),
+                  createdByFaculty: isFinalStage,
+                  ...(isFinalStage ? { facultyCreatedAt: new Date() } : {}),
                   adUsername: linkedAdUsername.trim(),
                 },
               });
@@ -363,8 +467,9 @@ export async function POST(
               await tx.vPNAccountStatusLog.create({
                 data: {
                   accountId: newVpnAccount.id,
-                  oldStatus: 'pending_faculty',
-                  newStatus: 'active',
+                  liveAccountId: newVpnAccount.id,
+                  oldStatus: null,
+                  newStatus: vpnTrackingStatus,
                   changedBy: admin.username,
                   reason: 'Created via manual assignment of access request',
                 },
@@ -419,7 +524,112 @@ export async function POST(
       throw transactionError;
     }
 
-    console.log(`[Manual Assignment] Logging successful assignment to audit log`);
+    const finalized = await prisma.accessRequest.updateMany({
+      where: {
+        id: resolvedParams.id,
+        version: updatedRequest.version,
+        status: targetStatus,
+        provisioningState: 'reconciliation_pending',
+      },
+      data: {
+        provisioningState: 'completed',
+        provisioningCompletedAt: new Date(),
+        provisioningError: null,
+        version: { increment: 1 },
+      },
+    });
+    if (finalized.count !== 1) {
+      await logAuditAction({
+        action: AuditActions.MANUAL_ASSIGN_REQUEST,
+        category: AuditCategories.ACCESS_REQUEST,
+        username: admin.username,
+        actorType: 'admin',
+        targetId: resolvedParams.id,
+        targetType: 'AccessRequest',
+        subjectUsername: linkedAdUsername.trim(),
+        subjectEmail: updatedRequest.email,
+        relatedRequestId: resolvedParams.id,
+        eventKind: 'write',
+        outcome: 'failure',
+        details: { directoryAccountObserved: true, reconciliationConflict: true },
+        ipAddress: getIpAddress(request),
+        userAgent: getUserAgent(request),
+        success: false,
+        errorMessage: 'Request changed before directory reconciliation could be finalized',
+      });
+      return NextResponse.json({
+        success: false,
+        code: 'RECONCILIATION_CONFLICT',
+        error: 'The directory identity was confirmed, but the request changed before finalization. Refresh and reconcile its current state.',
+      }, { status: 409 });
+    }
+    const finalizedRequest = await prisma.accessRequest.findUnique({ where: { id: resolvedParams.id } });
+    if (!finalizedRequest) {
+      return NextResponse.json({ error: 'The finalized request could not be loaded.' }, { status: 409 });
+    }
+    updatedRequest = finalizedRequest;
+
+    let stageNotificationStatus = isFinalStage ? 'not_applicable' : 'delivery_unknown';
+    if (nextStage) {
+      let stageRecipients: string[] = [];
+      try {
+        stageRecipients = await resolveStageNotificationRecipients(nextStage, async () => {
+          if (nextStage.reviewerRoleKey === 'faculty') {
+            const emailConfig = await getEmailConfig();
+            return emailConfig.facultyEmail ? [emailConfig.facultyEmail] : [];
+          }
+          return getStudentDirectorEmails();
+        });
+        if (stageRecipients.length === 0) {
+          stageNotificationStatus = 'not_configured';
+        } else {
+          await sendWorkflowStageNotification({
+            recipients: stageRecipients,
+            requestId: resolvedParams.id,
+            requestName: updatedRequest.name,
+            requestEmail: updatedRequest.email,
+            stageLabel: nextStage.label,
+            advancedBy: admin.username,
+          });
+          stageNotificationStatus = 'delivered';
+        }
+      } catch (emailError) {
+        console.error('[Manual Assignment] Configured stage notification outcome is unknown:', emailError);
+        stageNotificationStatus = stageRecipients.length > 0 ? 'delivery_unknown' : 'not_configured';
+      }
+
+      const persistedState = stageNotificationStatus === 'delivered'
+        ? 'delivered'
+        : stageNotificationStatus === 'not_configured'
+          ? 'failed'
+          : 'delivery_unknown';
+      const persistedError = persistedState === 'delivered'
+        ? null
+        : persistedState === 'failed'
+          ? `No notification recipient is configured for ${nextStage.label}.`
+          : `Delivery to ${nextStage.label} could not be confirmed. Reconcile the provider outcome before retrying.`;
+      const notificationUpdate = await prisma.accessRequest.updateMany({
+        where: {
+          id: resolvedParams.id,
+          version: updatedRequest.version,
+          status: targetStatus,
+          stageNotificationStageKey: nextStage.key,
+          stageNotificationState: 'delivery_unknown',
+        },
+        data: {
+          stageNotificationState: persistedState,
+          stageNotificationError: persistedError,
+          stageNotificationStateChangedAt: new Date(),
+          version: { increment: 1 },
+        },
+      });
+      if (notificationUpdate.count === 1) {
+        updatedRequest = await prisma.accessRequest.findUnique({ where: { id: resolvedParams.id } }) || updatedRequest;
+      } else {
+        stageNotificationStatus = 'delivery_unknown';
+      }
+    }
+
     await logAuditAction({
       action: AuditActions.MANUAL_ASSIGN_REQUEST,
       category: AuditCategories.ACCESS_REQUEST,
@@ -440,54 +650,16 @@ export async function POST(
         isInternal: accessRequest.isInternal,
         manuallyAssigned: true,
         notes: notes?.trim() || null,
+        directoryAccountObserved: true,
+        stageNotificationStatus,
+        stageNotificationStageKey: nextStage?.key || null,
       },
       ipAddress: getIpAddress(request),
       userAgent: getUserAgent(request),
       success: true,
     });
 
-    console.log(`[Manual Assignment] Request ${resolvedParams.id} successfully manually assigned to ${linkedAdUsername}`);
-
-    const ldapWarnings: string[] = [];
-
-    // LDAP updates happen after commit so directory failures do not roll back the request link.
-    if (accessRequest.isInternal) {
-      console.log(`[Manual Assignment] Updating AD account email and description for internal user`);
-      try {
-        await updateUserAttributes(linkedAdUsername.trim(), {
-          mail: accessRequest.email,
-          description: formatRequestDescription(resolvedParams.id),
-        });
-        
-        console.log(`[Manual Assignment] AD account email and description updated successfully`);
-      } catch (ldapUpdateError) {
-        const errorMsg = `Failed to update AD account email/description: ${ldapUpdateError instanceof Error ? ldapUpdateError.message : 'Unknown error'}`;
-        console.error(`[Manual Assignment] ${errorMsg}`);
-        ldapWarnings.push(errorMsg);
-        appLogger.warn('Manual assignment completed but AD email/description update failed', {
-          requestId: resolvedParams.id,
-          linkedAdUsername: linkedAdUsername.trim(),
-          error: ldapUpdateError instanceof Error ? ldapUpdateError.message : 'Unknown error',
-        });
-      }
-
-      console.log(`[Manual Assignment] Tagging AD account with Access Request ID`);
-      try {
-        await tagAccountWithAccessRequestId(linkedAdUsername.trim(), resolvedParams.id);
-        console.log(`[Manual Assignment] AD account tagged successfully with Request ID: ${resolvedParams.id}`);
-      } catch (tagError) {
-        const errorMsg = `Failed to tag AD account with Request ID: ${tagError instanceof Error ? tagError.message : 'Unknown error'}`;
-        console.error(`[Manual Assignment] ${errorMsg}`);
-        ldapWarnings.push(errorMsg);
-        appLogger.warn('Manual assignment completed but AD tagging failed', {
-          requestId: resolvedParams.id,
-          linkedAdUsername: linkedAdUsername.trim(),
-          error: tagError instanceof Error ? tagError.message : 'Unknown error',
-        });
-      }
-    }
-
-    if (accessRequest.isInternal) {
+    if (accessRequest.isInternal && isFinalStage) {
       console.log('[Manual Assignment] Sending linkage confirmation email to internal requester');
       try {
         await sendManualAssignmentLinkedEmail({
@@ -505,10 +677,13 @@ export async function POST(
     }
 
     return NextResponse.json({
-      message: 'Request successfully linked to existing account',
-      request: updatedRequest,
-      warnings: ldapWarnings.length > 0 ? ldapWarnings : undefined,
-    });
+      message: isFinalStage
+        ? 'Request linked to the existing account and approved at its final review stage'
+        : `Request linked to the existing account and moved to ${workflow.stages[currentStageIndex + 1]?.label || 'the next review stage'}`,
+      request: toSafeAccessRequestResponse(updatedRequest),
+      partial: !isFinalStage && stageNotificationStatus !== 'delivered',
+      stageNotificationStatus,
+    }, { status: stageNotificationStatus === 'delivery_unknown' ? 202 : 200 });
   } catch (error) {
     console.error('[Manual Assignment] Fatal error:', error);
     
@@ -525,6 +700,10 @@ export async function POST(
       } else if (errorMessage.includes('status has changed')) {
         statusCode = 409;
       } else if (errorMessage.includes('Transaction rolled back')) {
+        statusCode = 409;
+      } else if (errorMessage.includes('already has an active portal owner')) {
+        statusCode = 409;
+      } else if (errorMessage.includes('already has an active batch run owner')) {
         statusCode = 409;
       }
     }

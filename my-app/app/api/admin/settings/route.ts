@@ -1,14 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import logger from '@/lib/logger';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { validateAuthModeWrite } from '@/lib/auth/mode';
 import { isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit, validateEmail, validateStringLength } from '@/lib/validation';
 
 export const dynamic = 'force-dynamic';
 
+const DEFAULT_SYSTEM_SETTINGS = {
+  loginDisabled: false,
+  internalRegistrationDisabled: false,
+  externalRegistrationDisabled: false,
+  globalNotificationBanner: null,
+  notificationBannerType: null,
+  manualOverride: false,
+  authMode: null,
+  lastModifiedBy: null,
+  emailFrom: null,
+  adminEmail: null,
+  facultyEmail: null,
+  studentDirectorEmails: null,
+} as const;
+
 interface SettingsUpdateBody {
   loginDisabled?: unknown;
+  authMode?: unknown;
   internalRegistrationDisabled?: unknown;
   externalRegistrationDisabled?: unknown;
   globalNotificationBanner?: unknown;
@@ -23,6 +41,7 @@ interface SettingsUpdateBody {
 type SettingsUpdateData = {
   lastModifiedBy: string;
   loginDisabled?: boolean;
+  authMode?: string | null;
   internalRegistrationDisabled?: boolean;
   externalRegistrationDisabled?: boolean;
   globalNotificationBanner?: string | null;
@@ -117,30 +136,20 @@ export async function GET(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    // Get or create settings
-    let settings = await prisma.systemSettings.findFirst({
+    if (!actorHasPermission(admin, 'settings.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    const persistedSettings = await prisma.systemSettings.findFirst({
       orderBy: { createdAt: 'desc' },
     });
-
-    // If no settings exist, create default settings
-    if (!settings) {
-      settings = await prisma.systemSettings.create({
-        data: {
-          loginDisabled: false,
-          internalRegistrationDisabled: false,
-          externalRegistrationDisabled: false,
-          globalNotificationBanner: null,
-          notificationBannerType: null,
-          manualOverride: false,
-        },
-      });
-      
-      logger.info('Created default system settings', {
-        action: 'create_default_settings',
-        settingsId: settings.id,
-        createdBy: admin.username,
-      });
-    }
+    // Reading an unconfigured installation must not persist policy or imply a save.
+    const settings = persistedSettings ?? {
+      ...DEFAULT_SYSTEM_SETTINGS,
+      id: null,
+      createdAt: null,
+      updatedAt: null,
+    };
 
     return NextResponse.json({
       settings: {
@@ -171,9 +180,14 @@ export async function PATCH(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
+    if (!actorHasPermission(admin, 'settings.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
     const body = await parseJsonWithLimit<SettingsUpdateBody>(request, MAX_REQUEST_BODY_SIZE.SMALL);
     const {
       loginDisabled,
+      authMode,
       internalRegistrationDisabled,
       externalRegistrationDisabled,
       globalNotificationBanner,
@@ -219,23 +233,37 @@ export async function PATCH(request: NextRequest) {
     // If no settings exist, create them
     if (!currentSettings) {
       currentSettings = await prisma.systemSettings.create({
-        data: {
-          loginDisabled: false,
-          internalRegistrationDisabled: false,
-          externalRegistrationDisabled: false,
-          globalNotificationBanner: null,
-          notificationBannerType: null,
-          manualOverride: false,
-        },
+        data: DEFAULT_SYSTEM_SETTINGS,
       });
     }
 
-    // Check if trying to re-enable logins when manual override is active
-    if (currentSettings.manualOverride && currentSettings.loginDisabled && loginDisabled === false) {
+    // A live manual override can only be cleared through the documented database procedure.
+    const clearsManualLoginLock =
+      currentSettings.manualOverride &&
+      (
+        manualOverride === false ||
+        (currentSettings.loginDisabled && loginDisabled === false)
+      );
+
+    if (clearsManualLoginLock) {
       return NextResponse.json(
         { error: 'Login re-enabling is locked. Manual database override is required to unlock this setting.' },
         { status: 403 }
       );
+    }
+
+    if (
+      loginDisabled === false &&
+      !currentSettings.manualOverride &&
+      currentSettings.lastModifiedBy?.startsWith('break-glass:')
+    ) {
+      const recoveryOperator = currentSettings.lastModifiedBy.split(':')[1]?.toLowerCase();
+      if (recoveryOperator === admin.username.toLowerCase()) {
+        return NextResponse.json(
+          { error: 'A different authenticated administrator must re-enable logins after break-glass recovery.' },
+          { status: 403 }
+        );
+      }
     }
 
     // Prepare update data
@@ -243,6 +271,13 @@ export async function PATCH(request: NextRequest) {
       lastModifiedBy: admin.username,
     };
 
+    if (authMode !== undefined) {
+      const verdict = await validateAuthModeWrite(authMode);
+      if (!verdict.ok) {
+        return NextResponse.json({ error: verdict.error }, { status: 400 });
+      }
+      updateData.authMode = verdict.value;
+    }
     if (loginDisabled !== undefined) updateData.loginDisabled = loginDisabled as boolean;
     if (internalRegistrationDisabled !== undefined) updateData.internalRegistrationDisabled = internalRegistrationDisabled as boolean;
     if (externalRegistrationDisabled !== undefined) updateData.externalRegistrationDisabled = externalRegistrationDisabled as boolean;
@@ -259,6 +294,9 @@ export async function PATCH(request: NextRequest) {
     // Update manualOverride if login is being disabled
     if (manualOverride !== undefined) {
       updateData.manualOverride = manualOverride as boolean;
+    }
+    if (manualOverride === true) {
+      updateData.loginDisabled = true;
     }
 
     // Update email configuration
@@ -286,10 +324,35 @@ export async function PATCH(request: NextRequest) {
     }
     if (studentDirectorEmails !== undefined) updateData.studentDirectorEmails = normalizedDirectorEmails.value ?? null;
 
-    const updatedSettings = await prisma.systemSettings.update({
-      where: { id: currentSettings.id },
-      data: updateData,
-    });
+    let updatedSettings;
+    if (loginDisabled === false || manualOverride === false) {
+      const updateResult = await prisma.systemSettings.updateMany({
+        where: {
+          id: currentSettings.id,
+          manualOverride: false,
+        },
+        data: updateData,
+      });
+
+      if (updateResult.count !== 1) {
+        return NextResponse.json(
+          { error: 'Login re-enabling is locked. Manual database override is required to unlock this setting.' },
+          { status: 403 }
+        );
+      }
+
+      updatedSettings = await prisma.systemSettings.findUnique({
+        where: { id: currentSettings.id },
+      });
+      if (!updatedSettings) {
+        throw new Error('Updated system settings could not be loaded');
+      }
+    } else {
+      updatedSettings = await prisma.systemSettings.update({
+        where: { id: currentSettings.id },
+        data: updateData,
+      });
+    }
 
     // Clear email config cache when email settings are updated
     if (emailFrom !== undefined || adminEmail !== undefined || facultyEmail !== undefined || studentDirectorEmails !== undefined) {

@@ -4,10 +4,20 @@ import { randomBytes, createHash } from 'crypto';
 import { sendAccountReadyEmail, sendAccountActivationEmail } from '@/lib/email';
 import { disableLDAPUser, enableLDAPUser, setLDAPUserExpiration } from '@/lib/ldap';
 import { prisma } from '@/lib/prisma';
-import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { checkReviewAccessWithRateLimit } from '@/lib/adminAuth';
 import { decryptPassword } from '@/lib/encryption';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { isModuleEnabled } from '@/lib/modules/core';
+import { actorCanActOnStage } from '@/lib/rbac/core';
+import {
+  findStageIndexByStatus,
+  isFinalStageStatus,
+  resolveWorkflowForRequest,
+  workflowIntegrityConflict,
+} from '@/lib/workflow/core';
+import { evaluateApprovalSeparationOfDuties } from '@/lib/workflow/sod';
 import { extractBronconame, isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit } from '@/lib/validation';
+import { toSafeAccessRequestResponse } from '@/lib/access-request-response';
 
 const APPROVAL_STATE_IN_PROGRESS = 'approval_in_progress';
 const APPROVAL_STATE_FAILED = 'approval_failed';
@@ -118,6 +128,7 @@ async function activateVpnAccount(
     await prisma.vPNAccountStatusLog.create({
       data: {
         accountId: vpnAccount.id,
+        liveAccountId: vpnAccount.id,
         oldStatus: vpnAccount.status,
         newStatus: 'active',
         changedBy: adminUsername,
@@ -136,9 +147,10 @@ export async function POST(
 ) {
   let requestId: string | null = null;
   let adminUsername: string | null = null;
+  let approvalStageRoleKey: string | null = null;
 
   try {
-    const { admin, response } = await checkAdminAuthWithRateLimit(request);
+    const { admin, response } = await checkReviewAccessWithRateLimit(request);
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
@@ -154,6 +166,68 @@ export async function POST(
     }
     const approvalMessage = typeof body.message === 'string' ? body.message.trim() : '';
 
+    const vpnModuleEnabled = await isModuleEnabled('vpn.management');
+
+    // Governance precheck OUTSIDE the serializable section: a denial must not
+    // leave a claimed (approval_in_progress) request behind.
+    let sodEvaluation: Awaited<ReturnType<typeof evaluateApprovalSeparationOfDuties>> | null = null;
+    {
+      const preCheck = await prisma.accessRequest.findUnique({
+        where: { id: resolvedParams.id },
+        select: {
+          status: true,
+          workflowVersionId: true,
+          acknowledgedBy: true,
+          acknowledgedAt: true,
+          sentToFacultyBy: true,
+          sentToFacultyAt: true,
+          manuallyAssignedBy: true,
+          manuallyAssignedAt: true,
+        },
+      });
+      if (!preCheck) {
+        throw new HttpError('Request not found', 404);
+      }
+      const preWorkflow = await resolveWorkflowForRequest(preCheck);
+      const preWorkflowConflict = workflowIntegrityConflict(preWorkflow);
+      if (preWorkflowConflict) throw new HttpError(preWorkflowConflict, 409);
+      if (!isFinalStageStatus(preWorkflow.stages, preCheck.status)) {
+        throw new HttpError(
+          `Request status is ${preCheck.status}, expected the final review stage of workflow v${preWorkflow.version}`,
+          409
+        );
+      }
+      approvalStageRoleKey =
+        preWorkflow.stages[
+          findStageIndexByStatus(preWorkflow.stages, preCheck.status)
+        ].reviewerRoleKey;
+
+      if (!actorCanActOnStage(admin, approvalStageRoleKey)) {
+        return NextResponse.json(
+          {
+            error: 'You do not have the reviewer role required to approve requests at this stage.',
+            code: 'MISSING_STAGE_ROLE',
+          },
+          { status: 403 }
+        );
+      }
+
+      // Segregation-of-duties evaluation happens BEFORE any claim or external
+      // side effect, so "block" mode leaves the request untouched.
+      sodEvaluation = await evaluateApprovalSeparationOfDuties(preCheck, admin.username);
+      if (sodEvaluation.mode === 'block' && sodEvaluation.violated) {
+        return NextResponse.json(
+          {
+            error:
+              'Blocked by segregation-of-duties policy: this request was acknowledged/assigned by you at an earlier stage. Another reviewer must perform the final approval.',
+            code: 'SOD_BLOCKED',
+            priorActions: sodEvaluation.priorActions,
+          },
+          { status: 403 }
+        );
+      }
+    }
+
       const { accessRequest, lockedVersion } = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const requestRecord = await tx.accessRequest.findUnique({
         where: { id: resolvedParams.id },
@@ -166,23 +240,41 @@ export async function POST(
       if (!requestRecord.isVerified) {
         throw new HttpError('Cannot approve unverified request');
       }
+      if (['in_progress', 'reconciliation_required'].includes(requestRecord.accountUpdateState || '')) {
+        throw new HttpError('Account identity reconciliation must finish before approval', 409);
+      }
+      if (requestRecord.facultyNotificationState === 'sending') {
+        throw new HttpError('Faculty delivery is in progress; its outcome must settle before approval', 409);
+      }
+      if (requestRecord.provisioningState === 'reconciliation_pending') {
+        throw new HttpError('Directory reconciliation is in progress; wait for it to finish before approval', 409);
+      }
 
-      if (requestRecord.status !== 'pending_faculty') {
+      // Resolve the governance workflow this request is pinned to. Approval
+      // happens at the final configured review stage, whatever its label is.
+      const workflow = await resolveWorkflowForRequest(requestRecord);
+      const workflowConflict = workflowIntegrityConflict(workflow);
+      if (workflowConflict) throw new HttpError(workflowConflict, 409);
+
+      if (!isFinalStageStatus(workflow.stages, requestRecord.status)) {
         throw new HttpError(
-          `Request status is ${requestRecord.status}, expected pending_faculty`,
+          `Request status is ${requestRecord.status}, expected the final review stage of workflow v${workflow.version}`,
           409
         );
       }
 
+      approvalStageRoleKey =
+        workflow.stages[findStageIndexByStatus(workflow.stages, requestRecord.status)].reviewerRoleKey;
+
       if (!requestRecord.ldapUsername) {
-        throw new HttpError('LDAP username must be set by Student Directors before approval');
+        throw new HttpError('A directory username must be set before approval');
       }
 
       if (!requestRecord.isInternal && !requestRecord.accountPassword) {
         throw new HttpError('Account credentials must be set by Student Directors before approval for external users');
       }
 
-      if (!requestRecord.isInternal && !requestRecord.vpnUsername) {
+      if (vpnModuleEnabled && !requestRecord.isInternal && !requestRecord.vpnUsername) {
         throw new HttpError('VPN Username must be set for external users before approval');
       }
 
@@ -190,18 +282,35 @@ export async function POST(
         where: {
           id: resolvedParams.id,
           version: requestRecord.version,
-          status: 'pending_faculty',
+          status: requestRecord.status,
           isVerified: true,
-          OR: [
-            { provisioningState: null },
+          AND: [
             {
-              provisioningState: {
-                notIn: [
-                  APPROVAL_STATE_IN_PROGRESS,
-                  REJECTION_STATE_IN_PROGRESS,
-                  ACCOUNT_CREATION_IN_PROGRESS,
-                ],
-              },
+              OR: [
+                { provisioningState: null },
+                {
+                  provisioningState: {
+                    notIn: [
+                      APPROVAL_STATE_IN_PROGRESS,
+                      REJECTION_STATE_IN_PROGRESS,
+                      ACCOUNT_CREATION_IN_PROGRESS,
+                      'reconciliation_pending',
+                    ],
+                  },
+                },
+              ],
+            },
+            {
+              OR: [
+                { accountUpdateState: null },
+                { accountUpdateState: { in: ['failed', 'succeeded'] } },
+              ],
+            },
+            {
+              OR: [
+                { facultyNotificationState: null },
+                { facultyNotificationState: { not: 'sending' } },
+              ],
             },
           ],
         },
@@ -232,13 +341,14 @@ export async function POST(
 
     const ldapUsername = accessRequest.ldapUsername;
     if (!ldapUsername) {
-      throw new HttpError('LDAP username must be set by Student Directors before approval');
+      throw new HttpError('A directory username must be set before approval');
     }
 
     try {
       await enableLDAPUser(ldapUsername);
 
       if (
+        vpnModuleEnabled &&
         !accessRequest.isInternal &&
         accessRequest.vpnUsername &&
         accessRequest.vpnUsername !== ldapUsername
@@ -275,7 +385,7 @@ export async function POST(
         where: {
           id: resolvedParams.id,
           version: lockedVersion,
-          status: 'pending_faculty',
+          status: accessRequest.status,
           provisioningState: APPROVAL_STATE_IN_PROGRESS,
         },
         data: {
@@ -340,9 +450,13 @@ export async function POST(
       throw new HttpError('Request not found after update', 404);
     }
 
-    try {
-      await activateVpnAccount(updatedRequest, admin.username);
-    } catch (vpnError) {
+    // Activate the VPN tracking record only while VPN management is enabled.
+    // With the module disabled, approval completes as an AD-only flow and no
+    // VPN records are written; historical data is untouched.
+    if (vpnModuleEnabled) {
+      try {
+        await activateVpnAccount(updatedRequest, admin.username);
+      } catch (vpnError) {
       await rollbackExternalEnablement(updatedRequest);
       await markApprovalState(updatedRequest.id, APPROVAL_STATE_FAILED, vpnError);
 
@@ -387,6 +501,7 @@ export async function POST(
         },
         { status: 500 }
       );
+      }
     }
 
     try {
@@ -483,7 +598,7 @@ export async function POST(
         {
           success: true,
           warning: 'Request approved, but the notification email failed. Use the resend action to recover.',
-          request: requestWithFailureState,
+          request: toSafeAccessRequestResponse(requestWithFailureState),
         },
         { status: 202 }
       );
@@ -493,9 +608,9 @@ export async function POST(
 
     let commentText: string;
     if (updatedRequest.isInternal) {
-      commentText = `Request approved by ${admin.username}. LDAP account enabled in Active Directory. Activation link sent to ${updatedRequest.email}.`;
+      commentText = `Request approved by ${admin.username}. Directory account enabled in Active Directory. Activation link sent to ${updatedRequest.email}.`;
     } else {
-      commentText = `Request approved by ${admin.username}. LDAP account(s) enabled in Active Directory. Credentials sent to ${updatedRequest.email}.`;
+      commentText = `Request approved by ${admin.username}. Directory account(s) enabled in Active Directory. Credentials sent to ${updatedRequest.email}.`;
     }
     if (approvalMessage) {
       commentText += `\n\nFollow-up message: ${approvalMessage}`;
@@ -530,6 +645,15 @@ export async function POST(
         isInternal: updatedRequest.isInternal,
         approvalMessage,
         emailSent: true,
+        vpnModuleEnabled,
+        // SoD evidence (roadmap §8): flag mode annotates same-actor approvals
+        // without blocking them; off mode records nothing.
+        ...(sodEvaluation?.mode === 'flag' && sodEvaluation.violated
+          ? {
+              sodFlagged: true,
+              sodPriorActions: sodEvaluation.priorActions,
+            }
+          : {}),
       },
       ipAddress: getIpAddress(request),
       userAgent: getUserAgent(request),
@@ -541,7 +665,7 @@ export async function POST(
 
     return NextResponse.json({
       success: true,
-      request: finalRequest,
+      request: toSafeAccessRequestResponse(finalRequest),
     });
   } catch (error) {
     if (isJsonBodyError(error)) {

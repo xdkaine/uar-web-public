@@ -24,6 +24,9 @@ export {
 // User Search
 export {
   searchLDAPUser,
+  searchLDAPUserByObjectGuid,
+  searchLDAPUsers,
+  resolveLDAPUserDisplayNames,
   searchLDAPUserForProvisioning,
   isUserDomainAdmin,
   getLDAPUserEmail,
@@ -36,7 +39,10 @@ export {
   createLDAPUser,
   enableLDAPUser,
   disableLDAPUser,
+  disableConfirmedLDAPUser,
+  enableConfirmedLDAPUser,
   deleteLDAPUser,
+  deleteConfirmedDisabledLDAPUser,
   renameLDAPUser,
 } from './user-crud';
 
@@ -53,8 +59,6 @@ export {
   updateUserAttribute,
   updateUserAttributes,
   setLDAPUserExpiration,
-  tagAccountWithAccessRequestId,
-  getAccessRequestIdFromAccount,
   appendADDescription,
 } from './attributes';
 
@@ -62,6 +66,8 @@ export {
 export {
   searchLDAPGroups,
   getLDAPGroupMembers,
+  getLDAPGroupAncestorDNs,
+  getLDAPGroupIdentity,
   addLDAPGroupMember,
   removeLDAPGroupMember,
 } from './groups';

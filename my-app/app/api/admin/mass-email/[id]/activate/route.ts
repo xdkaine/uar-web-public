@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { secureErrorResponse, secureJsonResponse } from '@/lib/apiResponse';
 import { AuditActions, AuditCategories, getIpAddress, getUserAgent, logAuditAction } from '@/lib/audit-log';
+import { requireModuleEnabled } from '@/lib/modules/guards';
 import { activateMassEmailCampaign } from '@/lib/mass-email';
 
 export async function POST(
@@ -11,6 +13,12 @@ export async function POST(
   try {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    if (!actorHasPermission(admin, 'communications.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    const moduleGuard = await requireModuleEnabled('communications');
+    if (moduleGuard) return moduleGuard;
 
     const { id } = await params;
     const campaign = await activateMassEmailCampaign(id, admin.username);
@@ -28,6 +36,7 @@ export async function POST(
 
     return secureJsonResponse({ campaign, message: 'Mass email campaign activated' });
   } catch (error) {
-    return secureErrorResponse(error instanceof Error ? error.message : 'Failed to activate mass email campaign', 500);
+    const message = error instanceof Error ? error.message : 'Failed to activate mass email campaign';
+    return secureErrorResponse(message, message === 'MASS_EMAIL_PREVIEW_STALE' ? 409 : 500);
   }
 }

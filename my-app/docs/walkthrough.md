@@ -318,7 +318,7 @@ flowchart TB
     Decision -->|Both exist| Skip["Skip duplicate"]
     Decision -->|Missing request| CreateReq["Create approved AccessRequest"]
     Decision -->|Missing VPN| CreateVpn["Create VPNAccount"]
-    CreateReq --> Tag["Update AD description and request tagging"]
+    CreateReq --> Tag["Update formatted AD description"]
     CreateVpn --> Match["Create ADAccountMatch record"]
     Tag --> Match
     Skip --> Stats["Update sync stats and final status"]

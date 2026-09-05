@@ -96,16 +96,6 @@ export async function POST(request: NextRequest) {
         targetEmail = ldapEmail.trim().toLowerCase();
       }
     } else if (providedEmail) {
-      const targetRateLimitResult = await checkRateLimitAsync('password-reset-target', {
-        maxRequests: 3,
-        windowMs: RateLimitPresets.passwordReset.windowMs,
-        identifier: providedEmail,
-      });
-
-      if (!targetRateLimitResult.success) {
-        return rateLimitedResponse(targetRateLimitResult);
-      }
-
       // Verify Turnstile for public requests
       if (typeof turnstileToken !== 'string' || !turnstileToken) {
         return NextResponse.json(
@@ -129,6 +119,17 @@ export async function POST(request: NextRequest) {
           { status: 400 }
         );
       }
+
+      const targetRateLimitResult = await checkRateLimitAsync('password-reset-target', {
+        maxRequests: 3,
+        windowMs: RateLimitPresets.passwordReset.windowMs,
+        identifier: providedEmail,
+      });
+
+      if (!targetRateLimitResult.success) {
+        return rateLimitedResponse(targetRateLimitResult);
+      }
+
       targetEmail = providedEmail;
     } else {
       return NextResponse.json(

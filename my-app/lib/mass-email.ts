@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { prisma } from '@/lib/prisma';
 import { getLDAPGroupMembers, listUsersInOU } from '@/lib/ldap';
 import { appLogger } from '@/lib/logger';
@@ -80,6 +81,37 @@ export interface CreateMassEmailInput {
   subject: string;
   html: string;
   targets: MassEmailTargetInput;
+}
+
+export function massEmailResolutionDigest(resolution: MassEmailResolution): string {
+  const snapshot = {
+    targets: resolution.targets,
+    recipients: resolution.recipients.map((recipient) => ({
+      email: recipient.email,
+      adUsername: recipient.adUsername,
+      accountEnabled: recipient.accountEnabled,
+    })),
+    skipped: resolution.skipped.map((recipient) => ({
+      email: recipient.email || null,
+      adUsername: recipient.adUsername || null,
+      reason: recipient.reason,
+    })),
+  };
+  return createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
+}
+
+export function massEmailPreviewDigest(
+  resolution: MassEmailResolution,
+  subject: string,
+  html: string
+): string {
+  const content = previewMassEmailContent(subject, html);
+  return createHash('sha256').update(JSON.stringify({
+    audience: massEmailResolutionDigest(resolution),
+    subject: content.subject,
+    html: content.html,
+    text: content.text,
+  })).digest('hex');
 }
 
 export type UpdateMassEmailDraftInput = CreateMassEmailInput;
@@ -325,9 +357,13 @@ async function createMassEmailLog(client: MassEmailModelClient, input: {
   });
 }
 
-async function createCampaign(input: CreateMassEmailInput, actor: string, options: { activate?: boolean; quickSend?: boolean } = {}) {
+async function createCampaign(
+  input: CreateMassEmailInput,
+  actor: string,
+  options: { activate?: boolean; quickSend?: boolean; resolution?: MassEmailResolution } = {}
+) {
   const content = validateCampaignContent(input);
-  const resolution = await resolveMassEmailRecipients(input.targets);
+  const resolution = options.resolution ?? await resolveMassEmailRecipients(input.targets);
   if (resolution.recipients.length === 0) {
     throw new Error('No eligible recipients were resolved');
   }
@@ -356,6 +392,7 @@ async function createCampaign(input: CreateMassEmailInput, actor: string, option
           targets: resolution.targets,
           skipped: resolution.skipped,
           summary: resolution.summary,
+          previewDigest: massEmailPreviewDigest(resolution, content.subject, content.html),
           resolvedAt: now.toISOString(),
         }),
       },
@@ -401,8 +438,19 @@ export async function createMassEmailDraft(input: CreateMassEmailInput, actor: s
   return createCampaign(input, actor, { activate: false, quickSend: false });
 }
 
-export async function quickSendMassEmail(input: CreateMassEmailInput, actor: string) {
-  const campaign = await createCampaign(input, actor, { activate: true, quickSend: true });
+export async function quickSendMassEmail(
+  input: CreateMassEmailInput,
+  actor: string,
+  expectedPreviewDigest: string
+) {
+  const resolution = await resolveMassEmailRecipients(input.targets);
+  if (
+    !/^[a-f0-9]{64}$/.test(expectedPreviewDigest)
+    || massEmailPreviewDigest(resolution, input.subject, input.html) !== expectedPreviewDigest
+  ) {
+    throw new Error('MASS_EMAIL_PREVIEW_STALE');
+  }
+  const campaign = await createCampaign(input, actor, { activate: true, quickSend: true, resolution });
   const results = await processMassEmailCampaigns({ campaignId: campaign.id, actor, limit: 25 });
   return { campaign: await getMassEmailCampaign(campaign.id), results };
 }
@@ -431,8 +479,8 @@ export async function updateMassEmailDraft(campaignId: string, input: UpdateMass
 
   const now = new Date();
   await db.$transaction(async (tx) => {
-    await tx.massEmailCampaign.update({
-      where: { id: campaignId },
+    const claimedDraft = await tx.massEmailCampaign.updateMany({
+      where: { id: campaignId, status: 'draft', updatedAt: existing.updatedAt },
       data: {
         name: content.name,
         subject: content.subject,
@@ -448,10 +496,12 @@ export async function updateMassEmailDraft(campaignId: string, input: UpdateMass
           targets: resolution.targets,
           skipped: resolution.skipped,
           summary: resolution.summary,
+          previewDigest: massEmailPreviewDigest(resolution, content.subject, content.html),
           resolvedAt: now.toISOString(),
         }),
       },
     });
+    if (claimedDraft.count !== 1) throw new Error('Mass email draft changed concurrently; reload before saving');
 
     await tx.massEmailRecipient.deleteMany({ where: { campaignId } });
     await tx.massEmailRecipient.createMany({
@@ -545,27 +595,82 @@ export async function listMassEmailCampaigns(selectedCampaignId?: string | null)
 }
 
 export async function activateMassEmailCampaign(campaignId: string, actor: string) {
+  await db.massEmailCampaign.updateMany({
+    where: {
+      id: campaignId,
+      status: 'activating',
+      activationClaimedUntil: { lte: new Date() },
+    },
+    data: {
+      status: 'draft',
+      activationClaimId: null,
+      activationClaimedUntil: null,
+    },
+  });
   const campaign = await db.massEmailCampaign.findUnique({ where: { id: campaignId } });
   if (!campaign) throw new Error('Mass email campaign not found');
   if (campaign.status !== 'draft') throw new Error('Only draft mass email campaigns can be activated');
   if (campaign.eligibleRecipients <= 0) throw new Error('Campaign has no eligible recipients');
 
-  await db.$transaction(async (tx) => {
-    await tx.massEmailCampaign.update({
-      where: { id: campaignId },
-      data: { status: 'active', activatedAt: new Date(), activatedBy: actor },
-    });
-    await tx.massEmailRecipient.updateMany({
-      where: { campaignId, status: 'ready' },
-      data: { status: 'pending_send' },
-    });
-    await createMassEmailLog(tx, {
-      campaignId,
-      eventType: 'campaign_activated',
-      actor,
-      message: 'Mass email campaign activated',
-    });
+  const claimId = randomUUID();
+  const claimed = await db.massEmailCampaign.updateMany({
+    where: { id: campaignId, status: 'draft', updatedAt: campaign.updatedAt },
+    data: {
+      status: 'activating',
+      activationClaimId: claimId,
+      activationClaimedUntil: new Date(Date.now() + 15 * 60 * 1000),
+    },
   });
+  if (claimed.count !== 1) throw new Error('Mass email campaign changed or activation is already in progress');
+
+  try {
+    const snapshot = campaign.targetSnapshot as {
+      targets?: MassEmailTargetInput;
+      previewDigest?: string;
+    } | null;
+    if (!snapshot?.targets || !snapshot.previewDigest) {
+      throw new Error('MASS_EMAIL_PREVIEW_STALE');
+    }
+    const currentResolution = await resolveMassEmailRecipients(snapshot.targets);
+    const currentDigest = massEmailPreviewDigest(currentResolution, campaign.subject, campaign.html);
+    if (currentDigest !== snapshot.previewDigest) {
+      throw new Error('MASS_EMAIL_PREVIEW_STALE');
+    }
+
+    await db.$transaction(async (tx) => {
+      const finalized = await tx.massEmailCampaign.updateMany({
+        where: { id: campaignId, status: 'activating', activationClaimId: claimId },
+        data: {
+          status: 'active',
+          activatedAt: new Date(),
+          activatedBy: actor,
+          activationClaimId: null,
+          activationClaimedUntil: null,
+        },
+      });
+      if (finalized.count !== 1) throw new Error('Mass email activation ownership was lost');
+      await tx.massEmailRecipient.updateMany({
+        where: { campaignId, status: 'ready' },
+        data: { status: 'pending_send' },
+      });
+      await createMassEmailLog(tx, {
+        campaignId,
+        eventType: 'campaign_activated',
+        actor,
+        message: 'Mass email campaign activated',
+      });
+    });
+  } catch (error) {
+    await db.massEmailCampaign.updateMany({
+      where: { id: campaignId, status: 'activating', activationClaimId: claimId },
+      data: {
+        status: 'draft',
+        activationClaimId: null,
+        activationClaimedUntil: null,
+      },
+    }).catch(() => undefined);
+    throw error;
+  }
 
   return getMassEmailCampaign(campaignId);
 }
@@ -598,20 +703,28 @@ export async function cancelMassEmailCampaign(campaignId: string, actor: string)
 }
 
 async function markStaleMassEmailClaims() {
-  const staleBefore = new Date(Date.now() - STALE_SEND_CLAIM_MS);
+  const now = new Date();
   const staleRecipients = await db.massEmailRecipient.findMany({
-    where: { status: 'sending', emailClaimedAt: { lte: staleBefore } },
+    where: { status: 'sending', emailClaimedUntil: { lte: now } },
     take: 100,
   });
 
   for (const recipient of staleRecipients) {
     await db.$transaction(async (tx) => {
       const updated = await tx.massEmailRecipient.updateMany({
-        where: { id: recipient.id, status: 'sending' },
+        where: {
+          id: recipient.id,
+          status: 'sending',
+          emailClaimId: recipient.emailClaimId,
+          emailClaimedUntil: { lte: now },
+        },
         data: {
-          status: 'failed',
+          status: 'delivery_unknown',
+          emailClaimId: null,
+          emailClaimedUntil: null,
+          deliveryFailureCounted: true,
           failedAt: new Date(),
-          lastError: 'Send claim became stale before completion was recorded',
+          lastError: 'Send claim became stale; provider acceptance is unknown and must be reconciled',
         },
       });
       if (updated.count === 1) {
@@ -625,7 +738,7 @@ async function markStaleMassEmailClaims() {
           level: 'error',
           eventType: 'send_claim_stale',
           actor: 'system',
-          message: `Mass email send claim became stale for ${recipient.email}`,
+          message: `Mass email delivery outcome is unknown for ${recipient.email}`,
         });
       }
     });
@@ -633,9 +746,18 @@ async function markStaleMassEmailClaims() {
 }
 
 async function sendRecipient(campaign: MassEmailCampaign, recipient: MassEmailRecipient, actor: string): Promise<boolean> {
+  const claimId = randomUUID();
   const claimed = await db.massEmailRecipient.updateMany({
     where: { id: recipient.id, status: 'pending_send' },
-    data: { status: 'sending', emailClaimedAt: new Date(), lastError: null },
+    data: {
+      status: 'sending',
+      emailClaimId: claimId,
+      emailClaimedAt: new Date(),
+      emailClaimedUntil: new Date(Date.now() + STALE_SEND_CLAIM_MS),
+      deliveryAttempts: { increment: 1 },
+      deliveryFailureCounted: false,
+      lastError: null,
+    },
   });
   if (claimed.count !== 1) return false;
 
@@ -648,15 +770,19 @@ async function sendRecipient(campaign: MassEmailCampaign, recipient: MassEmailRe
     });
 
     await db.$transaction(async (tx) => {
-      await tx.massEmailRecipient.update({
-        where: { id: recipient.id },
+      const finalized = await tx.massEmailRecipient.updateMany({
+        where: { id: recipient.id, status: 'sending', emailClaimId: claimId },
         data: {
           status: 'sent',
+          emailClaimId: null,
+          emailClaimedUntil: null,
           sentAt: new Date(),
           messageId: info.messageId || null,
+          deliveryFailureCounted: false,
           lastError: null,
         },
       });
+      if (finalized.count !== 1) return;
       await tx.massEmailCampaign.update({
         where: { id: campaign.id },
         data: { sentCount: { increment: 1 } },
@@ -670,14 +796,26 @@ async function sendRecipient(campaign: MassEmailCampaign, recipient: MassEmailRe
         details: { messageId: info.messageId },
       });
     });
-    return true;
+    const current = await db.massEmailRecipient.findUnique({
+      where: { id: recipient.id },
+      select: { status: true },
+    });
+    return current?.status === 'sent';
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown send failure';
     await db.$transaction(async (tx) => {
-      await tx.massEmailRecipient.update({
-        where: { id: recipient.id },
-        data: { status: 'failed', failedAt: new Date(), lastError: message },
+      const finalized = await tx.massEmailRecipient.updateMany({
+        where: { id: recipient.id, status: 'sending', emailClaimId: claimId },
+        data: {
+          status: 'delivery_unknown',
+          emailClaimId: null,
+          emailClaimedUntil: null,
+          deliveryFailureCounted: true,
+          failedAt: new Date(),
+          lastError: `Mail transport did not confirm a safe retry outcome: ${message}`,
+        },
       });
+      if (finalized.count !== 1) return;
       await tx.massEmailCampaign.update({
         where: { id: campaign.id },
         data: { failedCount: { increment: 1 } },
@@ -686,9 +824,9 @@ async function sendRecipient(campaign: MassEmailCampaign, recipient: MassEmailRe
         campaignId: campaign.id,
         recipientId: recipient.id,
         level: 'error',
-        eventType: 'email_failure',
+        eventType: 'email_delivery_unknown',
         actor,
-        message: `Mass email failed for ${recipient.email}`,
+        message: `Mass email delivery outcome is unknown for ${recipient.email}`,
         details: { error: message },
       });
     });
@@ -697,13 +835,37 @@ async function sendRecipient(campaign: MassEmailCampaign, recipient: MassEmailRe
 }
 
 async function completeCampaignIfFinished(campaignId: string, actor: string) {
-  const [pending, sending, campaign] = await Promise.all([
+  const [pending, sending, unknown, campaign] = await Promise.all([
     db.massEmailRecipient.count({ where: { campaignId, status: 'pending_send' } }),
     db.massEmailRecipient.count({ where: { campaignId, status: 'sending' } }),
+    db.massEmailRecipient.count({ where: { campaignId, status: 'delivery_unknown' } }),
     db.massEmailCampaign.findUnique({ where: { id: campaignId } }),
   ]);
 
-  if (!campaign || campaign.status !== 'active' || pending > 0 || sending > 0) return;
+  if (
+    !campaign
+    || !['active', 'reconciliation_required'].includes(campaign.status)
+    || pending > 0
+    || sending > 0
+  ) return;
+
+  if (unknown > 0) {
+    await db.$transaction(async (tx) => {
+      await tx.massEmailCampaign.update({
+        where: { id: campaignId },
+        data: { status: 'reconciliation_required', completedAt: null },
+      });
+      await createMassEmailLog(tx, {
+        campaignId,
+        eventType: 'campaign_reconciliation_required',
+        actor,
+        level: 'error',
+        message: `${unknown} recipient delivery outcome(s) require operator reconciliation`,
+        details: { deliveryUnknownCount: unknown },
+      });
+    });
+    return;
+  }
 
   await db.$transaction(async (tx) => {
     await tx.massEmailCampaign.update({
@@ -756,6 +918,83 @@ export async function processMassEmailCampaigns(options: { campaignId?: string; 
   }
 
   return summaries;
+}
+
+export async function reconcileMassEmailRecipient(
+  campaignId: string,
+  recipientId: string,
+  actor: string,
+  resolution: 'delivered' | 'not_delivered',
+  evidence: string
+) {
+  const normalizedEvidence = evidence.trim();
+  if (normalizedEvidence.length < 10) {
+    throw new Error('Reconciliation evidence must contain at least 10 characters');
+  }
+
+  const reconciled = await db.$transaction(async (tx) => {
+    const recipient = await tx.massEmailRecipient.findUnique({
+      where: { id: recipientId },
+      select: { id: true, campaignId: true, email: true, status: true, deliveryFailureCounted: true },
+    });
+    if (!recipient || recipient.campaignId !== campaignId) {
+      throw new Error('Mass email recipient not found');
+    }
+    if (recipient.status !== 'delivery_unknown') {
+      throw new Error('Only delivery_unknown recipients can be reconciled');
+    }
+
+    const nextStatus = resolution === 'delivered' ? 'sent' : 'pending_send';
+    const updated = await tx.massEmailRecipient.updateMany({
+      where: { id: recipientId, campaignId, status: 'delivery_unknown' },
+      data: {
+        status: nextStatus,
+        sentAt: resolution === 'delivered' ? new Date() : null,
+        failedAt: null,
+        emailClaimId: null,
+        emailClaimedUntil: null,
+        deliveryFailureCounted: false,
+        lastError: resolution === 'delivered'
+          ? null
+          : `Operator confirmed non-delivery: ${normalizedEvidence}`,
+      },
+    });
+    if (updated.count !== 1) throw new Error('Recipient reconciliation conflict');
+
+    await tx.massEmailCampaign.update({
+      where: { id: campaignId },
+      data: {
+        status: resolution === 'delivered' ? 'reconciliation_required' : 'active',
+        ...(recipient.deliveryFailureCounted ? { failedCount: { decrement: 1 } } : {}),
+        ...(resolution === 'delivered' ? { sentCount: { increment: 1 } } : {}),
+      },
+    });
+    await createMassEmailLog(tx, {
+      campaignId,
+      recipientId,
+      eventType: resolution === 'delivered'
+        ? 'delivery_reconciled_delivered'
+        : 'delivery_reconciled_not_delivered',
+      actor,
+      message: resolution === 'delivered'
+        ? `Operator confirmed delivery to ${recipient.email}`
+        : `Operator confirmed non-delivery to ${recipient.email}; one explicit retry is queued`,
+      details: { resolution, evidence: normalizedEvidence },
+    });
+
+    return nextStatus;
+  });
+
+  if (reconciled === 'sent') {
+    const unknown = await db.massEmailRecipient.count({
+      where: { campaignId, status: 'delivery_unknown' },
+    });
+    if (unknown === 0) {
+      await completeCampaignIfFinished(campaignId, actor);
+    }
+  }
+
+  return getMassEmailCampaign(campaignId);
 }
 
 export async function sendMassEmailTest(input: { to: string; subject: string; html: string }, actor: string) {

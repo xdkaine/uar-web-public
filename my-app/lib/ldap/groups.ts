@@ -1,5 +1,5 @@
 import { Client, Attribute, Change } from 'ldapts';
-import { getRequiredEnv } from '../env-validator';
+import { getConfigValue, getRequiredSecretValue } from '../config/resolver';
 import { ldapLogger } from '../logger';
 import { createLDAPClient } from './client';
 import { 
@@ -19,9 +19,39 @@ type LDAPGroupMember = {
 
 type LDAPSearchClient = Pick<Client, 'search'>;
 
+const MAX_GROUP_ANCESTRY_DEPTH = 20;
+const MAX_GROUP_ANCESTRY_NODES = 256;
+
 function toStringArray(value: unknown): string[] {
   if (!value) return [];
   return Array.isArray(value) ? value.map(String) : [String(value)];
+}
+
+function ldapIdentityValue(value: unknown): string {
+  return value instanceof Uint8Array ? Buffer.from(value).toString('base64') : String(value);
+}
+
+export type LDAPGroupIdentity = {
+  dn: string;
+  objectGuid: string;
+};
+
+export async function resolveLDAPGroupIdentityFromClient(
+  client: LDAPSearchClient,
+  groupDN: string
+): Promise<LDAPGroupIdentity> {
+  const { searchEntries } = await withTimeout(client.search(groupDN, {
+    scope: 'base' as const,
+    attributes: ['objectClass', 'objectGUID'],
+  }), LDAP_TIMEOUT);
+  if (searchEntries.length !== 1 || !hasObjectClass(searchEntries[0] as Record<string, unknown>, 'group')) {
+    throw new Error(`Group not found or not uniquely resolvable: ${groupDN}`);
+  }
+  const entry = searchEntries[0] as Record<string, unknown>;
+  if (!entry.objectGUID) {
+    throw new Error(`Group has no readable immutable object identity: ${groupDN}`);
+  }
+  return { dn: String(entry.dn), objectGuid: ldapIdentityValue(entry.objectGUID) };
 }
 
 function findMemberAttribute(entry: Record<string, unknown>): { key: string; values: string[] } | null {
@@ -38,6 +68,95 @@ function nextMemberRangeStart(rangeKey: string): number | null {
 
 function hasObjectClass(entry: Record<string, unknown>, objectClass: string): boolean {
   return toStringArray(entry.objectClass).some((value) => value.toLowerCase() === objectClass.toLowerCase());
+}
+
+/**
+ * Resolve every direct and transitive parent of an AD group. The traversal is
+ * deliberately bounded and fail-closed so a malformed or unexpectedly large
+ * group graph cannot bypass lifecycle protection checks.
+ */
+export async function resolveLDAPGroupAncestorDNsFromClient(
+  client: LDAPSearchClient,
+  groupDN: string
+): Promise<string[]> {
+  const visited = new Set([groupDN.toLowerCase()]);
+  const ancestors: string[] = [];
+  const queue: Array<{ dn: string; depth: number }> = [{ dn: groupDN, depth: 0 }];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current) break;
+
+    const { searchEntries } = await withTimeout(client.search(current.dn, {
+      scope: 'base' as const,
+      attributes: ['objectClass', 'memberOf'],
+    }), LDAP_TIMEOUT);
+    if (searchEntries.length !== 1 || !hasObjectClass(searchEntries[0] as Record<string, unknown>, 'group')) {
+      throw new Error(`Group not found or not uniquely resolvable: ${current.dn}`);
+    }
+
+    const parentDNs = toStringArray((searchEntries[0] as Record<string, unknown>).memberOf);
+    if (parentDNs.length > 0 && current.depth >= MAX_GROUP_ANCESTRY_DEPTH) {
+      throw new Error('Group ancestry exceeds the lifecycle safety depth limit');
+    }
+
+    for (const parentDN of parentDNs) {
+      const normalized = parentDN.toLowerCase();
+      if (visited.has(normalized)) continue;
+      visited.add(normalized);
+      ancestors.push(parentDN);
+      if (ancestors.length > MAX_GROUP_ANCESTRY_NODES) {
+        throw new Error('Group ancestry exceeds the lifecycle safety size limit');
+      }
+      queue.push({ dn: parentDN, depth: current.depth + 1 });
+    }
+  }
+
+  return ancestors;
+}
+
+export async function getLDAPGroupAncestorDNs(groupDN: string): Promise<string[]> {
+  let client: Client | null = null;
+  try {
+    client = await createLDAPClient();
+    const bindDN = await getConfigValue<string>('ldap.bindDn');
+    const bindPassword = await getRequiredSecretValue('ldap.bindPassword');
+    await withTimeout(client.bind(bindDN, bindPassword), LDAP_TIMEOUT);
+    return await resolveLDAPGroupAncestorDNsFromClient(client, groupDN);
+  } catch (err) {
+    ldapLogger.error('Error resolving LDAP group ancestry', sanitizeLdapError(err as Record<string, unknown>));
+    throw err;
+  } finally {
+    if (client) {
+      try {
+        await client.unbind();
+      } catch (unbindErr) {
+        ldapLogger.error('Error unbinding connection', unbindErr);
+      }
+    }
+  }
+}
+
+export async function getLDAPGroupIdentity(groupDN: string): Promise<LDAPGroupIdentity> {
+  let client: Client | null = null;
+  try {
+    client = await createLDAPClient();
+    const bindDN = await getConfigValue<string>('ldap.bindDn');
+    const bindPassword = await getRequiredSecretValue('ldap.bindPassword');
+    await withTimeout(client.bind(bindDN, bindPassword), LDAP_TIMEOUT);
+    return await resolveLDAPGroupIdentityFromClient(client, groupDN);
+  } catch (err) {
+    ldapLogger.error('Error resolving LDAP group identity', sanitizeLdapError(err as Record<string, unknown>));
+    throw err;
+  } finally {
+    if (client) {
+      try {
+        await client.unbind();
+      } catch (unbindErr) {
+        ldapLogger.error('Error unbinding connection', unbindErr);
+      }
+    }
+  }
 }
 
 async function readAllMemberDNs(client: LDAPSearchClient, groupDN: string): Promise<string[]> {
@@ -131,13 +250,14 @@ export async function searchLDAPGroups(query: string): Promise<Array<{
   dn: string;
   name: string;
   description: string;
+  objectGuid: string;
 }>> {
   let client: Client | null = null;
   try {
-    client = createLDAPClient();
-    const bindDN = getRequiredEnv('LDAP_BIND_DN');
-    const bindPassword = getRequiredEnv('LDAP_BIND_PASSWORD');
-    const groupSearchBase = getRequiredEnv('LDAP_GROUPSEARCH');
+    client = await createLDAPClient();
+    const bindDN = await getConfigValue<string>('ldap.bindDn');
+    const bindPassword = (await getRequiredSecretValue('ldap.bindPassword'));
+    const groupSearchBase = await getConfigValue<string>('ldap.groupSearchBase');
 
     await withTimeout(client.bind(bindDN, bindPassword), LDAP_TIMEOUT);
 
@@ -152,7 +272,7 @@ export async function searchLDAPGroups(query: string): Promise<Array<{
       filter,
       scope: 'sub' as const,
       sizeLimit: 1000,
-      attributes: ['cn', 'description', 'distinguishedName'],
+      attributes: ['cn', 'description', 'distinguishedName', 'objectGUID'],
     };
 
     const { searchEntries } = await withTimeout(client.search(groupSearchBase, opts), LDAP_TIMEOUT);
@@ -163,6 +283,7 @@ export async function searchLDAPGroups(query: string): Promise<Array<{
         dn: String(group.dn),
         name: String(group.cn),
         description: String(group.description || ''),
+        objectGuid: group.objectGUID ? ldapIdentityValue(group.objectGUID) : '',
       };
     });
   } catch (err) {
@@ -192,9 +313,9 @@ export async function getLDAPGroupMembers(groupDN: string): Promise<Array<{
 }>> {
   let client: Client | null = null;
   try {
-    client = createLDAPClient();
-    const bindDN = getRequiredEnv('LDAP_BIND_DN');
-    const bindPassword = getRequiredEnv('LDAP_BIND_PASSWORD');
+    client = await createLDAPClient();
+    const bindDN = await getConfigValue<string>('ldap.bindDn');
+    const bindPassword = (await getRequiredSecretValue('ldap.bindPassword'));
 
     await withTimeout(client.bind(bindDN, bindPassword), LDAP_TIMEOUT);
 
@@ -219,9 +340,9 @@ export async function getLDAPGroupMembers(groupDN: string): Promise<Array<{
 export async function addLDAPGroupMember(groupDN: string, userDN: string): Promise<boolean> {
   let client: Client | null = null;
   try {
-    client = createLDAPClient();
-    const bindDN = getRequiredEnv('LDAP_BIND_DN');
-    const bindPassword = getRequiredEnv('LDAP_BIND_PASSWORD');
+    client = await createLDAPClient();
+    const bindDN = await getConfigValue<string>('ldap.bindDn');
+    const bindPassword = (await getRequiredSecretValue('ldap.bindPassword'));
 
     await withTimeout(client.bind(bindDN, bindPassword), LDAP_TIMEOUT);
 
@@ -264,9 +385,9 @@ export async function addLDAPGroupMember(groupDN: string, userDN: string): Promi
 export async function removeLDAPGroupMember(groupDN: string, userDN: string): Promise<boolean> {
   let client: Client | null = null;
   try {
-    client = createLDAPClient();
-    const bindDN = getRequiredEnv('LDAP_BIND_DN');
-    const bindPassword = getRequiredEnv('LDAP_BIND_PASSWORD');
+    client = await createLDAPClient();
+    const bindDN = await getConfigValue<string>('ldap.bindDn');
+    const bindPassword = (await getRequiredSecretValue('ldap.bindPassword'));
 
     await withTimeout(client.bind(bindDN, bindPassword), LDAP_TIMEOUT);
 

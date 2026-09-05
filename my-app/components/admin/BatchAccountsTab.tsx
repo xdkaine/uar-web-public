@@ -1,12 +1,31 @@
-'use client';
+"use client";
 
-import { useState } from 'react';
-import { useRouter } from 'next/navigation';
-import { useToast } from '@/hooks/useToast';
-import { fetchWithCsrf } from '@/lib/csrf';
-import DateTimePicker from '@/components/DateTimePicker';
+import {
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import {
+  AlertTriangle,
+  ArrowLeft,
+  ArrowRight,
+  Check,
+  Plus,
+  RefreshCw,
+  Trash2,
+} from "lucide-react";
+import { requestActionImpact } from "@/components/admin/actionImpactRequest";
+import { BATCH_OWNERSHIP_CONFIRMATION } from "@/components/admin/batchAccountConfirmation";
+import DateTimePicker from "@/components/DateTimePicker";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -20,32 +39,18 @@ import {
   TableCell,
   TableHead,
   TableHeader,
-  TableRow
+  TableRow,
 } from "@/components/ui/table";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Label } from "@/components/ui/label";
-import { Plus, Trash2, RefreshCw } from "lucide-react";
+import {
+  reviewBatchAccountPlan,
+  type BatchAdAccountDraft,
+  type BatchVpnAccountDraft,
+} from "@/lib/batch-account-plan";
+import { fetchWithCsrf } from "@/lib/csrf";
+import { useToast } from "@/hooks/useToast";
+import { BatchHistory } from "./BatchHistory";
 
-interface ADAccount {
-  name: string;
-  email?: string;
-  ldapUsername: string;
-  password: string;
-  accountExpiresAt: string;
-  isInternal: boolean;
-}
-
-interface VPNAccount {
-  name: string;
-  email?: string;
-  vpnUsername: string;
-  password: string;
-  accountExpiresAt: string;
-  portalType: string; // "Management", "Limited", "External"
-}
-
-interface BatchCreation {
+export interface BatchCreation {
   id: string;
   createdAt: string;
   createdBy: string;
@@ -54,12 +59,9 @@ interface BatchCreation {
   successfulAccounts: number;
   failedAccounts: number;
   status: string;
+  processingClaimedUntil?: string | null;
   completedAt?: string;
-  linkedTicket?: {
-    id: string;
-    subject: string;
-    status: string;
-  };
+  linkedTicket?: { id: string; subject: string; status: string };
   accounts: Array<{
     id: string;
     name: string;
@@ -67,627 +69,800 @@ interface BatchCreation {
     status: string;
     errorMessage?: string;
   }>;
-  _count: {
-    accounts: number;
-    auditLogs: number;
-  };
+  _count: { accounts: number; auditLogs: number };
 }
-
-interface BatchAccountsTabProps {
+interface Props {
   batches: BatchCreation[];
-  supportTickets: Array<{
-    id: string;
-    subject: string;
-    status: string;
-  }>;
-  onBatchCreated: () => void;
+  supportTickets: Array<{ id: string; subject: string; status: string }>;
+  onBatchCreated: () => void | Promise<void>;
 }
+type AdEntry = BatchAdAccountDraft & { draftKey: string };
+type VpnEntry = BatchVpnAccountDraft & { draftKey: string };
+type Review = ReturnType<typeof reviewBatchAccountPlan>;
+type SetEntries<T> = Dispatch<SetStateAction<T[]>>;
+const STEPS = ["Details", "Accounts", "Review & start"] as const;
+const password = () => {
+  const chars =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (value) => chars[value % chars.length]).join("");
+};
+const stripAd = ({ draftKey, ...draft }: AdEntry) => {
+  void draftKey;
+  return draft;
+};
+const stripVpn = ({ draftKey, ...draft }: VpnEntry) => {
+  void draftKey;
+  return draft;
+};
 
 export default function BatchAccountsTab({
   batches,
   supportTickets,
-  onBatchCreated
-}: BatchAccountsTabProps) {
+  onBatchCreated,
+}: Props) {
   const router = useRouter();
-  const [showCreateForm, setShowCreateForm] = useState(false);
-  const [description, setDescription] = useState('');
-  const [linkedTicketId, setLinkedTicketId] = useState('');
-  const [adAccounts, setAdAccounts] = useState<ADAccount[]>([]);
-  const [vpnAccounts, setVpnAccounts] = useState<VPNAccount[]>([]);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const searchParams = useSearchParams();
   const { showToast } = useToast();
-
-  const addAdAccount = () => {
-    if (adAccounts.length + vpnAccounts.length >= 100) {
-      showToast('Maximum 100 total accounts per batch', 'error');
-      return;
+  const [open, setOpen] = useState(false);
+  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [description, setDescription] = useState("");
+  const [linkedTicketId, setLinkedTicketId] = useState("");
+  const [adAccounts, setAdAccounts] = useState<AdEntry[]>([]);
+  const [vpnAccounts, setVpnAccounts] = useState<VpnEntry[]>([]);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const keyRef = useRef("");
+  const submittedRef = useRef(false);
+  const requested = searchParams.get("action") === "new";
+  const visible = open || requested;
+  const review = useMemo(
+    () => reviewBatchAccountPlan(description, adAccounts, vpnAccounts),
+    [description, adAccounts, vpnAccounts],
+  );
+  const reset = () => {
+    setOpen(false);
+    setStep(1);
+    setDescription("");
+    setLinkedTicketId("");
+    setAdAccounts([]);
+    setVpnAccounts([]);
+    keyRef.current = "";
+    submittedRef.current = false;
+    if (requested) {
+      const params = new URLSearchParams(searchParams.toString());
+      params.delete("action");
+      const query = params.toString();
+      router.replace(`/admin/batch${query ? `?${query}` : ""}`, {
+        scroll: false,
+      });
     }
-    setAdAccounts([
-      ...adAccounts,
+  };
+  const edit = () => {
+    if (submittedRef.current) {
+      keyRef.current = crypto.randomUUID();
+      submittedRef.current = false;
+    }
+  };
+  const addAd = () => {
+    if (adAccounts.length + vpnAccounts.length >= 100)
+      return showToast("Maximum 100 total accounts per batch", "error");
+    edit();
+    setAdAccounts((items) => [
+      ...items,
       {
-        name: '',
-        email: '',
-        ldapUsername: '',
-        password: '',
-        accountExpiresAt: '',
+        draftKey: crypto.randomUUID(),
+        name: "",
+        email: "",
+        ldapUsername: "",
+        password: "",
+        accountExpiresAt: "",
         isInternal: true,
       },
     ]);
   };
-
-  const removeAdAccount = (index: number) => {
-    setAdAccounts(adAccounts.filter((_, i) => i !== index));
-  };
-
-  const updateAdAccount = (index: number, field: keyof ADAccount, value: string | boolean) => {
-    const newAccounts = [...adAccounts];
-    newAccounts[index] = { ...newAccounts[index], [field]: value };
-    setAdAccounts(newAccounts);
-  };
-
-  const generateAdPassword = (index: number) => {
-    const length = 16;
-    const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
-    let password = '';
-    for (let i = 0; i < length; i++) {
-      password += charset.charAt(Math.floor(Math.random() * charset.length));
-    }
-    updateAdAccount(index, 'password', password);
-  };
-
-  const addVpnAccount = () => {
-    if (adAccounts.length + vpnAccounts.length >= 100) {
-      showToast('Maximum 100 total accounts per batch', 'error');
-      return;
-    }
-    setVpnAccounts([
-      ...vpnAccounts,
+  const addVpn = () => {
+    if (adAccounts.length + vpnAccounts.length >= 100)
+      return showToast("Maximum 100 total accounts per batch", "error");
+    edit();
+    setVpnAccounts((items) => [
+      ...items,
       {
-        name: '',
-        email: '',
-        vpnUsername: '',
-        password: '',
-        accountExpiresAt: '',
-        portalType: 'External',
+        draftKey: crypto.randomUUID(),
+        name: "",
+        email: "",
+        vpnUsername: "",
+        password: "",
+        accountExpiresAt: "",
+        portalType: "External",
       },
     ]);
   };
-
-  const removeVpnAccount = (index: number) => {
-    const newAccounts = vpnAccounts.filter((_, i) => i !== index);
-    setVpnAccounts(newAccounts);
-  };
-
-  const updateVpnAccount = (index: number, field: keyof VPNAccount, value: string) => {
-    const newAccounts = [...vpnAccounts];
-    newAccounts[index] = { ...newAccounts[index], [field]: value };
-    setVpnAccounts(newAccounts);
-  };
-
-  const generateVpnPassword = (index: number) => {
-    const length = 16;
-    const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
-    let password = '';
-    for (let i = 0; i < length; i++) {
-      password += charset.charAt(Math.floor(Math.random() * charset.length));
-    }
-    updateVpnAccount(index, 'password', password);
-  };
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-
-    // Validate
-    if (!description.trim()) {
-      showToast('Description is required', 'error');
-      return;
-    }
-
-    if (adAccounts.length === 0) {
-      showToast('At least one AD account is required', 'error');
-      return;
-    }
-
-    // Validate AD accounts
-    for (const account of adAccounts) {
-      if (!account.name || !account.ldapUsername || !account.password) {
-        showToast('All AD accounts must have name, username, and password', 'error');
-        return;
-      }
-      if (!account.isInternal && !account.accountExpiresAt) {
-        showToast('External AD accounts require an expiration date', 'error');
-        return;
-      }
-    }
-
-    // Validate VPN accounts
-    for (const account of vpnAccounts) {
-      if (!account.name || !account.vpnUsername || !account.password) {
-        showToast('All VPN accounts must have name, username, and password', 'error');
-        return;
-      }
-      if (!account.accountExpiresAt) {
-        showToast('VPN accounts require an expiration date', 'error');
-        return;
-      }
-    }
-
-    setIsSubmitting(true);
-
-    try {
-      const response = await fetchWithCsrf('/api/admin/batch-accounts', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
+  const cancel = async (batch: BatchCreation) => {
+    const decision = await requestActionImpact({
+      title: "Cancel account batch",
+      description: `Cancel "${batch.description}" and reconcile accounts it may already have created.`,
+      items: [
+        { label: "Scope", value: batch.description },
+        {
+          label: "External effects",
+          value: "Created directory and VPN accounts enter reconciliation",
+          tone: "warning",
         },
+      ],
+      confirmLabel: "Cancel and reconcile",
+      destructive: true,
+      evidence: "Cancellation and each reconciliation outcome are audited.",
+    });
+    if (!decision.confirmed) return;
+    try {
+      const response = await fetchWithCsrf(
+        `/api/admin/batch-accounts/${batch.id}/cancel`,
+        { method: "DELETE" },
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok)
+        throw new Error(data.error || "Batch cancellation failed");
+      showToast(
+        data.partial
+          ? `Cancellation needs reconciliation for ${data.rollback?.failed || 0} account(s).`
+          : "Batch cancelled",
+        data.partial ? "warning" : "success",
+      );
+      await onBatchCreated();
+    } catch (error) {
+      showToast(
+        error instanceof Error ? error.message : "Batch cancellation failed",
+        "error",
+      );
+    }
+  };
+  const submit = async () => {
+    if (!review.isReady || isSubmitting) return;
+    const ticket = supportTickets.find((item) => item.id === linkedTicketId);
+    const decision = await requestActionImpact({
+      title: "Start reviewed account batch",
+      description: BATCH_OWNERSHIP_CONFIRMATION,
+      items: [
+        { label: "AD accounts", value: adAccounts.length },
+        { label: "VPN accounts", value: vpnAccounts.length },
+        { label: "Support ticket", value: ticket?.subject || "None" },
+        {
+          label: "Failure handling",
+          value: "Partial outcomes stop for rollback or reconciliation",
+          tone: "warning",
+        },
+      ],
+      confirmLabel: "Start batch",
+      destructive: true,
+      evidence:
+        "The submission key prevents the same reviewed batch from starting twice.",
+    });
+    if (!decision.confirmed) return;
+    setIsSubmitting(true);
+    submittedRef.current = true;
+    try {
+      const response = await fetchWithCsrf("/api/admin/batch-accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          description,
+          description: description.trim(),
           linkedTicketId: linkedTicketId || undefined,
-          adAccounts,
-          vpnAccounts,
+          idempotencyKey: keyRef.current,
+          adAccounts: adAccounts.map(stripAd),
+          vpnAccounts: vpnAccounts.map(stripVpn),
         }),
       });
-
       const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to create batch');
+      if (data.replayed && data.batch?.id) {
+        showToast(
+          "This batch was already submitted; opening the existing tracked operation.",
+          "warning",
+        );
+        await onBatchCreated();
+        router.push(`/admin/batch-accounts/${data.batch.id}`);
+        return;
       }
-
+      if (!response.ok) {
+        if (data.batch?.id) {
+          showToast(data.error || "Batch requires review", "warning");
+          await onBatchCreated();
+          router.push(`/admin/batch-accounts/${data.batch.id}`);
+          return;
+        }
+        throw new Error(data.error || "Failed to create batch");
+      }
       showToast(
-        `Batch created successfully! ${data.summary.successful} successful, ${data.summary.failed} failed`,
-        data.summary.failed > 0 ? 'warning' : 'success'
+        `Batch complete: ${data.summary.successful} successful, ${data.summary.failed} failed`,
+        data.summary.failed > 0 ? "warning" : "success",
       );
-
-      setShowCreateForm(false);
-      setDescription('');
-      setLinkedTicketId('');
-      setAdAccounts([]);
-      setVpnAccounts([]);
-      onBatchCreated();
+      await onBatchCreated();
+      reset();
+      router.push(`/admin/batch-accounts/${data.batch.id}`);
     } catch (error) {
-      showToast(error instanceof Error ? error.message : 'Failed to create batch', 'error');
+      showToast(
+        error instanceof Error ? error.message : "Failed to create batch",
+        "error",
+      );
     } finally {
       setIsSubmitting(false);
     }
   };
-
-  const getStatusBadge = (status: string) => {
-    const styles = {
-      processing: 'bg-blue-100 text-blue-800',
-      completed: 'bg-green-100 text-green-800',
-      failed: 'bg-red-100 text-red-800',
-    };
-
-    return (
-      <span className={`px-3 py-1 rounded-full text-sm font-semibold ${styles[status as keyof typeof styles] || 'bg-gray-100 text-gray-800'}`}>
-        {status}
-      </span>
-    );
-  };
-
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <h2 className="text-2xl font-bold tracking-tight">Batch Account Creation</h2>
-        <Button
-          onClick={() => setShowCreateForm(!showCreateForm)}
-          variant={showCreateForm ? "secondary" : "default"}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-xl font-semibold">Batch operations</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Prepare, review, and start a tracked account batch.
+          </p>
+        </div>
+        {!visible && (
+          <Button
+            onClick={() => {
+              keyRef.current = crypto.randomUUID();
+              submittedRef.current = false;
+              setStep(1);
+              setOpen(true);
+            }}
+          >
+            <Plus className="h-4 w-4" /> New batch
+          </Button>
+        )}
+      </div>
+      {visible && (
+        <BatchWizard
+          step={step}
+          description={description}
+          linkedTicketId={linkedTicketId}
+          supportTickets={supportTickets}
+          adAccounts={adAccounts}
+          vpnAccounts={vpnAccounts}
+          review={review}
+          isSubmitting={isSubmitting}
+          onDescription={(value) => {
+            edit();
+            setDescription(value);
+          }}
+          onTicket={(value) => {
+            edit();
+            setLinkedTicketId(value);
+          }}
+          onAdChange={setAdAccounts}
+          onVpnChange={setVpnAccounts}
+          onAddAd={addAd}
+          onAddVpn={addVpn}
+          onClose={reset}
+          onStep={setStep}
+          onSubmit={() => void submit()}
+        />
+      )}
+      <BatchHistory
+        batches={batches}
+        onView={(id) => router.push(`/admin/batch-accounts/${id}`)}
+        onCancel={(batch) => void cancel(batch)}
+      />
+    </div>
+  );
+}
+
+function BatchWizard({
+  step,
+  description,
+  linkedTicketId,
+  supportTickets,
+  adAccounts,
+  vpnAccounts,
+  review,
+  isSubmitting,
+  onDescription,
+  onTicket,
+  onAdChange,
+  onVpnChange,
+  onAddAd,
+  onAddVpn,
+  onClose,
+  onStep,
+  onSubmit,
+}: {
+  step: 1 | 2 | 3;
+  description: string;
+  linkedTicketId: string;
+  supportTickets: Props["supportTickets"];
+  adAccounts: AdEntry[];
+  vpnAccounts: VpnEntry[];
+  review: Review;
+  isSubmitting: boolean;
+  onDescription: (value: string) => void;
+  onTicket: (value: string) => void;
+  onAdChange: SetEntries<AdEntry>;
+  onVpnChange: SetEntries<VpnEntry>;
+  onAddAd: () => void;
+  onAddVpn: () => void;
+  onClose: () => void;
+  onStep: (step: 1 | 2 | 3) => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <Card id="new-account-batch">
+      <CardHeader className="border-b">
+        <div className="flex justify-between gap-4">
+          <div>
+            <CardTitle>New account batch</CardTitle>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Nothing is provisioned until the final review is confirmed.
+            </p>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onClose}
+            disabled={isSubmitting}
+          >
+            Close
+          </Button>
+        </div>
+        <ol className="mt-5 grid grid-cols-3 overflow-hidden rounded-md border text-sm">
+          {STEPS.map((label, index) => (
+            <li
+              key={label}
+              className={`flex items-center gap-2 px-3 py-2.5 ${index > 0 ? "border-l" : ""} ${index + 1 === step ? "bg-muted font-medium" : ""}`}
+            >
+              <span className="flex h-5 w-5 items-center justify-center rounded-full border text-xs">
+                {index + 1 < step ? <Check className="h-3 w-3" /> : index + 1}
+              </span>
+              {label}
+            </li>
+          ))}
+        </ol>
+      </CardHeader>
+      <CardContent className="pt-6">
+        {step === 1 ? (
+          <BatchDetails
+            description={description}
+            ticket={linkedTicketId}
+            tickets={supportTickets}
+            onDescription={onDescription}
+            onTicket={onTicket}
+          />
+        ) : step === 2 ? (
+          <BatchAccountsEditor
+            adAccounts={adAccounts}
+            vpnAccounts={vpnAccounts}
+            onAdChange={onAdChange}
+            onVpnChange={onVpnChange}
+            onAddAd={onAddAd}
+            onAddVpn={onAddVpn}
+          />
+        ) : (
+          <BatchReview
+            review={review}
+            description={description}
+            adCount={adAccounts.length}
+            vpnCount={vpnAccounts.length}
+          />
+        )}
+        <div className="mt-6 flex justify-between border-t pt-4">
+          <Button
+            variant="outline"
+            onClick={() =>
+              step === 1 ? onClose() : onStep((step - 1) as 1 | 2 | 3)
+            }
+            disabled={isSubmitting}
+          >
+            <ArrowLeft className="h-4 w-4" />
+            {step === 1 ? "Cancel" : "Back"}
+          </Button>
+          {step < 3 ? (
+            <Button
+              onClick={() => onStep((step + 1) as 1 | 2 | 3)}
+              disabled={step === 1 && !description.trim()}
+            >
+              {step === 1 ? "Continue to accounts" : "Review batch"}
+              <ArrowRight className="h-4 w-4" />
+            </Button>
+          ) : (
+            <Button
+              onClick={onSubmit}
+              disabled={!review.isReady || isSubmitting}
+            >
+              {isSubmitting
+                ? "Starting batch…"
+                : `Start ${review.rows.length} account${review.rows.length === 1 ? "" : "s"}`}
+            </Button>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function BatchDetails({
+  description,
+  ticket,
+  tickets,
+  onDescription,
+  onTicket,
+}: {
+  description: string;
+  ticket: string;
+  tickets: Props["supportTickets"];
+  onDescription: (value: string) => void;
+  onTicket: (value: string) => void;
+}) {
+  return (
+    <div className="max-w-3xl space-y-5">
+      <div className="space-y-2">
+        <Label htmlFor="batch-description">Purpose or event</Label>
+        <Input
+          id="batch-description"
+          value={description}
+          onChange={(event) => onDescription(event.target.value)}
+          placeholder="Conference attendees - September session"
+          autoFocus
+        />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="batch-ticket">Support ticket (optional)</Label>
+        <Select
+          value={ticket || "none"}
+          onValueChange={(value) => onTicket(value === "none" ? "" : value)}
         >
-          {showCreateForm ? 'Cancel' : 'Create Batch'}
+          <SelectTrigger id="batch-ticket">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="none">No linked ticket</SelectItem>
+            {tickets.map((item) => (
+              <SelectItem key={item.id} value={item.id}>
+                {item.subject} · {item.status}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
+  );
+}
+
+function BatchAccountsEditor({
+  adAccounts,
+  vpnAccounts,
+  onAdChange,
+  onVpnChange,
+  onAddAd,
+  onAddVpn,
+}: {
+  adAccounts: AdEntry[];
+  vpnAccounts: VpnEntry[];
+  onAdChange: SetEntries<AdEntry>;
+  onVpnChange: SetEntries<VpnEntry>;
+  onAddAd: () => void;
+  onAddVpn: () => void;
+}) {
+  const update = (
+    kind: "ad" | "vpn",
+    index: number,
+    field: string,
+    value: string | boolean,
+  ) =>
+    (
+      (kind === "ad" ? onAdChange : onVpnChange) as Dispatch<
+        SetStateAction<(AdEntry | VpnEntry)[]>
+      >
+    )((items) =>
+      items.map((item, itemIndex) =>
+        itemIndex === index ? { ...item, [field]: value } : item,
+      ),
+    );
+  const remove = (kind: "ad" | "vpn", key: string) =>
+    (
+      (kind === "ad" ? onAdChange : onVpnChange) as Dispatch<
+        SetStateAction<(AdEntry | VpnEntry)[]>
+      >
+    )((items) => items.filter((item) => item.draftKey !== key));
+  return (
+    <div className="space-y-7">
+      <AccountSection
+        title="AD accounts"
+        accounts={adAccounts}
+        kind="ad"
+        onAdd={onAddAd}
+        onUpdate={update}
+        onRemove={remove}
+      />
+      <AccountSection
+        title="VPN accounts"
+        accounts={vpnAccounts}
+        kind="vpn"
+        onAdd={onAddVpn}
+        onUpdate={update}
+        onRemove={remove}
+      />
+    </div>
+  );
+}
+function AccountSection({
+  title,
+  accounts,
+  kind,
+  onAdd,
+  onUpdate,
+  onRemove,
+}: {
+  title: string;
+  accounts: (AdEntry | VpnEntry)[];
+  kind: "ad" | "vpn";
+  onAdd: () => void;
+  onUpdate: (
+    kind: "ad" | "vpn",
+    index: number,
+    field: string,
+    value: string | boolean,
+  ) => void;
+  onRemove: (kind: "ad" | "vpn", key: string) => void;
+}) {
+  return (
+    <section className="space-y-3">
+      <div className="flex justify-between gap-2">
+        <div>
+          <h3 className="font-semibold">
+            {title}{" "}
+            <span className="text-muted-foreground">({accounts.length})</span>
+          </h3>
+          <p className="text-xs text-muted-foreground">
+            {kind === "ad"
+              ? "At least one is required. External accounts require expiration."
+              : "Optional. Every VPN account requires an expiration."}
+          </p>
+        </div>
+        <Button type="button" variant="outline" size="sm" onClick={onAdd}>
+          <Plus className="h-4 w-4" /> Add {kind === "ad" ? "AD" : "VPN"}{" "}
+          account
         </Button>
       </div>
-
-      {showCreateForm && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-xl font-bold">Create New Batch</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <form onSubmit={handleSubmit} className="space-y-6">
-              <div className="grid gap-3">
-                <Label htmlFor="description">
-                  Description <span className="text-red-500">*</span>
-                </Label>
-                <Input
-                  id="description"
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                  placeholder="e.g., Conference attendees batch #1"
-                  required
-                />
-              </div>
-
-              <div className="grid gap-3">
-                <Label htmlFor="ticket">
-                  Link to Support Ticket (Optional)
-                </Label>
-                <Select
-                  value={linkedTicketId}
-                  onValueChange={setLinkedTicketId}
-                >
-                  <SelectTrigger id="ticket">
-                    <SelectValue placeholder="Select a ticket (Optional)" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="none">None</SelectItem>
-                    {supportTickets.map((ticket) => (
-                      <SelectItem key={ticket.id} value={ticket.id}>
-                        {ticket.subject} - {ticket.status}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div className="border-t pt-6">
-                <div className="flex justify-between items-center mb-4">
-                  <div>
-                    <h4 className="text-lg font-bold">AD Accounts ({adAccounts.length})</h4>
-                    <p className="text-sm text-gray-600 mt-1">Required - Add at least one AD account</p>
-                  </div>
-                  <Button
-                    type="button"
-                    onClick={addAdAccount}
-                    disabled={adAccounts.length + vpnAccounts.length >= 100}
-                    className="bg-blue-600 hover:bg-blue-700 text-white"
-                  >
-                    <Plus className="h-4 w-4 mr-2" />
-                    Add AD Account
-                  </Button>
-                </div>
-
-                {adAccounts.length === 0 ? (
-                  <div className="text-center py-8 text-gray-500 bg-gray-50 rounded-lg border-2 border-dashed border-gray-200">
-                    <p className="text-sm">No AD accounts added</p>
-                    <p className="text-xs mt-1">Click &ldquo;Add AD Account&rdquo; above to add at least one account</p>
-                  </div>
-                ) : (
-                  <div className="space-y-4 max-h-80 overflow-y-auto pr-2">
-                    {adAccounts.map((account, index) => (
-                      <Card key={index} className="border-blue-200 bg-blue-50/30">
-                        <CardContent className="p-4 space-y-3">
-                          <div className="flex justify-between items-center mb-2">
-                            <span className="font-semibold text-sm text-gray-700">AD Account {index + 1}</span>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => removeAdAccount(index)}
-                              className="text-red-600 hover:text-red-800 hover:bg-red-50"
-                            >
-                              <Trash2 className="h-4 w-4 mr-1" />
-                              Remove
-                            </Button>
-                          </div>
-
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                            <div>
-                              <Label className="text-xs font-semibold text-gray-600 mb-1">
-                                Full Name *
-                              </Label>
-                              <Input
-                                type="text"
-                                value={account.name}
-                                onChange={(e) => updateAdAccount(index, 'name', e.target.value)}
-                                className="bg-white"
-                                required
-                              />
-                            </div>
-
-                            <div>
-                              <Label className="text-xs font-semibold text-gray-600 mb-1">
-                                Email <span className="text-gray-400 font-normal">(Optional)</span>
-                              </Label>
-                              <Input
-                                type="email"
-                                value={account.email}
-                                onChange={(e) => updateAdAccount(index, 'email', e.target.value)}
-                                className="bg-white"
-                              />
-                            </div>
-
-                            <div>
-                              <Label className="text-xs font-semibold text-gray-600 mb-1">
-                                AD Username *
-                              </Label>
-                              <Input
-                                type="text"
-                                value={account.ldapUsername}
-                                onChange={(e) => updateAdAccount(index, 'ldapUsername', e.target.value)}
-                                className="bg-white"
-                                required
-                              />
-                            </div>
-
-                            <div>
-                              <Label className="text-xs font-semibold text-gray-600 mb-1">
-                                Password *
-                              </Label>
-                              <div className="flex gap-2">
-                                <Input
-                                  type="text"
-                                  value={account.password}
-                                  onChange={(e) => updateAdAccount(index, 'password', e.target.value)}
-                                  className="bg-white"
-                                  required
-                                />
-                                <Button
-                                  type="button"
-                                  variant="secondary"
-                                  size="icon"
-                                  onClick={() => generateAdPassword(index)}
-                                  title="Generate Password"
-                                >
-                                  <RefreshCw className="h-4 w-4" />
-                                </Button>
-                              </div>
-                            </div>
-
-                            <div>
-                              <DateTimePicker
-                                label={`Expiration Date ${!account.isInternal ? '*' : ''}`}
-                                value={account.accountExpiresAt}
-                                onChange={(datetime) => updateAdAccount(index, 'accountExpiresAt', datetime)}
-                                required={!account.isInternal}
-                                placeholder="Select expiration date/time"
-                              />
-                            </div>
-
-                            <div className="flex items-center pt-6">
-                              <div className="flex items-center space-x-2">
-                                <Checkbox
-                                  id={`internal-${index}`}
-                                  checked={account.isInternal}
-                                  onCheckedChange={(checked) => updateAdAccount(index, 'isInternal', checked as boolean)}
-                                />
-                                <Label htmlFor={`internal-${index}`} className="font-semibold cursor-pointer">
-                                  Internal User
-                                </Label>
-                              </div>
-                            </div>
-                          </div>
-                        </CardContent>
-                      </Card>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              <div className="border-t pt-6">
-                <div className="flex justify-between items-center mb-4">
-                  <div>
-                    <h4 className="text-lg font-bold">VPN Accounts ({vpnAccounts.length})</h4>
-                    <p className="text-sm text-gray-600 mt-1">Optional - Add VPN accounts if needed</p>
-                  </div>
-                  <Button
-                    type="button"
-                    onClick={addVpnAccount}
-                    disabled={adAccounts.length + vpnAccounts.length >= 100}
-                    className="bg-green-600 hover:bg-green-700 text-white"
-                  >
-                    <Plus className="h-4 w-4 mr-2" />
-                    Add VPN Account
-                  </Button>
-                </div>
-
-                {vpnAccounts.length === 0 ? (
-                  <div className="text-center py-8 text-gray-500 bg-gray-50 rounded-lg border-2 border-dashed border-gray-200">
-                    <p className="text-sm">No VPN accounts added</p>
-                    <p className="text-xs mt-1">Click &ldquo;Add VPN Account&rdquo; above to add VPN accounts</p>
-                  </div>
-                ) : (
-                  <div className="space-y-4 max-h-80 overflow-y-auto pr-2">
-                    {vpnAccounts.map((account, index) => (
-                      <Card key={index} className="border-green-200 bg-green-50/30">
-                        <CardContent className="p-4 space-y-3">
-                          <div className="flex justify-between items-center mb-2">
-                            <span className="font-semibold text-sm text-gray-700">VPN Account {index + 1}</span>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => removeVpnAccount(index)}
-                              className="text-red-600 hover:text-red-800 hover:bg-red-50"
-                            >
-                              <Trash2 className="h-4 w-4 mr-1" />
-                              Remove
-                            </Button>
-                          </div>
-
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                            <div>
-                              <Label className="text-xs font-semibold text-gray-600 mb-1">
-                                Full Name *
-                              </Label>
-                              <Input
-                                type="text"
-                                value={account.name}
-                                onChange={(e) => updateVpnAccount(index, 'name', e.target.value)}
-                                className="bg-white"
-                                required
-                              />
-                            </div>
-
-                            <div>
-                              <Label className="text-xs font-semibold text-gray-600 mb-1">
-                                Email <span className="text-gray-400 font-normal">(Optional)</span>
-                              </Label>
-                              <Input
-                                type="email"
-                                value={account.email}
-                                onChange={(e) => updateVpnAccount(index, 'email', e.target.value)}
-                                className="bg-white"
-                              />
-                            </div>
-
-                            <div>
-                              <Label className="text-xs font-semibold text-gray-600 mb-1">
-                                VPN Username *
-                              </Label>
-                              <Input
-                                type="text"
-                                value={account.vpnUsername}
-                                onChange={(e) => updateVpnAccount(index, 'vpnUsername', e.target.value)}
-                                className="bg-white"
-                                required
-                              />
-                            </div>
-
-                            <div>
-                              <Label className="text-xs font-semibold text-gray-600 mb-1">
-                                Password *
-                              </Label>
-                              <div className="flex gap-2">
-                                <Input
-                                  type="text"
-                                  value={account.password}
-                                  onChange={(e) => updateVpnAccount(index, 'password', e.target.value)}
-                                  className="bg-white"
-                                  required
-                                />
-                                <Button
-                                  type="button"
-                                  variant="secondary"
-                                  size="icon"
-                                  onClick={() => generateVpnPassword(index)}
-                                  title="Generate Password"
-                                >
-                                  <RefreshCw className="h-4 w-4" />
-                                </Button>
-                              </div>
-                            </div>
-
-                            <div>
-                              <Label className="text-xs font-semibold text-gray-600 mb-1">
-                                Portal Type *
-                              </Label>
-                              <Select
-                                value={account.portalType}
-                                onValueChange={(value) => updateVpnAccount(index, 'portalType', value)}
-                              >
-                                <SelectTrigger className="bg-white">
-                                  <SelectValue placeholder="Select portal type" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                  <SelectItem value="Management">Internal - Management</SelectItem>
-                                  <SelectItem value="Limited">Internal - Limited</SelectItem>
-                                  <SelectItem value="External">External</SelectItem>
-                                </SelectContent>
-                              </Select>
-                            </div>
-
-                            <div>
-                              <DateTimePicker
-                                label="Expiration Date *"
-                                value={account.accountExpiresAt}
-                                onChange={(datetime) => updateVpnAccount(index, 'accountExpiresAt', datetime)}
-                                required
-                                placeholder="Select expiration date/time"
-                              />
-                            </div>
-                          </div>
-                        </CardContent>
-                      </Card>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              <div className="flex justify-end gap-3 pt-4 border-t">
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setShowCreateForm(false)}
-                  disabled={isSubmitting}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="submit"
-                  disabled={isSubmitting || (adAccounts.length === 0)}
-                >
-                  {isSubmitting ? 'Creating...' : `Create ${adAccounts.length + vpnAccounts.length} Account${adAccounts.length + vpnAccounts.length !== 1 ? 's' : ''}`}
-                </Button>
-              </div>
-            </form>
-          </CardContent>
-        </Card>
-      )}
-
-      <Card>
-        <CardHeader className="bg-gray-50/50 border-b">
-          <CardTitle className="text-lg font-bold">Batch History</CardTitle>
-        </CardHeader>
-
-        {batches.length === 0 ? (
-          <CardContent className="p-8 text-center text-gray-500">
-            No batch operations yet
-          </CardContent>
-        ) : (
-          <Table>
-            <TableHeader className="bg-gray-50">
-              <TableRow>
-                <TableHead>Created</TableHead>
-                <TableHead>Created By</TableHead>
-                <TableHead>Description</TableHead>
-                <TableHead>Linked Ticket</TableHead>
-                <TableHead>Total</TableHead>
-                <TableHead>Successful</TableHead>
-                <TableHead>Failed</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {batches.map((batch) => (
-                <TableRow key={batch.id} className="hover:bg-gray-50">
-                  <TableCell className="text-sm">
-                    {new Date(batch.createdAt).toLocaleString()}
-                  </TableCell>
-                  <TableCell className="font-semibold">
-                    {batch.createdBy}
-                  </TableCell>
-                  <TableCell>
-                    {batch.description}
-                  </TableCell>
-                  <TableCell>
-                    {batch.linkedTicket ? (
-                      <div>
-                        <div className="font-medium">{batch.linkedTicket.subject}</div>
-                        <div className="text-xs text-gray-500">{batch.linkedTicket.status}</div>
-                      </div>
-                    ) : (
-                      <span className="text-gray-400">—</span>
-                    )}
-                  </TableCell>
-                  <TableCell className="font-semibold">
-                    {batch.totalAccounts}
-                  </TableCell>
-                  <TableCell>
-                    <span className="text-green-600 font-semibold">{batch.successfulAccounts}</span>
-                  </TableCell>
-                  <TableCell>
-                    <span className="text-red-600 font-semibold">{batch.failedAccounts}</span>
-                  </TableCell>
-                  <TableCell>
-                    {getStatusBadge(batch.status)}
-                  </TableCell>
-                  <TableCell>
-                    <Button
-                      variant="link"
-                      onClick={() => router.push(`/admin/batch-accounts/${batch.id}`)}
-                      className="text-black font-semibold p-0 h-auto"
-                    >
-                      View Details
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+      {accounts.map((account, index) => (
+        <AccountFields
+          key={account.draftKey}
+          account={account}
+          index={index}
+          kind={kind}
+          onUpdate={onUpdate}
+          onRemove={onRemove}
+        />
+      ))}
+    </section>
+  );
+}
+function AccountFields({
+  account,
+  index,
+  kind,
+  onUpdate,
+  onRemove,
+}: {
+  account: AdEntry | VpnEntry;
+  index: number;
+  kind: "ad" | "vpn";
+  onUpdate: (
+    kind: "ad" | "vpn",
+    index: number,
+    field: string,
+    value: string | boolean,
+  ) => void;
+  onRemove: (kind: "ad" | "vpn", key: string) => void;
+}) {
+  const adAccount = account as AdEntry;
+  const vpnAccount = account as VpnEntry;
+  const set = (field: string, value: string | boolean) =>
+    onUpdate(kind, index, field, value);
+  const id = `${kind}-${account.draftKey}`;
+  return (
+    <div className="rounded-md border p-4">
+      <div className="mb-3 flex justify-between">
+        <span className="text-sm font-medium">
+          {kind === "ad" ? "AD" : "VPN"} account {index + 1}
+        </span>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => onRemove(kind, account.draftKey)}
+        >
+          <Trash2 className="h-4 w-4 text-destructive" />
+          Remove
+        </Button>
+      </div>
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        <Field
+          id={`${id}-name`}
+          label="Full name"
+          value={account.name ?? ""}
+          onChange={(value: string) => set("name", value)}
+        />
+        <Field
+          id={`${id}-email`}
+          label={kind === "ad" ? "Email" : "Email (optional)"}
+          value={account.email ?? ""}
+          onChange={(value: string) => set("email", value)}
+          type="email"
+        />
+        <Field
+          id={`${id}-username`}
+          label={kind === "ad" ? "AD username" : "VPN username"}
+          value={
+            kind === "ad" ? adAccount.ldapUsername : vpnAccount.vpnUsername
+          }
+          onChange={(value: string) =>
+            set(kind === "ad" ? "ldapUsername" : "vpnUsername", value)
+          }
+        />
+        <Field
+          id={`${id}-password`}
+          label="Initial password"
+          value={account.password ?? ""}
+          onChange={(value: string) => set("password", value)}
+          password
+          onGenerate={() => set("password", password())}
+        />
+        {kind === "vpn" && (
+          <div className="space-y-1.5">
+            <Label>Portal type</Label>
+            <Select
+              value={vpnAccount.portalType}
+              onValueChange={(value) => set("portalType", value)}
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="Management">
+                  Internal - Management
+                </SelectItem>
+                <SelectItem value="Limited">Internal - Limited</SelectItem>
+                <SelectItem value="External">External</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         )}
-      </Card>
+        <DateTimePicker
+          label={`Expiration${kind === "ad" && adAccount.isInternal ? " (optional)" : ""}`}
+          value={account.accountExpiresAt}
+          onChange={(value) => set("accountExpiresAt", value)}
+          required={kind === "vpn" || !adAccount.isInternal}
+          placeholder="Select expiration"
+        />
+        {kind === "ad" && (
+          <div className="flex items-center gap-2 pt-7">
+            <Checkbox
+              id={`${id}-internal`}
+              checked={adAccount.isInternal}
+              onCheckedChange={(checked) => set("isInternal", checked === true)}
+            />
+            <Label htmlFor={`${id}-internal`}>Internal account</Label>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+function Field({
+  id,
+  label,
+  value,
+  onChange,
+  type = "text",
+  password: isPassword,
+  onGenerate,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  type?: string;
+  password?: boolean;
+  onGenerate?: () => void;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label htmlFor={id}>{label}</Label>
+      <div className="flex gap-2">
+        <Input
+          id={id}
+          type={isPassword ? "password" : type}
+          autoComplete={isPassword ? "new-password" : undefined}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        />
+        {isPassword && (
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            title="Generate password"
+            onClick={onGenerate}
+          >
+            <RefreshCw className="h-4 w-4" />
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+function BatchReview({
+  review,
+  description,
+  adCount,
+  vpnCount,
+}: {
+  review: Review;
+  description: string;
+  adCount: number;
+  vpnCount: number;
+}) {
+  return (
+    <div className="space-y-4">
+      <Alert className="bg-muted/20">
+        <AlertTriangle />
+        <AlertTitle>Final validation happens under lock</AlertTitle>
+        <AlertDescription>
+          The server checks active requests and directory usernames while
+          holding race-control locks.
+        </AlertDescription>
+      </Alert>
+      {review.issues.length > 0 && (
+        <Alert variant="destructive">
+          <AlertTriangle />
+          <AlertTitle>Batch-level issues</AlertTitle>
+          <AlertDescription>
+            <ul className="list-disc pl-4">
+              {review.issues.map((issue: string) => (
+                <li key={issue}>{issue}</li>
+              ))}
+            </ul>
+          </AlertDescription>
+        </Alert>
+      )}
+      <div className="overflow-x-auto rounded-md border">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Type</TableHead>
+              <TableHead>Name</TableHead>
+              <TableHead>Username</TableHead>
+              <TableHead>Review</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {review.rows.map((row) => (
+              <TableRow key={row.key}>
+                <TableCell>{row.type}</TableCell>
+                <TableCell>{row.name || "—"}</TableCell>
+                <TableCell>{row.username || "—"}</TableCell>
+                <TableCell>
+                  {row.issues.length === 0 ? "Ready" : row.issues.join(", ")}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+      <div className="grid gap-3 rounded-md border bg-muted/20 p-4 text-sm sm:grid-cols-3">
+        <div>
+          Purpose<p className="font-medium">{description || "—"}</p>
+        </div>
+        <div>
+          Accounts
+          <p className="font-medium">
+            {adCount} AD · {vpnCount} VPN
+          </p>
+        </div>
+        <div>
+          Tracking
+          <p className="font-medium">
+            One batch ID + one request ID per AD account
+          </p>
+        </div>
+      </div>
     </div>
   );
 }

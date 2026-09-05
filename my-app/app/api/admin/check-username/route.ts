@@ -2,11 +2,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { searchLDAPUserForProvisioning } from '@/lib/ldap';
-import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { checkReviewAccessWithRateLimit } from '@/lib/adminAuth';
 import { checkRateLimitAsync, getClientIp } from '@/lib/ratelimit';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 import { findReusableOffboardedRequest } from '@/lib/offboard-reenrollment';
 import { isJsonBodyError, parseAdminJson } from '@/lib/admin-json-parser';
+import { actorHasPermission } from '@/lib/rbac/core';
 
 type CheckUsernameBody = {
   username?: string;
@@ -17,10 +18,13 @@ export async function POST(
   request: NextRequest
 ) {
   try {
-    const { admin, response } = await checkAdminAuthWithRateLimit(request);
+    const { admin, response } = await checkReviewAccessWithRateLimit(request);
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!actorHasPermission(admin, 'access_requests.provision')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const body = await parseAdminJson<CheckUsernameBody>(request);
@@ -87,7 +91,7 @@ export async function POST(
     } catch (ldapError) {
       console.error('LDAP search error:', ldapError);
       return NextResponse.json(
-        { error: 'Failed to verify LDAP username availability. Please try again.' },
+        { error: 'Failed to verify directory username availability. Please try again.' },
         { status: 503 }
       );
     }

@@ -2,7 +2,8 @@ import crypto from 'crypto';
 import type { Client } from 'ldapts';
 import { prisma } from '@/lib/prisma';
 import { createLDAPClient } from '@/lib/ldap';
-import { getOptionalEnv, getRequiredEnv } from '@/lib/env-validator';
+import { getOptionalEnv } from '@/lib/env-validator';
+import { getConfigValue, getRequiredSecretValue } from '@/lib/config/resolver';
 import { sendPasswordExpirationReminderEmail } from '@/lib/email';
 import {
   AuditActions,
@@ -198,9 +199,13 @@ export function buildPasswordReminderKey(
 }
 
 async function bindServiceClient(): Promise<Client> {
-  const client = createLDAPClient();
+  const client = await createLDAPClient();
+  const [bindDn, bindPassword] = await Promise.all([
+    getConfigValue<string>('ldap.bindDn'),
+    getRequiredSecretValue('ldap.bindPassword'),
+  ]);
   await withTimeout(
-    client.bind(getRequiredEnv('LDAP_BIND_DN'), getRequiredEnv('LDAP_BIND_PASSWORD')),
+    client.bind(bindDn, bindPassword),
     LDAP_TIMEOUT
   );
   return client;
@@ -243,8 +248,9 @@ async function getDomainMaxPasswordAgeDays(client: Client): Promise<number | nul
 }
 
 async function listPasswordExpirationEntries(client: Client): Promise<Map<string, LdapEntry>> {
+  const searchBase = await getConfigValue<string>('ldap.searchBase');
   const { searchEntries } = await withTimeout(
-    client.search(getRequiredEnv('LDAP_SEARCH_BASE'), {
+    client.search(searchBase, {
       filter: '(&(objectCategory=person)(objectClass=user))',
       scope: 'sub',
       attributes: [

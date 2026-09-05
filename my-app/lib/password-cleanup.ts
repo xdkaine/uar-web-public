@@ -17,7 +17,7 @@ export async function clearAccessRequestPassword(requestId: string): Promise<boo
       requestId, 
       error: error instanceof Error ? error.message : String(error) 
     });
-    return false;
+    throw error;
   }
 }
 
@@ -37,35 +37,62 @@ export async function clearBatchAccountPassword(batchItemId: string): Promise<bo
       batchItemId, 
       error: error instanceof Error ? error.message : String(error) 
     });
-    return false;
+    throw error;
   }
 }
 
 export async function cleanupStaleAccessRequestPasswords(daysOld: number = 7): Promise<number> {
   try {
     const cutoffDate = new Date(Date.now() - daysOld * 24 * 60 * 60 * 1000);
-    
-    const result = await prisma.accessRequest.updateMany({
+
+    const pendingResult = await prisma.accessRequest.updateMany({
+      where: {
+        provisioningState: 'credential_cleanup_pending',
+        OR: [
+          { provisioningCompletedAt: { lt: cutoffDate } },
+          {
+            provisioningCompletedAt: null,
+            provisioningStartedAt: { lt: cutoffDate },
+          },
+        ],
+      },
+      data: {
+        accountPassword: null,
+        provisioningState: 'completed',
+        provisioningError: null,
+      },
+    });
+
+    const terminalResult = await prisma.accessRequest.updateMany({
       where: {
         accountPassword: { not: null },
-        provisioningCompletedAt: {
-          lt: cutoffDate
-        }
+        provisioningState: { in: ['ldap_failed', 'delivery_failed', 'completed'] },
+        OR: [
+          {
+            provisioningCompletedAt: {
+              lt: cutoffDate
+            }
+          },
+          { provisioningCompletedAt: null, provisioningStartedAt: { lt: cutoffDate } }
+        ]
       },
       data: { accountPassword: null }
     });
     
-    appLogger.info('Cleaned up stale access request passwords', { 
-      count: result.count,
+    const count = pendingResult.count + terminalResult.count;
+    appLogger.info('Cleaned up stale access request passwords', {
+      count,
+      cleanupPendingCompleted: pendingResult.count,
+      terminalCredentialsCleared: terminalResult.count,
       daysOld 
     });
-    
-    return result.count;
+
+    return count;
   } catch (error) {
     appLogger.error('Failed to cleanup stale access request passwords', { 
       error: error instanceof Error ? error.message : String(error) 
     });
-    return 0;
+    throw error;
   }
 }
 
@@ -94,7 +121,7 @@ export async function cleanupStaleBatchPasswords(daysOld: number = 7): Promise<n
     appLogger.error('Failed to cleanup stale batch passwords', { 
       error: error instanceof Error ? error.message : String(error) 
     });
-    return 0;
+    throw error;
   }
 }
 
@@ -105,9 +132,45 @@ export async function runPasswordCleanup(daysOld: number = 7): Promise<{
 }> {
   appLogger.info('Starting password cleanup task', { daysOld });
   
-  const accessRequestsCleared = await cleanupStaleAccessRequestPasswords(daysOld);
-  const batchAccountsCleared = await cleanupStaleBatchPasswords(daysOld);
+  let accessRequestsCleared = 0;
+  let batchAccountsCleared = 0;
+
+  try {
+    accessRequestsCleared = await cleanupStaleAccessRequestPasswords(daysOld);
+    batchAccountsCleared = await cleanupStaleBatchPasswords(daysOld);
+  } catch (error) {
+    await prisma.auditLog.create({
+      data: {
+        action: 'scheduled_password_cleanup',
+        category: 'settings',
+        username: 'password-cleanup-scheduler',
+        actorType: 'system',
+        targetType: 'EncryptedCredentials',
+        eventKind: 'security',
+        outcome: 'failure',
+        success: false,
+        errorMessage: error instanceof Error ? error.message : 'Unknown cleanup error',
+        details: JSON.stringify({ accessRequestsCleared, batchAccountsCleared, daysOld }),
+      },
+    });
+    throw error;
+  }
+
   const totalCleared = accessRequestsCleared + batchAccountsCleared;
+
+  await prisma.auditLog.create({
+    data: {
+      action: 'scheduled_password_cleanup',
+      category: 'settings',
+      username: 'password-cleanup-scheduler',
+      actorType: 'system',
+      targetType: 'EncryptedCredentials',
+      eventKind: 'security',
+      outcome: 'success',
+      success: true,
+      details: JSON.stringify({ accessRequestsCleared, batchAccountsCleared, totalCleared, daysOld }),
+    },
+  });
   
   appLogger.info('Password cleanup task completed', {
     accessRequestsCleared,

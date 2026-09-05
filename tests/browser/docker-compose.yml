@@ -1,0 +1,228 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: uar_browser_test
+      POSTGRES_USER: uar_test
+      POSTGRES_PASSWORD: fixture-db-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U uar_test -d uar_browser_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /data
+
+  directory:
+    build:
+      context: ./directory
+    cap_add:
+      - SYS_ADMIN
+    environment:
+      SAMBA_REALM: UAR.TEST
+      SAMBA_DOMAIN: UAR
+      SAMBA_ADMIN_PASSWORD: Fixture-admin-42!
+      BROWSER_TEST_USER_PASSWORD: ${BROWSER_TEST_USER_PASSWORD:-Fixture-only-42!}
+    volumes:
+      - directory_state:/var/lib/samba
+      - directory_certs:/var/lib/samba/private/tls
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/lib/samba/browser-fixtures-ready && samba-tool domain info 127.0.0.1 >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  smtp:
+    image: axllent/mailpit:v1.27
+    ports:
+      - "127.0.0.1:4425:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  portal-migrate:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: prisma-tool
+    environment:
+      DATABASE_URL: postgresql://uar_test:fixture-db-only@postgres:5432/uar_browser_test?sslmode=disable
+      DATABASE_SSL_ALLOW_INSECURE: "true"
+    command: ["migrate", "deploy"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  auth-migrate:
+    build:
+      context: ../..
+      dockerfile: services/auth-service/Dockerfile
+      target: builder
+    environment:
+      DATABASE_URL: postgresql://uar_test:fixture-db-only@postgres:5432/uar_browser_test?sslmode=disable
+    command: ["npx", "prisma", "migrate", "deploy"]
+    depends_on:
+      portal-migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  fixtures:
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD: fixture-db-only
+    volumes:
+      - ./fixtures.sql:/fixtures.sql:ro
+    command: ["psql", "-h", "postgres", "-U", "uar_test", "-d", "uar_browser_test", "-v", "ON_ERROR_STOP=1", "-f", "/fixtures.sql"]
+    depends_on:
+      auth-migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  auth:
+    build:
+      context: ../..
+      dockerfile: services/auth-service/Dockerfile
+    ports:
+      - "127.0.0.1:4403:3003"
+    environment:
+      NODE_ENV: test
+      AUTH_ISSUER: http://127.0.0.1:4403
+      AUTH_PORT: "3003"
+      AUTH_COOKIE_KEYS: fixture-cookie-key-one-at-least-32-characters,fixture-cookie-key-two-at-least-32-characters
+      DATABASE_URL: postgresql://uar_test:fixture-db-only@postgres:5432/uar_browser_test?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      OIDC_CLIENT_ID: uar-portal
+      OIDC_CLIENT_SECRET: fixture-oidc-secret-at-least-32-characters
+      OIDC_REDIRECT_URIS: http://127.0.0.1:4402/api/auth/oidc/callback
+      OIDC_POST_LOGOUT_URIS: http://127.0.0.1:4402
+      LDAP_URL: ldaps://directory:636
+      LDAP_DOMAIN: uar.test
+      LDAP_SEARCH_BASE: CN=Users,DC=uar,DC=test
+      LDAP_BIND_DN: Administrator@uar.test
+      LDAP_BIND_PASSWORD: Fixture-admin-42!
+      LDAP_ALLOW_INVALID_CERTS: "false"
+      NODE_EXTRA_CA_CERTS: /test-directory-certs/ca.pem
+      NEXT_PUBLIC_TURNSTILE_SITE_KEY: 1x00000000000000000000AA
+      TURNSTILE_SECRET_KEY: 1x0000000000000000000000000000000AA
+      AUTH_LOGIN_MAX_ATTEMPTS: "1000"
+      AUTH_ADMIN_GROUPS: role-full-admin
+      AUTH_CLIENT_SECRET_ENC_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      AUTH_INTERNAL_BRANDING_TOKEN: fixture-branding-token-at-least-32-characters
+    volumes:
+      - directory_certs:/test-directory-certs:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      directory:
+        condition: service_healthy
+      fixtures:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3003/healthz"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  app:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_APP_URL: http://127.0.0.1:4402
+        NEXT_PUBLIC_TURNSTILE_SITE_KEY: 1x00000000000000000000AA
+    ports:
+      - "127.0.0.1:4402:3002"
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://uar_test:fixture-db-only@postgres:5432/uar_browser_test?sslmode=disable
+      DATABASE_SSL_ALLOW_INSECURE: "true"
+      REDIS_URL: redis://redis:6379
+      SMTP_HOST: smtp
+      SMTP_PORT: "1025"
+      SMTP_USER: browser-fixture
+      SMTP_PASSWORD: browser-fixture
+      EMAIL_FROM: browser-fixture@uar.test
+      ADMIN_EMAIL: browser-admin@uar.test
+      LDAP_URL: ldaps://directory:636
+      LDAP_BIND_DN: Administrator@uar.test
+      LDAP_BIND_PASSWORD: Fixture-admin-42!
+      LDAP_BASE: DC=uar,DC=test
+      LDAP_SEARCH_BASE: CN=Users,DC=uar,DC=test
+      LDAP_DOMAIN_SEARCH_BASE: DC=uar,DC=test
+      LDAP_DOMAIN: uar.test
+      LDAP_ADMIN_GROUPS: '["CN=role-full-admin,CN=Users,DC=uar,DC=test"]'
+      LDAP_GROUP2ADD: CN=role-group-assignee,CN=Users,DC=uar,DC=test
+      LDAP_KAMINO_INTERNAL_GROUP: CN=role-group-assignee,CN=Users,DC=uar,DC=test
+      LDAP_KAMINO_EXTERNAL_GROUP: CN=role-group-assignee,CN=Users,DC=uar,DC=test
+      LDAP_GROUPSEARCH: CN=Users,DC=uar,DC=test
+      LDAP_ALLOW_INVALID_CERTS: "false"
+      NODE_EXTRA_CA_CERTS: /test-directory-certs/ca.pem
+      NEXTAUTH_URL: http://127.0.0.1:4402
+      NEXTAUTH_SECRET: fixture-nextauth-secret-at-least-32-characters
+      NEXT_PUBLIC_APP_URL: http://127.0.0.1:4402
+      NEXT_PUBLIC_TURNSTILE_SITE_KEY: 1x00000000000000000000AA
+      TURNSTILE_SECRET_KEY: 1x0000000000000000000000000000000AA
+      ENCRYPTION_SECRET: fixture-encryption-secret-at-least-32-characters
+      ENCRYPTION_SALT: fixture-encryption-salt-at-least-32-characters
+      AUTH_MODE: oidc
+      AUTH_ISSUER: http://127.0.0.1:4403
+      AUTH_CLIENT_ID: uar-portal
+      AUTH_CLIENT_SECRET: fixture-oidc-secret-at-least-32-characters
+      AUTH_REDIRECT_URI: http://127.0.0.1:4402/api/auth/oidc/callback
+      OIDC_INTERNAL_ISSUER_URL: http://auth:3003
+      AUTH_INTERNAL_ISSUER_URL: http://auth:3003
+      AUTH_BROWSER_BASE_URL: http://127.0.0.1:4403
+      AUTH_ALLOW_INSECURE_OIDC: "true"
+      AUTH_INTERNAL_BRANDING_TOKEN: fixture-branding-token-at-least-32-characters
+      SESSION_COOKIE_ALLOW_INSECURE: "true"
+      CRON_SECRET: fixture-cron-secret-at-least-32-characters
+      MONITOR_PROBE_SHARED_SECRET: fixture-monitor-secret-at-least-32-characters
+      MONITOR_PROBE_URL: http://monitor-probe:8091
+      ASSET_SHARED_SECRET: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      ASSET_SERVICE_URL: http://127.0.0.1:9
+      CLAMAV_HOST: 127.0.0.1
+      CLAMAV_PORT: "9"
+      LIFECYCLE_QUEUE_SCHEDULER_ENABLED: "false"
+      OFFBOARD_SCHEDULER_ENABLED: "false"
+      PASSWORD_EXPIRATION_SCHEDULER_ENABLED: "false"
+      PASSWORD_CLEANUP_SCHEDULER_ENABLED: "false"
+      DIRECTORY_PROBE_ENABLED: "false"
+      WORKFLOW_TICK_ENABLED: "false"
+      OPERATIONAL_DETECTOR_SCHEDULER_ENABLED: "false"
+      MONITORED_ENDPOINTS_SCHEDULER_ENABLED: "false"
+      ATTACHMENT_QUARANTINE_PURGE_ENABLED: "false"
+      FLOW_OUTBOX_SCHEDULER_ENABLED: "false"
+    volumes:
+      - directory_certs:/test-directory-certs:ro
+    depends_on:
+      auth:
+        condition: service_healthy
+      fixtures:
+        condition: service_completed_successfully
+      smtp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3002/login"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 15s
+
+volumes:
+  directory_state:
+  directory_certs:

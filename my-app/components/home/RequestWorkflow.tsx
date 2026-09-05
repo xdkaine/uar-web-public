@@ -1,6 +1,6 @@
 'use client';
 
-import { motion } from 'framer-motion';
+import { domAnimation, LazyMotion, m, MotionConfig, useReducedMotion } from 'framer-motion';
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 
 type CursorPosition = {
@@ -80,13 +80,64 @@ const MICRO_LABEL_CLASS = 'text-[10px] font-medium uppercase tracking-[0.25em]';
 const BODY_TEXT_CLASS = 'text-sm text-gray-700 leading-relaxed';
 const CARD_BASE_CLASS = 'rounded-xl border border-gray-200 bg-white shadow-sm';
 
+function startTypingAnimation(
+  value: string,
+  target: FormField,
+  speed: number,
+  startIndex: number,
+  update: (target: FormField, value: string) => void
+) {
+  let index = Math.min(startIndex, value.length);
+  if (index >= value.length) {
+    return () => undefined;
+  }
+
+  const interval = setInterval(() => {
+    index += 1;
+    update(target, value.slice(0, index));
+    if (index >= value.length) {
+      clearInterval(interval);
+    }
+  }, speed);
+
+  return () => clearInterval(interval);
+}
+
+/**
+ * Walks a demo sequence once and holds on its final frame. Looping restarted
+ * the panel partway through the workflow step's progress bar, so each demo now
+ * plays through and waits for the hand-off instead.
+ */
+function useDemoSequence(steps: readonly { duration: number }[], isPaused: boolean) {
+  const [stepIndex, setStepIndex] = useState(0);
+
+  useEffect(() => {
+    if (isPaused || stepIndex >= steps.length - 1) {
+      return;
+    }
+
+    const timer = setTimeout(() => setStepIndex(prev => prev + 1), steps[stepIndex].duration);
+
+    return () => clearTimeout(timer);
+  }, [stepIndex, isPaused, steps]);
+
+  return stepIndex;
+}
+
+/** How long a finished demo stays on screen before the workflow advances. */
+const SEQUENCE_HOLD_MS = 1400;
+
+const sequenceDurationMs = (steps: readonly { duration: number }[]) =>
+  steps.reduce((total, step) => total + step.duration, 0) + SEQUENCE_HOLD_MS;
+
 const AnimatedCursor = ({ position, isClicking }: { position: CursorPosition; isClicking: boolean }) => (
-  <motion.div
+  <m.div
     className="pointer-events-none absolute z-40"
+    initial={false}
     animate={{ left: position.x, top: position.y, scale: isClicking ? 0.92 : 1 }}
     transition={{ type: 'spring', stiffness: 220, damping: 30 }}
   >
-    <motion.svg
+    <m.svg
       width="28"
       height="28"
       viewBox="0 0 24 24"
@@ -95,20 +146,20 @@ const AnimatedCursor = ({ position, isClicking }: { position: CursorPosition; is
       initial={false}
       animate={{ scale: isClicking ? 0.9 : 1, rotate: isClicking ? -4 : 0 }}
       transition={{ type: 'spring', stiffness: 200, damping: 24 }}
-      className="drop-shadow-[0_4px_6px_rgba(15,23,42,0.25)]"
+      style={{ filter: 'drop-shadow(0 4px 6px var(--landing-cursor-shadow))' }}
     >
       <path
         d="M4 3.5L9.5 20.5L11.75 14.5L17.5 17.75L4 3.5Z"
-        fill={isClicking ? '#0f172a' : '#111827'}
+        fill={isClicking ? 'var(--landing-cursor-fill-active)' : 'var(--landing-cursor-fill)'}
       />
       <path
         d="M4 3.5L9.5 20.5L11.75 14.5L17.5 17.75L4 3.5Z"
-        stroke="#f8fafc"
+        stroke="var(--landing-cursor-stroke)"
         strokeWidth="1.2"
         strokeLinejoin="round"
       />
-    </motion.svg>
-  </motion.div>
+    </m.svg>
+  </m.div>
 );
 
 const InteractiveRequestDemo = ({ isPaused }: { isPaused: boolean }) => {
@@ -121,56 +172,68 @@ const InteractiveRequestDemo = ({ isPaused }: { isPaused: boolean }) => {
     event: '',
   });
   const [submitPulse, setSubmitPulse] = useState(false);
+  const typingIndexRef = useRef<Partial<Record<FormField, number>>>({});
+  const remainingStepMsRef = useRef(INTERACTIVE_STEPS[0].duration);
+  const stepStartedAtRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (isPaused) return;
     const step = INTERACTIVE_STEPS[stepIndex];
-    let typingInterval: ReturnType<typeof setInterval> | null = null;
-    let pulseTimeout: ReturnType<typeof setTimeout> | null = null;
-    let syncTimeout: ReturnType<typeof setTimeout> | null = null;
+    const typingValue = step.typingValue;
+    const typingTarget = step.target;
+    if (isPaused) {
+      return;
+    }
 
-    syncTimeout = setTimeout(() => {
+    stepStartedAtRef.current = Date.now();
+    const stopTyping = !isPaused && typingValue && typingTarget
+      ? startTypingAnimation(
+        typingValue,
+        typingTarget,
+        step.typingSpeed ?? 60,
+        typingIndexRef.current[typingTarget] ?? 0,
+        (target, value) => {
+          typingIndexRef.current[target] = value.length;
+          setFormState(prev => ({ ...prev, [target]: value }));
+        }
+      )
+      : () => undefined;
+    const syncTimeout = setTimeout(() => {
       if (step.updates) {
         setFormState(prev => ({ ...prev, ...step.updates }));
       }
-
-      if (step.typingValue && step.target) {
-        let index = 0;
-        typingInterval = setInterval(() => {
-          index += 1;
-          const slice = step.typingValue!.slice(0, index);
-          setFormState(prev => ({ ...prev, [step.target as FormField]: slice }));
-          if (index >= step.typingValue!.length) {
-            clearInterval(typingInterval!);
-            typingInterval = null;
-          }
-        }, step.typingSpeed ?? 60);
+      if (step.id === 'reset') {
+        typingIndexRef.current = {};
       }
-
-      if (step.id === 'submit') {
-        setSubmitPulse(true);
-        pulseTimeout = setTimeout(() => {
-          setSubmitPulse(false);
-        }, 900);
-      } else {
-        setSubmitPulse(false);
-      }
+      setSubmitPulse(step.id === 'submit');
     }, 0);
 
-    const timer = setTimeout(() => {
-      setStepIndex(prev => (prev + 1) % INTERACTIVE_STEPS.length);
-    }, step.duration);
+    const pulseTimeout = setTimeout(() => {
+      if (step.id === 'submit') {
+        setSubmitPulse(false);
+      }
+    }, 900);
+
+    const isLastStep = stepIndex >= INTERACTIVE_STEPS.length - 1;
+    const stepTimeout = isLastStep
+      ? null
+      : setTimeout(() => {
+        const nextIndex = stepIndex + 1;
+        remainingStepMsRef.current = INTERACTIVE_STEPS[nextIndex].duration;
+        stepStartedAtRef.current = null;
+        setStepIndex(nextIndex);
+      }, remainingStepMsRef.current);
 
     return () => {
-      clearTimeout(timer);
-      if (typingInterval) {
-        clearInterval(typingInterval);
+      if (stepStartedAtRef.current !== null) {
+        const elapsed = Date.now() - stepStartedAtRef.current;
+        remainingStepMsRef.current = Math.max(0, remainingStepMsRef.current - elapsed);
+        stepStartedAtRef.current = null;
       }
-      if (pulseTimeout) {
-        clearTimeout(pulseTimeout);
-      }
-      if (syncTimeout) {
-        clearTimeout(syncTimeout);
+      stopTyping();
+      clearTimeout(syncTimeout);
+      clearTimeout(pulseTimeout);
+      if (stepTimeout) {
+        clearTimeout(stepTimeout);
       }
     };
   }, [stepIndex, isPaused]);
@@ -200,7 +263,7 @@ const InteractiveRequestDemo = ({ isPaused }: { isPaused: boolean }) => {
   };
 
   return (
-    <div className="relative space-y-3">
+    <div className="relative space-y-3" data-workflow-demo>
       <AnimatedCursor position={currentPosition} isClicking={isClicking} />
       <div className="mx-auto w-full max-w-md rounded-2xl border border-gray-200 bg-white shadow-sm">
         <div className="flex items-center justify-between border-b border-gray-200 bg-gray-50 px-4 py-3">
@@ -208,17 +271,17 @@ const InteractiveRequestDemo = ({ isPaused }: { isPaused: boolean }) => {
             <p className={`${MICRO_LABEL_CLASS} text-gray-700`}>Request form</p>
             <p className="mt-1 text-base font-semibold text-gray-900">Choose your path</p>
           </div>
-          <motion.span
+          <m.span
             className="rounded-full bg-gray-900 px-3 py-1 text-xs font-medium text-white"
             animate={{ opacity: submitPulse ? 0.6 : 1 }}
             transition={{ duration: 0.6, ease: 'easeInOut' }}
           >
             Step 1
-          </motion.span>
+          </m.span>
         </div>
         <div className="space-y-3 px-4 py-3">
           <div className={`flex flex-wrap items-center gap-2 rounded-xl bg-gray-50 px-3 py-2 ${highlightClasses('role')}`}>
-            <motion.button
+            <m.button
               type="button"
               className={`rounded-lg border px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.2em] ${formState.role === 'internal'
                 ? 'border-gray-900 bg-gray-900 text-white'
@@ -229,36 +292,38 @@ const InteractiveRequestDemo = ({ isPaused }: { isPaused: boolean }) => {
               disabled
             >
               Internal student
-            </motion.button>
-            <motion.button
+            </m.button>
+            <m.button
               type="button"
               className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-gray-600"
               disabled
             >
               External visitor
-            </motion.button>
+            </m.button>
             <p className={`ml-auto ${META_LABEL_CLASS} text-gray-700`}>Pick your route</p>
           </div>
           <div className="grid gap-3">
-            <label className={`block ${META_LABEL_CLASS} text-gray-700`}>
+            <label htmlFor="workflow-preview-name" className={`block ${META_LABEL_CLASS} text-gray-700`}>
               Full name
-              <motion.input
+              <m.input
+                id="workflow-preview-name"
                 className={`mt-1.5 w-full rounded-lg border bg-gray-50 px-3 py-2 text-sm text-gray-700 shadow-inner placeholder-gray-400 focus:outline-none ${highlightClasses('name')}`}
                 placeholder="Billy Bronco"
                 value={formState.name}
                 disabled
-                animate={{ backgroundColor: activeField === 'name' ? '#fff' : '#f9fafb' }}
+                animate={{ backgroundColor: activeField === 'name' ? 'var(--landing-field-active)' : 'var(--landing-field-idle)' }}
                 transition={{ duration: 0.4 }}
               />
             </label>
-            <label className={`block ${META_LABEL_CLASS} text-gray-700`}>
+            <label htmlFor="workflow-preview-email" className={`block ${META_LABEL_CLASS} text-gray-700`}>
               Cal Poly email
-              <motion.input
+              <m.input
+                id="workflow-preview-email"
                 className={`mt-1.5 w-full rounded-lg border bg-gray-50 px-3 py-2 text-sm text-gray-700 shadow-inner placeholder-gray-400 focus:outline-none ${highlightClasses('email')}`}
                 placeholder="bbronco@cpp.edu"
                 value={formState.email}
                 disabled
-                animate={{ backgroundColor: activeField === 'email' ? '#fff' : '#f9fafb' }}
+                animate={{ backgroundColor: activeField === 'email' ? 'var(--landing-field-active)' : 'var(--landing-field-idle)' }}
                 transition={{ duration: 0.4 }}
               />
             </label>
@@ -270,7 +335,7 @@ const InteractiveRequestDemo = ({ isPaused }: { isPaused: boolean }) => {
             <p className={BODY_TEXT_CLASS}>
               Next: Check the verification email we send immediately.
             </p>
-            <motion.button
+            <m.button
               type="button"
               className={`rounded-lg border px-3 py-1.5 text-xs font-semibold text-white opacity-80 ${highlightClasses('submit')} bg-gray-900`}
               disabled
@@ -278,7 +343,7 @@ const InteractiveRequestDemo = ({ isPaused }: { isPaused: boolean }) => {
               transition={{ type: 'spring', stiffness: 260, damping: 16 }}
             >
               Submit request
-            </motion.button>
+            </m.button>
           </div>
         </div>
       </div>
@@ -304,20 +369,7 @@ const VERIFICATION_STEPS: VerificationStep[] = [
 ];
 
 const InteractiveVerificationDemo = ({ isPaused }: { isPaused: boolean }) => {
-  const [stepIndex, setStepIndex] = useState(0);
-
-  useEffect(() => {
-    if (isPaused) return;
-    const step = VERIFICATION_STEPS[stepIndex];
-
-    const timer = setTimeout(() => {
-      setStepIndex(prev => (prev + 1) % VERIFICATION_STEPS.length);
-    }, step.duration);
-
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [stepIndex, isPaused]);
+  const stepIndex = useDemoSequence(VERIFICATION_STEPS, isPaused);
 
   const currentStep = VERIFICATION_STEPS[stepIndex] ?? VERIFICATION_STEPS[0];
   const currentPosition = currentStep.position;
@@ -330,7 +382,7 @@ const InteractiveVerificationDemo = ({ isPaused }: { isPaused: boolean }) => {
   return (
     <div className="relative space-y-4">
       <AnimatedCursor position={currentPosition} isClicking={isClicking} />
-      <motion.div
+      <m.div
         className={`flex items-center gap-3 rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-blue-800 ${highlightClasses('callout')}`}
         animate={{ opacity: activeHighlight === 'callout' ? 1 : 0.9 }}
         transition={{ duration: 0.3 }}
@@ -340,21 +392,21 @@ const InteractiveVerificationDemo = ({ isPaused }: { isPaused: boolean }) => {
           <p className={`${META_LABEL_CLASS} text-blue-600`}>Check your inbox</p>
           <p className="text-sm font-medium text-blue-900">Pause here until the link is confirmed.</p>
         </div>
-      </motion.div>
+      </m.div>
       <div className={CARD_BASE_CLASS}>
         <div className={`border-b border-gray-200 bg-gray-50 px-4 py-3 ${highlightClasses('emailHeader')}`}>
           <p className={`${META_LABEL_CLASS} text-gray-700`}>Inbox preview</p>
           <p className="text-sm font-semibold text-gray-900">Verify your UAR request</p>
         </div>
         <div className="space-y-3 px-4 py-4">
-          <motion.p
+          <m.p
             className={`rounded-lg px-3 py-2 ${BODY_TEXT_CLASS} ${highlightClasses('emailBody')}`}
             animate={{ opacity: activeHighlight === 'emailBody' ? 1 : 0.95 }}
             transition={{ duration: 0.3 }}
           >
             Hi Alex, thanks for reaching out for SDC access. Tap the secure button below so we know this was you.
-          </motion.p>
-          <motion.button
+          </m.p>
+          <m.button
             type="button"
             className={`w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white opacity-90 shadow-sm ${highlightClasses('emailButton')}`}
             disabled
@@ -362,7 +414,7 @@ const InteractiveVerificationDemo = ({ isPaused }: { isPaused: boolean }) => {
             transition={{ type: 'spring', stiffness: 240, damping: 18 }}
           >
             Verify my email
-          </motion.button>
+          </m.button>
           <div
             className={`flex flex-wrap items-center justify-between gap-2 rounded-md bg-blue-50 px-3 py-2 text-xs text-blue-700 ${highlightClasses('emailMeta')}`}
           >
@@ -392,20 +444,7 @@ const DIRECTOR_STEPS: DirectorStep[] = [
 ];
 
 const InteractiveDirectorReviewDemo = ({ isPaused }: { isPaused: boolean }) => {
-  const [stepIndex, setStepIndex] = useState(0);
-
-  useEffect(() => {
-    if (isPaused) return;
-    const step = DIRECTOR_STEPS[stepIndex];
-
-    const timer = setTimeout(() => {
-      setStepIndex(prev => (prev + 1) % DIRECTOR_STEPS.length);
-    }, step.duration);
-
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [stepIndex, isPaused]);
+  const stepIndex = useDemoSequence(DIRECTOR_STEPS, isPaused);
 
   const currentStep = DIRECTOR_STEPS[stepIndex] ?? DIRECTOR_STEPS[0];
   const currentPosition = currentStep.position;
@@ -504,20 +543,7 @@ const FACULTY_STEPS: FacultyStep[] = [
 ];
 
 const InteractiveFacultyReviewDemo = ({ isPaused }: { isPaused: boolean }) => {
-  const [stepIndex, setStepIndex] = useState(0);
-
-  useEffect(() => {
-    if (isPaused) return;
-    const step = FACULTY_STEPS[stepIndex];
-
-    const timer = setTimeout(() => {
-      setStepIndex(prev => (prev + 1) % FACULTY_STEPS.length);
-    }, step.duration);
-
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [stepIndex, isPaused]);
+  const stepIndex = useDemoSequence(FACULTY_STEPS, isPaused);
 
   const currentStep = FACULTY_STEPS[stepIndex] ?? FACULTY_STEPS[0];
   const currentPosition = currentStep.position;
@@ -612,20 +638,7 @@ const APPROVAL_STEPS: ApprovalStep[] = [
 ];
 
 const InteractiveApprovalDemo = ({ isPaused }: { isPaused: boolean }) => {
-  const [stepIndex, setStepIndex] = useState(0);
-
-  useEffect(() => {
-    if (isPaused) return;
-    const step = APPROVAL_STEPS[stepIndex];
-
-    const timer = setTimeout(() => {
-      setStepIndex(prev => (prev + 1) % APPROVAL_STEPS.length);
-    }, step.duration);
-
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [stepIndex, isPaused]);
+  const stepIndex = useDemoSequence(APPROVAL_STEPS, isPaused);
 
   const currentStep = APPROVAL_STEPS[stepIndex] ?? APPROVAL_STEPS[0];
   const currentPosition = currentStep.position;
@@ -678,7 +691,7 @@ const InteractiveApprovalDemo = ({ isPaused }: { isPaused: boolean }) => {
             <p>2. Review VPN setup instructions before connecting remotely.</p>
             <p>3. Need help? Open a support ticket directly from the portal.</p>
           </div>
-          <motion.button
+          <m.button
             type="button"
             className={`w-full rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white opacity-90 shadow-sm ${highlightClasses('button')}`}
             disabled
@@ -686,7 +699,7 @@ const InteractiveApprovalDemo = ({ isPaused }: { isPaused: boolean }) => {
             transition={{ type: 'spring', stiffness: 240, damping: 18 }}
           >
             Open instructions
-          </motion.button>
+          </m.button>
         </div>
       </div>
     </div>
@@ -698,6 +711,8 @@ type WorkflowStep = {
   description: string;
   caption: string;
   color: string;
+  /** Progress bar length, derived from the demo so the bar and the demo end together. */
+  durationMs: number;
   window: {
     title: string;
     subtitle: string;
@@ -716,6 +731,7 @@ const workflowSteps: WorkflowStep[] = [
       'Pick the internal or external path, share the required details, and submit. The form takes only a couple of minutes and works great on mobile.',
     caption: 'As soon as you submit, we email a confirmation with the next steps.',
     color: 'bg-black',
+    durationMs: sequenceDurationMs(INTERACTIVE_STEPS),
     window: {
       title: 'Tell us what you need',
       subtitle: 'Step 1 • Online form',
@@ -741,6 +757,7 @@ const workflowSteps: WorkflowStep[] = [
       'Click the link in the message we send right after submission. Verification lets us know it was really you who made the request.',
     caption: 'We pause everything until you confirm, so nothing moves forward without you.',
     color: 'bg-blue-600',
+    durationMs: sequenceDurationMs(VERIFICATION_STEPS),
     window: {
       title: 'Confirm your email',
       subtitle: 'Step 2 • Email link',
@@ -766,6 +783,7 @@ const workflowSteps: WorkflowStep[] = [
       'Directors double-check the request, prep any accounts, and reach out if they need more details.',
     caption: 'You stay updated by email if we have questions or need clarification.',
     color: 'bg-emerald-600',
+    durationMs: sequenceDurationMs(DIRECTOR_STEPS),
     window: {
       title: 'Directors prepare your access',
       subtitle: 'Step 3 • Review queue',
@@ -791,6 +809,7 @@ const workflowSteps: WorkflowStep[] = [
       'Faculty confirm compliance, create VPN accounts when needed, and sign off before we deliver credentials.',
     caption: 'Student Directors coordinate closely and keep you informed of the final approval timing.',
     color: 'bg-amber-600',
+    durationMs: sequenceDurationMs(FACULTY_STEPS),
     window: {
       title: 'Faculty finalize access',
       subtitle: 'Step 4 • Faculty review',
@@ -816,6 +835,7 @@ const workflowSteps: WorkflowStep[] = [
       'After faculty activates your request, we send your credentials and quick start instructions.',
     caption: 'You are ready to log in right away and support is available if you need help.',
     color: 'bg-indigo-600',
+    durationMs: sequenceDurationMs(APPROVAL_STEPS),
     window: {
       title: 'You are approved',
       subtitle: 'Step 5 • Welcome email',
@@ -837,65 +857,44 @@ const workflowSteps: WorkflowStep[] = [
   },
 ];
 
-const STEP_INTERVAL_MS = 10000;
-
 export function RequestWorkflow() {
+  const prefersReducedMotion = useReducedMotion();
   const [activeStep, setActiveStep] = useState(0);
   const [progressCycle, setProgressCycle] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
   const [isHidden, setIsHidden] = useState(false);
   const totalSteps = workflowSteps.length;
-  const cycleRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const scheduleCycle = useCallback(() => {
-    if (cycleRef.current) {
-      clearInterval(cycleRef.current);
-      cycleRef.current = null;
-    }
-
-    if (totalSteps === 0 || isPaused) {
-      return;
-    }
-
-    cycleRef.current = setInterval(() => {
-      setActiveStep(prev => (prev + 1) % totalSteps);
-      setProgressCycle(prev => prev + 1);
-    }, STEP_INTERVAL_MS);
-    setProgressCycle(prev => prev + 1);
-  }, [isPaused, totalSteps]);
+  const motionPaused = isPaused || Boolean(prefersReducedMotion);
 
   const handleStepChange = useCallback(
     (index: number) => {
       setActiveStep(index);
-      scheduleCycle();
+      setProgressCycle(prev => prev + 1);
     },
-    [scheduleCycle]
+    []
   );
 
-  useEffect(() => {
-    const asyncId = setTimeout(() => {
-      scheduleCycle();
-    }, 0);
-
-    return () => {
-      clearTimeout(asyncId);
-      if (cycleRef.current) {
-        clearInterval(cycleRef.current);
-        cycleRef.current = null;
-      }
-    };
-  }, [scheduleCycle]);
+  const handleProgressComplete = useCallback(() => {
+    if (!motionPaused && totalSteps > 0) {
+      setActiveStep(prev => (prev + 1) % totalSteps);
+    }
+  }, [motionPaused, totalSteps]);
 
   const activeStepData = workflowSteps[activeStep] ?? workflowSteps[0];
 
   return (
-    <motion.section
-      initial={{ opacity: 0, y: 40 }}
+    <LazyMotion features={domAnimation}>
+    <MotionConfig reducedMotion="user">
+    <m.section
+      initial={prefersReducedMotion ? false : { opacity: 0, y: 40 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.9, delay: 0.6, ease: 'easeOut' }}
       className="max-w-5xl mx-auto mt-16 px-4 sm:px-6"
     >
-      <div className="bg-white/95 border border-gray-200 rounded-3xl shadow-xl p-6 sm:p-10 md:p-12 backdrop-blur-sm space-y-8">
+      {/* No backdrop-filter here: it forced a full-card backdrop re-blur on every
+          scroll frame and blocked the progress bar from compositing on its own
+          layer. The page behind is a flat gradient, so the blur was invisible. */}
+      <div className="bg-white border border-gray-200 rounded-3xl shadow-lg p-6 sm:p-10 md:p-12 space-y-8">
         <div className="text-center max-w-3xl mx-auto flex flex-col items-center gap-3">
           <span className="inline-flex items-center justify-center px-3 py-1 text-[11px] font-semibold tracking-[0.25em] uppercase bg-gray-900 text-white rounded-full">
             Request Workflow
@@ -925,14 +924,14 @@ export function RequestWorkflow() {
               {workflowSteps.map((step, index) => {
                 const isActive = activeStep === index;
                 return (
-                  <motion.button
+                  <m.button
                     key={step.title}
                     type="button"
                     onClick={() => handleStepChange(index)}
                     whileHover={{ scale: isActive ? 1.01 : 1.05 }}
                     whileTap={{ scale: 0.97 }}
                     aria-pressed={isActive}
-                    className={`flex w-full sm:w-auto justify-center items-center gap-2 rounded-full border px-4 py-2 text-sm sm:text-base font-semibold transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-900/70 focus-visible:ring-offset-2 focus-visible:ring-offset-white ${isActive
+                    className={`flex w-full items-center justify-center gap-2 rounded-full border px-4 py-2 text-sm font-semibold transition-[background-color,border-color,color,box-shadow] duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-900/70 focus-visible:ring-offset-2 focus-visible:ring-offset-white sm:w-auto sm:text-base ${isActive
                       ? 'border-gray-900 bg-gray-900 text-white shadow-lg'
                       : 'border-gray-200 bg-white text-gray-700 hover:border-gray-300 hover:text-gray-900'
                       }`}
@@ -941,27 +940,27 @@ export function RequestWorkflow() {
                       {index + 1}
                     </span>
                     {step.title}
-                  </motion.button>
+                  </m.button>
                 );
               })}
             </div>
 
-            <motion.div
+            <m.div
               key={activeStep}
               initial={{ opacity: 0, y: 30 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.5, ease: 'easeOut' }}
               className="relative"
             >
-              <div className="relative rounded-3xl border border-gray-200 overflow-hidden shadow-[0_32px_70px_rgba(15,23,42,0.12)] bg-white">
+              <div className="relative rounded-3xl border border-gray-200 overflow-hidden shadow-[0_12px_28px_rgba(15,23,42,0.10)] bg-white">
                 <div className="absolute inset-x-0 top-0 h-1 bg-gray-100">
-                  <motion.div
+                  <div
                     key={`${activeStep}-${progressCycle}`}
-                    initial={{ width: '0%' }}
-                    animate={{ width: isPaused ? undefined : '100%' }}
-                    transition={{ duration: STEP_INTERVAL_MS / 1000, ease: 'linear' }}
-                    style={isPaused ? { animationPlayState: 'paused' } : undefined}
-                    className={`h-full ${activeStepData.color}`}
+                    data-workflow-progress
+                    data-paused={motionPaused ? 'true' : 'false'}
+                    onAnimationEnd={handleProgressComplete}
+                    style={{ animationDuration: `${activeStepData.durationMs}ms` }}
+                    className={`h-full origin-left ${activeStepData.color}`}
                   />
                 </div>
                 <div className="flex flex-wrap items-center justify-between gap-3 px-5 sm:px-6 py-4 border-b border-gray-200 bg-gray-50">
@@ -976,15 +975,16 @@ export function RequestWorkflow() {
                     </span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <motion.button
+                    <m.button
                       type="button"
                       onClick={() => setIsPaused(prev => !prev)}
+                      disabled={Boolean(prefersReducedMotion)}
                       whileHover={{ scale: 1.1 }}
                       whileTap={{ scale: 0.9 }}
-                      aria-label={isPaused ? 'Resume workflow' : 'Pause workflow'}
+                      aria-label={prefersReducedMotion ? 'Workflow motion disabled by system preference' : isPaused ? 'Resume workflow' : 'Pause workflow'}
                       className="flex h-7 w-7 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-500 shadow-sm transition-colors hover:border-gray-300 hover:text-gray-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-900/70 focus-visible:ring-offset-2"
                     >
-                      {isPaused ? (
+                      {motionPaused ? (
                         <svg className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
                           <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" />
                         </svg>
@@ -993,7 +993,7 @@ export function RequestWorkflow() {
                           <path d="M5.75 3a.75.75 0 00-.75.75v12.5c0 .414.336.75.75.75h1.5a.75.75 0 00.75-.75V3.75A.75.75 0 007.25 3h-1.5zM12.75 3a.75.75 0 00-.75.75v12.5c0 .414.336.75.75.75h1.5a.75.75 0 00.75-.75V3.75a.75.75 0 00-.75-.75h-1.5z" />
                         </svg>
                       )}
-                    </motion.button>
+                    </m.button>
                     <span className={`${MICRO_LABEL_CLASS} text-gray-600`}>Live Preview</span>
                   </div>
                 </div>
@@ -1012,7 +1012,7 @@ export function RequestWorkflow() {
                   </div>
 
                   <div className="rounded-2xl border border-gray-200 bg-gray-50/80 p-4 sm:p-6 shadow-inner">
-                    {activeStepData.window.content(isPaused)}
+                    {activeStepData.window.content(motionPaused)}
                   </div>
 
                   <div className="grid gap-6 lg:grid-cols-2">
@@ -1054,10 +1054,12 @@ export function RequestWorkflow() {
                   </div>
                 </div>
               </div>
-            </motion.div>
+            </m.div>
           </div>
         )}
       </div>
-    </motion.section>
+    </m.section>
+    </MotionConfig>
+    </LazyMotion>
   );
 }

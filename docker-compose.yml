@@ -2,14 +2,16 @@ services:
   # PostgreSQL Database
   postgres:
     image: postgres:16-alpine
-    container_name: uar-postgres
+    container_name: uar-${INSTANCE:-dev}-postgres
     environment:
       POSTGRES_DB: uar_database
       POSTGRES_USER: uar_user
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
     restart: unless-stopped
     ports:
-      - "5432:5432"
+      # Published only for host-side tooling; the stack always talks to
+      # postgres:5432 internally. Dev-on-shared-VM default avoids prod's 5432.
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-15432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -20,13 +22,36 @@ services:
     networks:
       - uar-network
 
+  # One-shot migration runner. The tools profile keeps Prisma and its build
+  # dependencies out of the production application image while allowing
+  # deployments to reuse the exact Compose database contract without exposing
+  # credentials on the command line.
+  prisma-tool:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: prisma-tool
+    image: uar-prisma:${INSTANCE:-dev}
+    environment:
+      DATABASE_URL: ${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}
+      DATABASE_SSL_ALLOW_INSECURE: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - uar-network
+
   # Redis Cache
   redis:
     image: redis:7-alpine
-    container_name: uar-redis
+    container_name: uar-${INSTANCE:-dev}-redis
     restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
-      - "6379:6379"
+      # Same shared-VM reasoning as postgres: internal redis:6379 is what the
+      # apps use; the published port is host-side convenience only.
+      - "${REDIS_BIND_ADDRESS:-127.0.0.1}:${REDIS_PORT:-16379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -45,15 +70,24 @@ services:
       args:
         NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
         NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${NEXT_PUBLIC_TURNSTILE_SITE_KEY}
-    container_name: uar-app
-    image: uar-web:latest
+    container_name: uar-${INSTANCE:-dev}-app
+    image: uar-web:${INSTANCE:-dev}
+    # Host-side publishing is parameterized (APP_BIND_ADDRESS/APP_PORT) so a
+    # dev instance can live beside prod on shared VMs; the container ALWAYS
+    # listens on 3002 internally (healthcheck, schedulers, and the compose
+    # network all target app:3002 regardless of the published port).
     ports:
-      - "3002:3002"
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-4002}:3002"
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://uar_user:${DB_PASSWORD:-changeme}@postgres:5432/uar_database
+      # Compatibility fallback supports the staged database-role rollout.
+      # Production sets PORTAL_DATABASE_URL to the portal-only runtime role.
+      DATABASE_URL: ${PORTAL_DATABASE_URL:-${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}}
+      DATABASE_SSL_ALLOW_INSECURE: "true"
       REDIS_URL: redis://redis:6379
       REDIS_TOKEN: ${REDIS_TOKEN:-}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+      SESSION_COOKIE_ALLOW_INSECURE: ${SESSION_COOKIE_ALLOW_INSECURE:-false}
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}
       SMTP_USER: ${SMTP_USER}
@@ -68,13 +102,217 @@ services:
       LDAP_DOMAIN: ${LDAP_DOMAIN}
       LDAP_ADMIN_GROUPS: ${LDAP_ADMIN_GROUPS}
       LDAP_GROUP2ADD: ${LDAP_GROUP2ADD}
-      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3002}
+      LDAP_ALLOW_INVALID_CERTS: ${LDAP_ALLOW_INVALID_CERTS:-false}
+      LDAP_CA_CERT_BASE64: ${LDAP_CA_CERT_BASE64:-}
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:4002}
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      AUTH_SESSION_MAX_AGE: ${AUTH_SESSION_MAX_AGE:-}
+      AUTH_OIDC_SESSION_MAX_AGE: ${AUTH_OIDC_SESSION_MAX_AGE:-28800}
+      CRON_SECRET: ${CRON_SECRET:-}
+      LIFECYCLE_QUEUE_SCHEDULER_ENABLED: ${LIFECYCLE_QUEUE_SCHEDULER_ENABLED:-false}
+      LIFECYCLE_QUEUE_SCHEDULER_INTERVAL_SECONDS: ${LIFECYCLE_QUEUE_SCHEDULER_INTERVAL_SECONDS:-300}
+      MASS_EMAIL_SCHEDULER_ENABLED: ${MASS_EMAIL_SCHEDULER_ENABLED:-false}
+      MASS_EMAIL_SCHEDULER_INTERVAL_SECONDS: ${MASS_EMAIL_SCHEDULER_INTERVAL_SECONDS:-300}
+      MASS_EMAIL_SCHEDULER_INITIAL_DELAY_SECONDS: ${MASS_EMAIL_SCHEDULER_INITIAL_DELAY_SECONDS:-30}
+      MASS_EMAIL_SCHEDULER_HEALTH_MAX_AGE_SECONDS: ${MASS_EMAIL_SCHEDULER_HEALTH_MAX_AGE_SECONDS:-1200}
+      OFFBOARD_SCHEDULER_ENABLED: ${OFFBOARD_SCHEDULER_ENABLED:-false}
+      OFFBOARD_SCHEDULER_INTERVAL_SECONDS: ${OFFBOARD_SCHEDULER_INTERVAL_SECONDS:-300}
+      OFFBOARD_SCHEDULER_GRACE_SECONDS: ${OFFBOARD_SCHEDULER_GRACE_SECONDS:-900}
+      PASSWORD_EXPIRATION_WARNING_DAYS: ${PASSWORD_EXPIRATION_WARNING_DAYS:-14}
+      PASSWORD_EXPIRATION_SCHEDULER_ENABLED: ${PASSWORD_EXPIRATION_SCHEDULER_ENABLED:-false}
+      PASSWORD_EXPIRATION_SCHEDULER_INTERVAL_SECONDS: ${PASSWORD_EXPIRATION_SCHEDULER_INTERVAL_SECONDS:-21600}
+      PASSWORD_CLEANUP_SCHEDULER_ENABLED: ${PASSWORD_CLEANUP_SCHEDULER_ENABLED:-false}
+      PASSWORD_CREDENTIAL_RETENTION_DAYS: ${PASSWORD_CREDENTIAL_RETENTION_DAYS:-7}
+      PASSWORD_CLEANUP_INTERVAL_SECONDS: ${PASSWORD_CLEANUP_INTERVAL_SECONDS:-21600}
+      PASSWORD_CLEANUP_INITIAL_DELAY_SECONDS: ${PASSWORD_CLEANUP_INITIAL_DELAY_SECONDS:-60}
+      PASSWORD_CLEANUP_HEALTH_MAX_AGE_SECONDS: ${PASSWORD_CLEANUP_HEALTH_MAX_AGE_SECONDS:-86400}
+      TICKET_GROUP_SYNC_ENABLED: ${TICKET_GROUP_SYNC_ENABLED:-false}
+      TICKET_GROUP_SYNC_INTERVAL_SECONDS: ${TICKET_GROUP_SYNC_INTERVAL_SECONDS:-3600}
+      DIRECTORY_PROBE_ENABLED: ${DIRECTORY_PROBE_ENABLED:-false}
+      DIRECTORY_PROBE_INTERVAL_SECONDS: ${DIRECTORY_PROBE_INTERVAL_SECONDS:-300}
+      WORKFLOW_TICK_ENABLED: ${WORKFLOW_TICK_ENABLED:-false}
+      WORKFLOW_TICK_INTERVAL_SECONDS: ${WORKFLOW_TICK_INTERVAL_SECONDS:-60}
+      OPERATIONAL_DETECTOR_SCHEDULER_ENABLED: ${OPERATIONAL_DETECTOR_SCHEDULER_ENABLED:-false}
+      OPERATIONAL_DETECTOR_INTERVAL_SECONDS: ${OPERATIONAL_DETECTOR_INTERVAL_SECONDS:-60}
+      LDAP_DOMAIN_SEARCH_BASE: ${LDAP_DOMAIN_SEARCH_BASE:-}
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
       NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${NEXT_PUBLIC_TURNSTILE_SITE_KEY}
       TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY}
       ENCRYPTION_SECRET: ${ENCRYPTION_SECRET}
       ENCRYPTION_SALT: ${ENCRYPTION_SALT}
+      LDAP_KAMINO_INTERNAL_GROUP: ${LDAP_KAMINO_INTERNAL_GROUP}
+      LDAP_KAMINO_EXTERNAL_GROUP: ${LDAP_KAMINO_EXTERNAL_GROUP}
+      LDAP_GROUPSEARCH: ${LDAP_GROUPSEARCH}
+      FACULTY_EMAIL: ${FACULTY_EMAIL:-}
+      STUDENT_DIRECTOR_EMAILS: ${STUDENT_DIRECTOR_EMAILS:-}
+      ASSET_SERVICE_URL: ${ASSET_SERVICE_URL:-http://asset-store:8090}
+      ASSET_SHARED_SECRET: ${ASSET_SHARED_SECRET:-}
+      CLAMAV_HOST: ${CLAMAV_HOST:-clamav}
+      CLAMAV_PORT: ${CLAMAV_PORT:-3310}
+      CLAMAV_TIMEOUT_MS: ${CLAMAV_TIMEOUT_MS:-15000}
+      MONITORED_ENDPOINTS_SCHEDULER_ENABLED: ${MONITORED_ENDPOINTS_SCHEDULER_ENABLED:-false}
+      MONITORED_ENDPOINTS_INTERVAL_SECONDS: ${MONITORED_ENDPOINTS_INTERVAL_SECONDS:-60}
+      MONITORED_ENDPOINTS_HEALTH_MAX_AGE_SECONDS: ${MONITORED_ENDPOINTS_HEALTH_MAX_AGE_SECONDS:-300}
+      MONITOR_PROBE_URL: http://monitor-probe:8091
+      MONITOR_PROBE_SHARED_SECRET: ${MONITOR_PROBE_SHARED_SECRET:?MONITOR_PROBE_SHARED_SECRET is required}
+      ATTACHMENT_QUARANTINE_PURGE_ENABLED: ${ATTACHMENT_QUARANTINE_PURGE_ENABLED:-false}
+      PORTAL_CLONE_READ_ONLY: ${PORTAL_CLONE_READ_ONLY:-false}
+      ATTACHMENT_QUARANTINE_PURGE_INTERVAL_SECONDS: ${ATTACHMENT_QUARANTINE_PURGE_INTERVAL_SECONDS:-86400}
+      ATTACHMENT_QUARANTINE_PURGE_HEALTH_MAX_AGE_SECONDS: ${ATTACHMENT_QUARANTINE_PURGE_HEALTH_MAX_AGE_SECONDS:-172800}
+      FLOW_OUTBOX_SCHEDULER_ENABLED: ${FLOW_OUTBOX_SCHEDULER_ENABLED:-false}
+      FLOW_OUTBOX_INTERVAL_SECONDS: ${FLOW_OUTBOX_INTERVAL_SECONDS:-60}
+      FLOW_OUTBOX_HEALTH_MAX_AGE_SECONDS: ${FLOW_OUTBOX_HEALTH_MAX_AGE_SECONDS:-300}
+      # Legacy bootstrap mode. Once auth.signInPolicy exists, the saved portal
+      # policy independently controls each sign-in method (ADR-0023).
+      AUTH_MODE: ${AUTH_MODE:-native}
+      AUTH_ISSUER: ${AUTH_ISSUER:-}
+      AUTH_OIDC_DISPLAY_NAME: ${AUTH_OIDC_DISPLAY_NAME:-}
+      AUTH_OIDC_DISPLAY_DESCRIPTION: ${AUTH_OIDC_DISPLAY_DESCRIPTION:-}
+      AUTH_CLIENT_ID: ${AUTH_CLIENT_ID:-uar-portal}
+      AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET:-}
+      AUTH_REDIRECT_URI: ${AUTH_REDIRECT_URI:-}
+      # Server-to-server mirror of the issuer for token/discovery calls from
+      # inside the compose network; authorization stays browser-facing.
+      OIDC_INTERNAL_ISSUER_URL: ${AUTH_INTERNAL_ISSUER_URL:-http://auth-service:3003}
+      OIDC_BROWSER_BASE_URL: ${AUTH_BROWSER_BASE_URL:-}
+      # Legacy policy inputs used only before auth.signInPolicy is saved.
+      AUTH_OIDC_OUTAGE_FALLBACK: ${AUTH_OIDC_OUTAGE_FALLBACK:-off}
+      AUTH_OIDC_ALTERNATE_SIGNIN: ${AUTH_OIDC_ALTERNATE_SIGNIN:-off}
+      AUTH_LOGIN_WINDOW_MS: ${AUTH_LOGIN_WINDOW_MS:-900000}
+      AUTH_LOGIN_MAX_ATTEMPTS: ${AUTH_LOGIN_MAX_ATTEMPTS:-20}
+      AUTH_ACCOUNT_LOCK_WINDOW_MS: ${AUTH_ACCOUNT_LOCK_WINDOW_MS:-900000}
+      AUTH_ACCOUNT_LOCK_MAX_ATTEMPTS: ${AUTH_ACCOUNT_LOCK_MAX_ATTEMPTS:-5}
+      # DEV-ONLY escape hatch permitting plain-HTTP issuers; ignored in production.
+      AUTH_ALLOW_INSECURE_OIDC: ${AUTH_ALLOW_INSECURE_OIDC:-false}
+      # NOTE: sign-in branding and OIDC client management live entirely in the
+      # auth service (see the auth-service block below). The portal consumes
+      # authentication only - it never stores branding docs or client secrets.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clamav:
+        condition: service_healthy
+      monitor-probe:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3002/login || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ICMP is isolated from the portal runtime. This internal-only service has
+  # no database, portal session, or published port and receives only a host
+  # plus bounded timeout after the portal has applied authorization/policy.
+  monitor-probe:
+    build:
+      context: .
+      dockerfile: services/monitor-probe/Dockerfile
+    container_name: uar-${INSTANCE:-dev}-monitor-probe
+    environment:
+      MONITOR_PROBE_SHARED_SECRET: ${MONITOR_PROBE_SHARED_SECRET:?MONITOR_PROBE_SHARED_SECRET is required}
+    cap_drop: ["ALL"]
+    cap_add: ["NET_RAW"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    networks:
+      - uar-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8091/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Standalone OIDC authentication service (ADR-0012). OIDC users authenticate
+  # only against Active Directory. Auth-service recovery accounts are scoped
+  # to the Auth Manager console and never produce OIDC tokens.
+  auth-service:
+    profiles: ["auth"]
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    container_name: uar-${INSTANCE:-dev}-auth
+    image: uar-auth:${INSTANCE:-dev}
+    ports:
+      # AUTH_PORT here is the HOST-side published port only (dev default 4003);
+      # the container env below pins the in-container listen port to 3003 so
+      # the two can never drift apart on shared VMs.
+      - "${AUTH_BIND_ADDRESS:-127.0.0.1}:${AUTH_PORT:-4003}:3003"
+      # IPv6 loopback publishing is DISABLED for local Docker Desktop
+      # (WSL2): its ::1 forward SYN-drops instead of refusing, which hangs
+      # dual-stack clients resolving `localhost`. With no ::1 listener the
+      # connection is refused instantly and clients fall back to 127.0.0.1.
+      # Re-enable on hosts where IPv6 loopback publishing works.
+      # - "${AUTH_BIND6_ADDRESS:-[::1]}:${AUTH_PORT:-4003}:3003"
+    environment:
+      NODE_ENV: production
+      # Runtime startup fails loudly (with a clear message) when these are
+      # unset; empty defaults keep `docker compose config` valid for
+      # deployments that have not opted into the auth service yet.
+      AUTH_ISSUER: ${AUTH_ISSUER:-}
+      AUTH_PORT: 3003
+      AUTH_COOKIE_KEYS: ${AUTH_COOKIE_KEYS:-}
+      # Compatibility fallback supports the staged database-role rollout.
+      # Production sets AUTH_DATABASE_URL to the auth-only runtime role.
+      DATABASE_URL: ${AUTH_DATABASE_URL:-${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}}
+      REDIS_URL: redis://redis:6379
+      OIDC_CLIENT_ID: ${AUTH_CLIENT_ID:-uar-portal}
+      OIDC_CLIENT_SECRET: ${AUTH_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URIS: ${AUTH_REDIRECT_URIS:-http://localhost:4002/api/auth/oidc/callback}
+      OIDC_POST_LOGOUT_URIS: ${AUTH_POST_LOGOUT_URIS:-http://localhost:4002}
+      LDAP_URL: ${LDAP_URL}
+      LDAP_DOMAIN: ${LDAP_DOMAIN}
+      LDAP_SEARCH_BASE: ${LDAP_SEARCH_BASE}
+      # Required for directory search/detail in the Auth Manager. Credential
+      # sign-in still binds as the user and does not use this service account.
+      LDAP_BIND_DN: ${LDAP_BIND_DN:-}
+      LDAP_BIND_PASSWORD: ${LDAP_BIND_PASSWORD:-}
+      LDAP_ALLOW_INVALID_CERTS: ${LDAP_ALLOW_INVALID_CERTS:-false}
+      # Fixed-window login rate limiter per source IP (defaults 15min / 20).
+      AUTH_LOGIN_WINDOW_MS: ${AUTH_LOGIN_WINDOW_MS:-900000}
+      AUTH_LOGIN_MAX_ATTEMPTS: ${AUTH_LOGIN_MAX_ATTEMPTS:-20}
+      AUTH_ACCOUNT_LOCK_WINDOW_MS: ${AUTH_ACCOUNT_LOCK_WINDOW_MS:-900000}
+      AUTH_ACCOUNT_LOCK_MAX_ATTEMPTS: ${AUTH_ACCOUNT_LOCK_MAX_ATTEMPTS:-5}
+      NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${NEXT_PUBLIC_TURNSTILE_SITE_KEY}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY}
+      # Internal branding API shared secret (sign-in page editor). Unset =>
+      # the internal endpoints fail closed and the portal editor reports the
+      # integration as not configured.
+      AUTH_INTERNAL_BRANDING_TOKEN: ${AUTH_INTERNAL_BRANDING_TOKEN:-}
+      # AD usernames allowed to use the first-party /admin console (Auth
+      # Manager). Empty/unset => the console 404s entirely.
+      AUTH_ADMIN_USERNAMES: ${AUTH_ADMIN_USERNAMES:-}
+      # AD group allowlist (DN or bare CN) for the console - membership grants
+      # access even when the username is not on the allowlist above.
+      AUTH_ADMIN_GROUPS: ${AUTH_ADMIN_GROUPS:-}
+      # Auth-service-owned recovery accounts authenticate Auth Manager only;
+      # they never enter an OIDC interaction or create a portal session.
+      AUTH_ADMIN_LOCAL_RECOVERY_ENABLED: ${AUTH_ADMIN_LOCAL_RECOVERY_ENABLED:-false}
+      # AES-256-GCM key encrypting registry client secrets at rest (64 lower-
+      # case hex). Unset => creating/rotating registry secrets fails closed,
+      # and boot refuses to start while encrypted secrets exist without it.
+      AUTH_CLIENT_SECRET_ENC_KEY: ${AUTH_CLIENT_SECRET_ENC_KEY:-}
+      # Persistent RSA signing keys (JWK Set JSON). Production startup fails
+      # when this is empty; see docs/runbooks/auth-signing-keys.md.
+      AUTH_JWKS: ${AUTH_JWKS:-}
+      # Trust X-Forwarded-For/X-Real-IP for rate-limit IP attribution ONLY
+      # behind the reference nginx proxy that overwrites those headers.
+      AUTH_TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+      # Opt-in, evidence-only device risk evaluation. The HMAC key prevents
+      # raw browser/cookie identifiers from being stored or exposed.
+      AUTH_DEVICE_RISK_MODE: ${AUTH_DEVICE_RISK_MODE:-off}
+      AUTH_DEVICE_EVIDENCE_KEY: ${AUTH_DEVICE_EVIDENCE_KEY:-}
+      AUTH_DEVICE_EVIDENCE_PREVIOUS_KEYS: ${AUTH_DEVICE_EVIDENCE_PREVIOUS_KEYS:-}
+      PORTAL_CLONE_READ_ONLY: ${PORTAL_CLONE_READ_ONLY:-false}
+      # Lab-only escape hatch permitting non-LDAPS directory transport.
+      LDAP_ALLOW_INSECURE_TRANSPORT: ${LDAP_ALLOW_INSECURE_TRANSPORT:-false}
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,6 +321,737 @@ services:
     networks:
       - uar-network
     restart: unless-stopped
+
+  # Explicit, one-shot break-glass tool. It is excluded from normal Compose
+  # startup and retains the builder-stage script and Prisma client.
+  login-lock-recovery:
+    profiles: ["manual-recovery"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    environment:
+      DATABASE_URL: ${PORTAL_DATABASE_URL:-${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}}
+      DATABASE_SSL_ALLOW_INSECURE: "true"
+      LOGIN_LOCK_RECOVERY_ACTION: ${LOGIN_LOCK_RECOVERY_ACTION:-}
+      LOGIN_LOCK_RECOVERY_OPERATOR: ${LOGIN_LOCK_RECOVERY_OPERATOR:-}
+      LOGIN_LOCK_RECOVERY_APPROVER: ${LOGIN_LOCK_RECOVERY_APPROVER:-}
+      LOGIN_LOCK_RECOVERY_TICKET: ${LOGIN_LOCK_RECOVERY_TICKET:-}
+      LOGIN_LOCK_RECOVERY_SETTINGS_ID: ${LOGIN_LOCK_RECOVERY_SETTINGS_ID:-}
+      LOGIN_LOCK_RECOVERY_EXPECTED_UPDATED_AT: ${LOGIN_LOCK_RECOVERY_EXPECTED_UPDATED_AT:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - uar-network
+    command: ["npm", "run", "reset-login-lock"]
+
+  # Account lifecycle queue drain scheduler. This endpoint owns queued
+  # lifecycle actions AND mass-email delivery waves, then re-invokes the
+  # guarded offboard logic, so it carries the tightest cadence of the family.
+  # Alternative: leave disabled and schedule the same authenticated POST from
+  # a host crontab against the published portal port.
+  lifecycle-queue-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-lifecycle-queue-scheduler
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      LIFECYCLE_QUEUE_SCHEDULER_ENABLED: ${LIFECYCLE_QUEUE_SCHEDULER_ENABLED:-false}
+      LIFECYCLE_QUEUE_SCHEDULER_INTERVAL_SECONDS: ${LIFECYCLE_QUEUE_SCHEDULER_INTERVAL_SECONDS:-300}
+      LIFECYCLE_QUEUE_SCHEDULER_INITIAL_DELAY_SECONDS: ${LIFECYCLE_QUEUE_SCHEDULER_INITIAL_DELAY_SECONDS:-30}
+      LIFECYCLE_QUEUE_SCHEDULER_HEALTH_MAX_AGE_SECONDS: ${LIFECYCLE_QUEUE_SCHEDULER_HEALTH_MAX_AGE_SECONDS:-1200}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${LIFECYCLE_QUEUE_SCHEDULER_ENABLED}" != "true" ]; then
+          echo "Lifecycle queue scheduler disabled; set LIFECYCLE_QUEUE_SCHEDULER_ENABLED=true and recreate this service to activate it."
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then
+          echo "Lifecycle queue scheduler cannot start because CRON_SECRET is empty."
+          exit 1
+        fi
+        sleep "$${LIFECYCLE_QUEUE_SCHEDULER_INITIAL_DELAY_SECONDS}"
+        while true; do
+          if response="$$(curl --fail-with-body --silent --show-error \
+              --max-time 240 \
+              --header "Authorization: Bearer $${CRON_SECRET}" \
+              --request POST \
+              http://app:3002/api/cron/process-lifecycle-queue)"; then
+            date +%s > /tmp/lifecycle-queue-last-success
+            printf '%s\n' "$${response}"
+          else
+            printf 'Lifecycle queue request failed at %s\n' "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+          fi
+          sleep "$${LIFECYCLE_QUEUE_SCHEDULER_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${LIFECYCLE_QUEUE_SCHEDULER_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/lifecycle-queue-last-success || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/lifecycle-queue-last-success);
+          age=$$((now - last));
+          [ "$${age}" -le "$${LIFECYCLE_QUEUE_SCHEDULER_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 60s
+      timeout: 5s
+      retries: 2
+      start_period: 10m
+
+  mass-email-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-mass-email-scheduler
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      MASS_EMAIL_SCHEDULER_ENABLED: ${MASS_EMAIL_SCHEDULER_ENABLED:-false}
+      MASS_EMAIL_SCHEDULER_INTERVAL_SECONDS: ${MASS_EMAIL_SCHEDULER_INTERVAL_SECONDS:-300}
+      MASS_EMAIL_SCHEDULER_INITIAL_DELAY_SECONDS: ${MASS_EMAIL_SCHEDULER_INITIAL_DELAY_SECONDS:-30}
+      MASS_EMAIL_SCHEDULER_HEALTH_MAX_AGE_SECONDS: ${MASS_EMAIL_SCHEDULER_HEALTH_MAX_AGE_SECONDS:-1200}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${MASS_EMAIL_SCHEDULER_ENABLED}" != "true" ]; then
+          echo "Mass email scheduler disabled; enable it only during an approved canary."
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then
+          echo "Mass email scheduler cannot start because CRON_SECRET is empty."
+          exit 1
+        fi
+        sleep "$${MASS_EMAIL_SCHEDULER_INITIAL_DELAY_SECONDS}"
+        while true; do
+          if response="$$(curl --fail-with-body --silent --show-error \
+              --max-time 240 \
+              --header "Authorization: Bearer $${CRON_SECRET}" \
+              --request POST \
+              http://app:3002/api/cron/process-mass-email)"; then
+            date +%s > /tmp/mass-email-scheduler-last-success
+            printf '%s\n' "$${response}"
+          else
+            printf 'Mass email scheduler request failed at %s\n' "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+          fi
+          sleep "$${MASS_EMAIL_SCHEDULER_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${MASS_EMAIL_SCHEDULER_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/mass-email-scheduler-last-success || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/mass-email-scheduler-last-success);
+          age=$$((now - last));
+          [ "$${age}" -le "$${MASS_EMAIL_SCHEDULER_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 60s
+      timeout: 5s
+      retries: 2
+      start_period: 10m
+
+  # Guarded offboarding scheduler. The first enabled run records a baseline and
+  # intentionally does not process existing overdue recipients.
+  offboard-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-offboard-scheduler
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      OFFBOARD_SCHEDULER_ENABLED: ${OFFBOARD_SCHEDULER_ENABLED:-false}
+      OFFBOARD_SCHEDULER_INTERVAL_SECONDS: ${OFFBOARD_SCHEDULER_INTERVAL_SECONDS:-300}
+      OFFBOARD_SCHEDULER_INITIAL_DELAY_SECONDS: ${OFFBOARD_SCHEDULER_INITIAL_DELAY_SECONDS:-30}
+      OFFBOARD_SCHEDULER_HEALTH_MAX_AGE_SECONDS: ${OFFBOARD_SCHEDULER_HEALTH_MAX_AGE_SECONDS:-1200}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${OFFBOARD_SCHEDULER_ENABLED}" != "true" ]; then
+          echo "Offboard scheduler disabled; set OFFBOARD_SCHEDULER_ENABLED=true and recreate this service to activate it."
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then
+          echo "Offboard scheduler cannot start because CRON_SECRET is empty."
+          exit 1
+        fi
+        sleep "$${OFFBOARD_SCHEDULER_INITIAL_DELAY_SECONDS}"
+        while true; do
+          if response="$$(curl --fail-with-body --silent --show-error \
+              --max-time 240 \
+              --header "Authorization: Bearer $${CRON_SECRET}" \
+              --request POST \
+              http://app:3002/api/cron/process-offboard-campaigns)"; then
+            date +%s > /tmp/offboard-scheduler-last-success
+            printf '%s\n' "$${response}"
+          else
+            printf 'Offboard scheduler request failed at %s\n' "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+          fi
+          sleep "$${OFFBOARD_SCHEDULER_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${OFFBOARD_SCHEDULER_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/offboard-scheduler-last-success || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/offboard-scheduler-last-success);
+          age=$$((now - last));
+          [ "$${age}" -le "$${OFFBOARD_SCHEDULER_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 60s
+      timeout: 5s
+      retries: 2
+      start_period: 10m
+
+  # Password expiration reminder scheduler. The first enabled run immediately
+  # sends any currently due milestone reminders.
+  password-expiration-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-password-expiration-scheduler
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      PASSWORD_EXPIRATION_SCHEDULER_ENABLED: ${PASSWORD_EXPIRATION_SCHEDULER_ENABLED:-false}
+      PASSWORD_EXPIRATION_SCHEDULER_INTERVAL_SECONDS: ${PASSWORD_EXPIRATION_SCHEDULER_INTERVAL_SECONDS:-21600}
+      PASSWORD_EXPIRATION_SCHEDULER_INITIAL_DELAY_SECONDS: ${PASSWORD_EXPIRATION_SCHEDULER_INITIAL_DELAY_SECONDS:-45}
+      PASSWORD_EXPIRATION_SCHEDULER_HEALTH_MAX_AGE_SECONDS: ${PASSWORD_EXPIRATION_SCHEDULER_HEALTH_MAX_AGE_SECONDS:-86400}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${PASSWORD_EXPIRATION_SCHEDULER_ENABLED}" != "true" ]; then
+          echo "Password expiration scheduler disabled; set PASSWORD_EXPIRATION_SCHEDULER_ENABLED=true and recreate this service to activate it."
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then
+          echo "Password expiration scheduler cannot start because CRON_SECRET is empty."
+          exit 1
+        fi
+        sleep "$${PASSWORD_EXPIRATION_SCHEDULER_INITIAL_DELAY_SECONDS}"
+        while true; do
+          if response="$$(curl --fail-with-body --silent --show-error \
+              --max-time 240 \
+              --header "Authorization: Bearer $${CRON_SECRET}" \
+              --request POST \
+              http://app:3002/api/cron/process-password-expiration)"; then
+            date +%s > /tmp/password-expiration-scheduler-last-success
+            printf '%s\n' "$${response}"
+          else
+            printf 'Password expiration scheduler request failed at %s\n' "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+          fi
+          sleep "$${PASSWORD_EXPIRATION_SCHEDULER_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${PASSWORD_EXPIRATION_SCHEDULER_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/password-expiration-scheduler-last-success || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/password-expiration-scheduler-last-success);
+          age=$$((now - last));
+          [ "$${age}" -le "$${PASSWORD_EXPIRATION_SCHEDULER_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 60s
+      timeout: 5s
+      retries: 2
+      start_period: 10m
+
+  password-cleanup-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-password-cleanup-scheduler
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      PASSWORD_CLEANUP_SCHEDULER_ENABLED: ${PASSWORD_CLEANUP_SCHEDULER_ENABLED:-false}
+      PASSWORD_CLEANUP_INTERVAL_SECONDS: ${PASSWORD_CLEANUP_INTERVAL_SECONDS:-21600}
+      PASSWORD_CLEANUP_INITIAL_DELAY_SECONDS: ${PASSWORD_CLEANUP_INITIAL_DELAY_SECONDS:-60}
+      PASSWORD_CLEANUP_HEALTH_MAX_AGE_SECONDS: ${PASSWORD_CLEANUP_HEALTH_MAX_AGE_SECONDS:-86400}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${PASSWORD_CLEANUP_SCHEDULER_ENABLED}" != "true" ]; then
+          echo "Password cleanup scheduler disabled; set PASSWORD_CLEANUP_SCHEDULER_ENABLED=true and recreate this service to activate it."
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then
+          echo "Password cleanup scheduler cannot start because CRON_SECRET is empty."
+          exit 1
+        fi
+        sleep "$${PASSWORD_CLEANUP_INITIAL_DELAY_SECONDS}"
+        while true; do
+          if response="$$(curl --fail-with-body --silent --show-error \
+              --max-time 240 \
+              --header "Authorization: Bearer $${CRON_SECRET}" \
+              --request POST \
+              http://app:3002/api/cron/process-password-cleanup)"; then
+            date +%s > /tmp/password-cleanup-last-success
+            printf '%s\n' "$${response}"
+          else
+            printf 'Password cleanup request failed at %s\n' "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+          fi
+          sleep "$${PASSWORD_CLEANUP_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${PASSWORD_CLEANUP_SCHEDULER_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/password-cleanup-last-success || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/password-cleanup-last-success);
+          age=$$((now - last));
+          [ "$${age}" -le "$${PASSWORD_CLEANUP_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 60s
+      timeout: 5s
+      retries: 2
+      start_period: 10m
+
+  # Ticket group directory snapshot scheduler. Refreshes AD membership/mail
+  # snapshots for allowed ticket groups so ticket forms and assignment
+  # notifications never perform live LDAP searches (ADR-0007). Disabled by
+  # default; the System Configuration page can also trigger syncs manually.
+  ticket-group-sync-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-ticket-group-sync-scheduler
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      TICKET_GROUP_SYNC_ENABLED: ${TICKET_GROUP_SYNC_ENABLED:-false}
+      TICKET_GROUP_SYNC_INTERVAL_SECONDS: ${TICKET_GROUP_SYNC_INTERVAL_SECONDS:-3600}
+      TICKET_GROUP_SYNC_INITIAL_DELAY_SECONDS: ${TICKET_GROUP_SYNC_INITIAL_DELAY_SECONDS:-45}
+      TICKET_GROUP_SYNC_HEALTH_MAX_AGE_SECONDS: ${TICKET_GROUP_SYNC_HEALTH_MAX_AGE_SECONDS:-14400}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${TICKET_GROUP_SYNC_ENABLED}" != "true" ]; then
+          echo "Ticket group sync scheduler disabled; set TICKET_GROUP_SYNC_ENABLED=true and recreate this service to activate it."
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then
+          echo "Ticket group sync scheduler cannot start because CRON_SECRET is empty."
+          exit 1
+        fi
+        sleep "$${TICKET_GROUP_SYNC_INITIAL_DELAY_SECONDS}"
+        while true; do
+          if response="$$(curl --fail-with-body --silent --show-error \
+              --max-time 240 \
+              --header "Authorization: Bearer $${CRON_SECRET}" \
+              --request POST \
+              http://app:3002/api/cron/sync-ticket-groups)"; then
+            date +%s > /tmp/ticket-group-sync-last-success
+            printf '%s\n' "$${response}"
+          else
+            printf 'Ticket group sync request failed at %s\n' "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+          fi
+          sleep "$${TICKET_GROUP_SYNC_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${TICKET_GROUP_SYNC_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/ticket-group-sync-last-success || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/ticket-group-sync-last-success);
+          age=$$((now - last));
+          [ "$${age}" -le "$${TICKET_GROUP_SYNC_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 60s
+      timeout: 5s
+      retries: 2
+      start_period: 10m
+
+  # Internal evidence/asset store (ADR-0010). Holds uploaded ticket evidence
+  # on a dedicated volume. It publishes NO host ports and is reachable only on
+  # the internal network; every request must carry the shared secret header,
+  # and the Next.js app is the single ingress that performs authorization.
+  asset-store:
+    image: nginx:1.27-alpine
+    container_name: uar-${INSTANCE:-dev}-asset-store
+    environment:
+      ASSET_SHARED_SECRET: ${ASSET_SHARED_SECRET:-}
+    volumes:
+      - ./docker/asset-store/nginx.conf:/etc/nginx/nginx.conf.template:ro
+      - asset_data:/var/lib/assets
+    depends_on: []
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ -z "$${ASSET_SHARED_SECRET}" ]; then
+          echo "asset-store cannot start because ASSET_SHARED_SECRET is empty."
+          exit 1
+        fi
+        sed "s/__ASSET_SHARED_SECRET__/$${ASSET_SHARED_SECRET}/" \
+          /etc/nginx/nginx.conf.template > /tmp/nginx.conf
+        exec nginx -g "daemon off;" -c /tmp/nginx.conf
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8090/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Malware scanner for every managed upload. clamd is reachable only on the
+  # internal Compose network; its unauthenticated TCP socket is never published.
+  clamav:
+    image: clamav/clamav:stable
+    container_name: uar-${INSTANCE:-dev}-clamav
+    volumes:
+      - clamav_data:/var/lib/clamav
+    networks:
+      - uar-network
+    restart: unless-stopped
+
+  # Retention runs independently from sign-in and from AUTH_DEVICE_RISK_MODE.
+  # Work is bounded per pass; a backlog is reported and continued next pass.
+  auth-device-evidence-maintenance:
+    profiles: ["auth"]
+    image: uar-auth:${INSTANCE:-dev}
+    container_name: uar-${INSTANCE:-dev}-auth-device-maintenance
+    environment:
+      DATABASE_URL: ${AUTH_DATABASE_URL:-${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL is required}}
+      AUTH_DEVICE_PURGE_INTERVAL_SECONDS: ${AUTH_DEVICE_PURGE_INTERVAL_SECONDS:-86400}
+      AUTH_DEVICE_PURGE_RETRY_SECONDS: ${AUTH_DEVICE_PURGE_RETRY_SECONDS:-300}
+      AUTH_DEVICE_PURGE_HEALTH_GRACE_SECONDS: ${AUTH_DEVICE_PURGE_HEALTH_GRACE_SECONDS:-900}
+      AUTH_DEVICE_PURGE_BATCH_SIZE: ${AUTH_DEVICE_PURGE_BATCH_SIZE:-1000}
+      AUTH_DEVICE_PURGE_MAX_BATCHES: ${AUTH_DEVICE_PURGE_MAX_BATCHES:-25}
+    command: ["node", "dist/prune-device-observations.js", "--loop"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "dist/prune-device-observations.js", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # Directory health probe scheduler (ADR-0008). Binds LDAPS and reads the
+  # rootDSE on an interval; failures raise service alerts via configured
+  # automation rules. Disabled by default like the other schedulers.
+  directory-probe-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-directory-probe-scheduler
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      DIRECTORY_PROBE_ENABLED: ${DIRECTORY_PROBE_ENABLED:-false}
+      DIRECTORY_PROBE_INTERVAL_SECONDS: ${DIRECTORY_PROBE_INTERVAL_SECONDS:-300}
+      DIRECTORY_PROBE_INITIAL_DELAY_SECONDS: ${DIRECTORY_PROBE_INITIAL_DELAY_SECONDS:-60}
+      DIRECTORY_PROBE_HEALTH_MAX_AGE_SECONDS: ${DIRECTORY_PROBE_HEALTH_MAX_AGE_SECONDS:-1800}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${DIRECTORY_PROBE_ENABLED}" != "true" ]; then
+          echo "Directory probe scheduler disabled; set DIRECTORY_PROBE_ENABLED=true and recreate this service to activate it."
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then
+          echo "Directory probe scheduler cannot start because CRON_SECRET is empty."
+          exit 1
+        fi
+        sleep "$${DIRECTORY_PROBE_INITIAL_DELAY_SECONDS}"
+        while true; do
+          if response="$$(curl --fail-with-body --silent --show-error \
+              --max-time 120 \
+              --header "Authorization: Bearer $${CRON_SECRET}" \
+              --request POST \
+              http://app:3002/api/cron/probe-directory)"; then
+            date +%s > /tmp/directory-probe-last-success
+            printf '%s\n' "$${response}"
+          else
+            printf 'Directory probe request failed at %s\n' "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+          fi
+          sleep "$${DIRECTORY_PROBE_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${DIRECTORY_PROBE_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/directory-probe-last-success || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/directory-probe-last-success);
+          age=$$((now - last));
+          [ "$${age}" -le "$${DIRECTORY_PROBE_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 60s
+      timeout: 5s
+      retries: 2
+      start_period: 10m
+
+  # Workflow tick worker (ADR-0013). Drains Wait-node timers and fires
+  # schedule triggers every minute. Disabled by default like the other
+  # schedulers so behavior is unchanged until operators opt in.
+  workflow-tick-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-workflow-tick
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      WORKFLOW_TICK_ENABLED: ${WORKFLOW_TICK_ENABLED:-false}
+      WORKFLOW_TICK_INTERVAL_SECONDS: ${WORKFLOW_TICK_INTERVAL_SECONDS:-60}
+      WORKFLOW_TICK_HEALTH_MAX_AGE_SECONDS: ${WORKFLOW_TICK_HEALTH_MAX_AGE_SECONDS:-300}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${WORKFLOW_TICK_ENABLED}" != "true" ]; then
+          echo "Workflow tick disabled; set WORKFLOW_TICK_ENABLED=true to activate it."
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then
+          echo "Workflow tick cannot start because CRON_SECRET is empty."
+          exit 1
+        fi
+        sleep 10
+        while true; do
+          if curl --fail --silent --show-error --max-time 60 \
+            --header "Authorization: Bearer $${CRON_SECRET}" \
+            --request POST http://app:3002/api/cron/workflow-tick > /dev/null; then
+            date +%s > /tmp/workflow-tick-last-run
+          else
+            printf 'Workflow tick request failed at %s\n' "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+          fi
+          sleep "$${WORKFLOW_TICK_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${WORKFLOW_TICK_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/workflow-tick-last-run || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/workflow-tick-last-run);
+          [ "$$((now - last))" -le "$${WORKFLOW_TICK_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 30s
+      timeout: 5s
+      retries: 2
+
+  monitored-endpoints-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-monitored-endpoints
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      MONITORED_ENDPOINTS_SCHEDULER_ENABLED: ${MONITORED_ENDPOINTS_SCHEDULER_ENABLED:-false}
+      MONITORED_ENDPOINTS_INTERVAL_SECONDS: ${MONITORED_ENDPOINTS_INTERVAL_SECONDS:-60}
+      MONITORED_ENDPOINTS_HEALTH_MAX_AGE_SECONDS: ${MONITORED_ENDPOINTS_HEALTH_MAX_AGE_SECONDS:-300}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${MONITORED_ENDPOINTS_SCHEDULER_ENABLED}" != "true" ]; then
+          echo "Monitored endpoints scheduler disabled."
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then exit 1; fi
+        sleep 30
+        while true; do
+          if curl --fail --silent --show-error --max-time 120 \
+            --header "Authorization: Bearer $${CRON_SECRET}" \
+            --request POST http://app:3002/api/cron/probe-monitored-endpoints > /dev/null; then
+            date +%s > /tmp/monitored-endpoints-last-run
+          fi
+          sleep "$${MONITORED_ENDPOINTS_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${MONITORED_ENDPOINTS_SCHEDULER_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/monitored-endpoints-last-run || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/monitored-endpoints-last-run);
+          [ "$$((now - last))" -le "$${MONITORED_ENDPOINTS_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 30s
+      timeout: 5s
+      retries: 2
+      start_period: 5m
+
+  attachment-quarantine-purge-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-attachment-quarantine-purge
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      ATTACHMENT_QUARANTINE_PURGE_ENABLED: ${ATTACHMENT_QUARANTINE_PURGE_ENABLED:-false}
+      ATTACHMENT_QUARANTINE_PURGE_INTERVAL_SECONDS: ${ATTACHMENT_QUARANTINE_PURGE_INTERVAL_SECONDS:-86400}
+      ATTACHMENT_QUARANTINE_PURGE_HEALTH_MAX_AGE_SECONDS: ${ATTACHMENT_QUARANTINE_PURGE_HEALTH_MAX_AGE_SECONDS:-172800}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${ATTACHMENT_QUARANTINE_PURGE_ENABLED}" != "true" ]; then
+          echo "Attachment quarantine purge disabled."
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then
+          echo "Attachment quarantine purge cannot start because CRON_SECRET is empty."
+          exit 1
+        fi
+        sleep 90
+        while true; do
+          if curl --fail --silent --show-error --max-time 300 \
+            --header "Authorization: Bearer $${CRON_SECRET}" \
+            --request POST http://app:3002/api/cron/purge-attachment-quarantine > /dev/null; then
+            date +%s > /tmp/attachment-quarantine-purge-last-run
+          else
+            printf 'Attachment quarantine purge failed at %s\n' "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+          fi
+          sleep "$${ATTACHMENT_QUARANTINE_PURGE_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${ATTACHMENT_QUARANTINE_PURGE_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/attachment-quarantine-purge-last-run || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/attachment-quarantine-purge-last-run);
+          [ "$$((now - last))" -le "$${ATTACHMENT_QUARANTINE_PURGE_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 5m
+      timeout: 5s
+      retries: 2
+      start_period: 10m
+
+  flow-outbox-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-flow-outbox
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      FLOW_OUTBOX_SCHEDULER_ENABLED: ${FLOW_OUTBOX_SCHEDULER_ENABLED:-false}
+      FLOW_OUTBOX_INTERVAL_SECONDS: ${FLOW_OUTBOX_INTERVAL_SECONDS:-60}
+      FLOW_OUTBOX_HEALTH_MAX_AGE_SECONDS: ${FLOW_OUTBOX_HEALTH_MAX_AGE_SECONDS:-300}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${FLOW_OUTBOX_SCHEDULER_ENABLED}" != "true" ]; then
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then exit 1; fi
+        sleep 20
+        while true; do
+          if curl --fail --silent --show-error --max-time 60 \
+            --header "Authorization: Bearer $${CRON_SECRET}" \
+            --request POST http://app:3002/api/cron/drain-flow-outbox > /dev/null; then
+            date +%s > /tmp/flow-outbox-last-run
+          fi
+          sleep "$${FLOW_OUTBOX_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${FLOW_OUTBOX_SCHEDULER_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/flow-outbox-last-run || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/flow-outbox-last-run);
+          [ "$$((now - last))" -le "$${FLOW_OUTBOX_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 30s
+      timeout: 5s
+      retries: 2
+      start_period: 5m
+
+  operational-detector-scheduler:
+    image: curlimages/curl:8.12.1
+    container_name: uar-${INSTANCE:-dev}-operational-detector
+    environment:
+      CRON_SECRET: ${CRON_SECRET:-}
+      OPERATIONAL_DETECTOR_SCHEDULER_ENABLED: ${OPERATIONAL_DETECTOR_SCHEDULER_ENABLED:-false}
+      OPERATIONAL_DETECTOR_INTERVAL_SECONDS: ${OPERATIONAL_DETECTOR_INTERVAL_SECONDS:-60}
+      OPERATIONAL_DETECTOR_HEALTH_MAX_AGE_SECONDS: ${OPERATIONAL_DETECTOR_HEALTH_MAX_AGE_SECONDS:-300}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - uar-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${OPERATIONAL_DETECTOR_SCHEDULER_ENABLED}" != "true" ]; then
+          while true; do sleep 86400; done
+        fi
+        if [ -z "$${CRON_SECRET}" ]; then exit 1; fi
+        sleep 25
+        while true; do
+          if curl --fail --silent --show-error --max-time 60 \
+            --header "Authorization: Bearer $${CRON_SECRET}" \
+            --request POST http://app:3002/api/cron/detect-operational-issues > /dev/null; then
+            date +%s > /tmp/operational-detector-last-run
+          fi
+          sleep "$${OPERATIONAL_DETECTOR_INTERVAL_SECONDS}"
+        done
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ "$${OPERATIONAL_DETECTOR_SCHEDULER_ENABLED}" != "true" ]; then exit 0; fi;
+          test -s /tmp/operational-detector-last-run || exit 1;
+          now=$$(date +%s);
+          last=$$(cat /tmp/operational-detector-last-run);
+          [ "$$((now - last))" -le "$${OPERATIONAL_DETECTOR_HEALTH_MAX_AGE_SECONDS}" ]
+      interval: 30s
+      timeout: 5s
+      retries: 2
+      start_period: 5m
+
 networks:
   uar-network:
     driver: bridge
@@ -90,3 +1059,5 @@ networks:
 volumes:
   postgres_data:
   redis_data:
+  asset_data:
+  clamav_data:

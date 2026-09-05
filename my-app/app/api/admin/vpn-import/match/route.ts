@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { requireModuleEnabled } from '@/lib/modules/guards';
+
 import { getIpAddress, logAuditAction } from '@/lib/audit-log';
 import { searchLDAPUser } from '@/lib/ldap';
 import { INPUT_LIMITS, isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit, validateStringLength } from '@/lib/validation';
@@ -66,7 +69,12 @@ export async function POST(request: NextRequest) {
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
+    const vpnModuleGuard = await requireModuleEnabled('vpn.management');
+    if (vpnModuleGuard) return vpnModuleGuard;
     const body = await parseJsonWithLimit<MatchRequestBody>(request, MAX_REQUEST_BODY_SIZE.SMALL);
     const recordId = typeof body.recordId === 'string' ? body.recordId.trim() : '';
     const adUsername = typeof body.adUsername === 'string' ? body.adUsername.trim() : '';
@@ -174,7 +182,12 @@ export async function PATCH(request: NextRequest) {
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
+    const vpnModuleGuard = await requireModuleEnabled('vpn.management');
+    if (vpnModuleGuard) return vpnModuleGuard;
     const body = await parseJsonWithLimit<MatchStatusBody>(request, MAX_REQUEST_BODY_SIZE.SMALL);
     const recordId = typeof body.recordId === 'string' ? body.recordId.trim() : '';
     const matchStatus = typeof body.matchStatus === 'string' ? body.matchStatus.trim() : '';

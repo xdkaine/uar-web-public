@@ -1,0 +1,161 @@
+name: Development build and release
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: dev-build-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    name: Check ${{ matrix.service }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: portal
+            dockerfile: Dockerfile
+          - service: auth
+            dockerfile: services/auth-service/Dockerfile
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Validate deployment configuration
+        if: matrix.service == 'portal'
+        run: |
+          docker compose --env-file .env.example config --quiet
+          python3 -m unittest discover -s deploy/scripts -p '*_test.py'
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: builder
+          load: true
+          tags: uar-check:${{ matrix.service }}
+          cache-from: type=gha,scope=check-${{ matrix.service }}
+          cache-to: type=gha,scope=check-${{ matrix.service }},mode=max
+      - name: Lint
+        run: docker run --rm --network none uar-check:${{ matrix.service }} npm run lint
+      - name: Tests
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          if [ "$SERVICE" = portal ]; then
+            docker run --rm --network none uar-check:portal npm run test:run
+          else
+            docker run --rm --network none uar-check:auth npm test
+          fi
+  images:
+    name: Publish ${{ matrix.image }}
+    needs: checks
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/dev' && vars.DEV_PORTAL_URL != '' && vars.DEV_AUTH_URL != '' && vars.DEV_TURNSTILE_SITE_KEY != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: portal
+            dockerfile: Dockerfile
+            target: runner
+          - image: auth
+            dockerfile: services/auth-service/Dockerfile
+            target: runner
+          - image: portal-migrate
+            dockerfile: Dockerfile
+            target: prisma-tool
+          - image: auth-migrate
+            dockerfile: services/auth-service/Dockerfile
+            target: migration-tool
+          - image: monitor
+            dockerfile: services/monitor-probe/Dockerfile
+            target: ''
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate public build inputs
+        env:
+          DEV_PORTAL_URL: ${{ vars.DEV_PORTAL_URL }}
+          DEV_AUTH_URL: ${{ vars.DEV_AUTH_URL }}
+        run: python3 deploy/scripts/publish_release.py --check-origins
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: build
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          push: true
+          platforms: linux/amd64
+          tags: ghcr.io/${{ github.repository }}-${{ matrix.image }}:dev-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            NEXT_PUBLIC_APP_URL=${{ vars.DEV_PORTAL_URL }}
+            NEXT_PUBLIC_TURNSTILE_SITE_KEY=${{ vars.DEV_TURNSTILE_SITE_KEY }}
+          cache-from: type=gha,scope=image-${{ matrix.image }}
+          cache-to: type=gha,scope=image-${{ matrix.image }},mode=max
+      - name: Record immutable image
+        env:
+          IMAGE_KIND: ${{ matrix.image }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          python3 - <<'PY'
+          import json, os, pathlib
+          kind = os.environ['IMAGE_KIND']
+          pathlib.Path('digests', kind + '.json').write_text(json.dumps({
+              'kind': kind, 'digest': os.environ['IMAGE_DIGEST'], 'source': os.environ['GITHUB_SHA']
+          }))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.image }}
+          path: digests/*.json
+          retention-days: 7
+  release:
+    name: Publish tested development deployment
+    needs: images
+    if: github.ref == 'refs/heads/dev' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: uar-dev-release
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - name: Publish digest-pinned manifests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEV_PORTAL_URL: ${{ vars.DEV_PORTAL_URL }}
+          DEV_AUTH_URL: ${{ vars.DEV_AUTH_URL }}
+        run: python3 deploy/scripts/publish_release.py --publish

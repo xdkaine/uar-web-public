@@ -76,6 +76,20 @@ const securityHeaders = [
 
 const nextConfig: NextConfig = {
   output: 'standalone',
+  // Dynamic asset storage paths must not pull the source checkout into runners.
+  // Anchor project exclusions so dependency runtime files remain traceable.
+  outputFileTracingExcludes: {
+    '*': [
+      './.env*', './**/.env*',
+      './app/**/*', './components/**/*', './hooks/**/*', './lib/**/*',
+      './scripts/**/*', './types/**/*', './e2e/**/*', './tests/**/*',
+      './docs/**/*', './prisma/**/*', './.agent/**/*', './.agents/**/*',
+      './*.ts', './*.tsx', './*.md', './*.mdx', './*.tsbuildinfo',
+      './eslint.config.*', './postcss.config.*', './playwright.config.*',
+      './vitest.config.*', './tsconfig*.json', './components.json',
+      './package-lock.json', './.npmrc',
+    ],
+  },
   
   // Disable sourcemaps in production to obscure code
   productionBrowserSourceMaps: false,

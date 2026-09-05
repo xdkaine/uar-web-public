@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { parseJsonWithLimit, MAX_REQUEST_BODY_SIZE, validateStringLength, INPUT_LIMITS } from '@/lib/validation';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 
@@ -19,11 +21,15 @@ export async function GET(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
+    if (!actorHasPermission(admin, 'blocklist.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
     const { searchParams } = new URL(request.url);
     const includeInactive = searchParams.get('includeInactive') === 'true';
     const search = searchParams.get('search') || '';
 
-    const where: any = {};
+    const where: Prisma.BlockedEmailWhereInput = {};
     
     if (!includeInactive) {
       where.isActive = true;
@@ -72,6 +78,10 @@ export async function POST(request: NextRequest) {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!actorHasPermission(admin, 'blocklist.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const body = await parseJsonWithLimit<BlocklistRequestBody>(request, MAX_REQUEST_BODY_SIZE.SMALL);

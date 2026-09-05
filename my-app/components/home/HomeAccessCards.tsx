@@ -32,9 +32,9 @@ const publicCards: AccessCard[] = [
     ),
     action: 'Request Access',
     icon: 'internal',
-    borderClass: 'hover:border-black',
-    iconClass: 'bg-black',
-    buttonClass: 'bg-black group-hover:bg-gray-800',
+    borderClass: 'hover:border-black dark:hover:border-gray-500',
+    iconClass: 'bg-black dark:bg-gray-700',
+    buttonClass: 'bg-black group-hover:bg-gray-800 dark:bg-gray-700 dark:group-hover:bg-gray-600',
   },
   {
     href: '/request/external',
@@ -42,9 +42,9 @@ const publicCards: AccessCard[] = [
     description: 'Non-Cal Poly Pomona Students or external participants requiring temporary access',
     action: 'Request Access',
     icon: 'external',
-    borderClass: 'hover:border-black',
-    iconClass: 'bg-black',
-    buttonClass: 'bg-black group-hover:bg-gray-800',
+    borderClass: 'hover:border-black dark:hover:border-gray-500',
+    iconClass: 'bg-black dark:bg-gray-700',
+    buttonClass: 'bg-black group-hover:bg-gray-800 dark:bg-gray-700 dark:group-hover:bg-gray-600',
   },
 ];
 
@@ -171,7 +171,7 @@ function AccessCard({ card }: { card: AccessCard }) {
   return (
     <Link href={card.href} className="group block h-full">
       <div
-        className={`flex h-full flex-col rounded-lg border-2 border-transparent bg-white p-6 shadow-lg transition-all duration-300 hover:shadow-xl sm:p-8 ${card.borderClass}`}
+        className={`flex h-full flex-col rounded-lg border-2 border-transparent bg-card p-6 text-card-foreground shadow-lg transition-[border-color,box-shadow] duration-300 hover:shadow-xl dark:border-border dark:shadow-black/30 sm:p-8 ${card.borderClass}`}
       >
         <div
           className={`mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full transition-transform duration-300 group-hover:scale-110 sm:mb-6 sm:h-16 sm:w-16 ${card.iconClass}`}
@@ -180,10 +180,10 @@ function AccessCard({ card }: { card: AccessCard }) {
             <AccessIcon icon={card.icon} />
           </svg>
         </div>
-        <h3 className="mb-2 text-center text-xl font-bold text-gray-900 sm:mb-3 sm:text-2xl">
+        <h3 className="mb-2 text-center text-xl font-bold text-gray-900 dark:text-gray-50 sm:mb-3 sm:text-2xl">
           {card.title}
         </h3>
-        <p className="mb-4 text-center text-sm text-gray-700 sm:mb-6 sm:text-base">
+        <p className="mb-4 text-center text-sm text-gray-700 dark:text-gray-300 sm:mb-6 sm:text-base">
           {card.description}
         </p>
         <div className="mt-auto text-center">
@@ -224,7 +224,7 @@ export function HomeAccessCards() {
 
   return (
     <>
-      <p className="mx-auto mb-8 mt-4 max-w-3xl px-4 text-center text-sm leading-relaxed text-gray-700 sm:text-base md:text-lg">
+      <p className="mx-auto mb-8 mt-4 max-w-3xl px-4 text-center text-sm leading-relaxed text-gray-700 dark:text-gray-300 sm:text-base md:text-lg">
         {isAuthenticated
           ? 'Welcome back! Quick access to commonly used features.'
           : 'Select your student category below to start your access request.'}

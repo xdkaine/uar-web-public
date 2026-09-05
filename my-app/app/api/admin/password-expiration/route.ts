@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { getPasswordExpirationReport } from '@/lib/password-expiration';
 import {
   AuditActions,
@@ -15,6 +16,9 @@ export async function GET(request: NextRequest) {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!actorHasPermission(admin, 'password_expiration.read')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const report = await getPasswordExpirationReport();

@@ -2,13 +2,28 @@ import { NextRequest, NextResponse } from 'next/server';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { searchLDAPUserForProvisioning } from '@/lib/ldap';
-import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { checkReviewAccessWithRateLimit } from '@/lib/adminAuth';
+import { actorCanActOnStage, actorHasPermission } from '@/lib/rbac/core';
 import { encryptPassword } from '@/lib/encryption';
 
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 import { findReusableOffboardedRequest } from '@/lib/offboard-reenrollment';
+import { toSafeAccessRequestResponse } from '@/lib/access-request-response';
+import {
+  acquireDirectoryOwnershipFence,
+  findBatchDirectoryOwnershipClaims,
+} from '@/lib/directory-ownership-fence';
+import {
+  findStageIndexByStatus,
+  resolveWorkflowForRequest,
+  workflowIntegrityConflict,
+} from '@/lib/workflow/core';
 
 type ReusableOffboardedRequest = { id: string } | null;
+
+class BatchOwnershipConflict extends Error {
+  readonly code = 'BATCH_ACCOUNT_OWNER';
+}
 
 // Retry configuration for handling unique constraint violations
 const MAX_RETRIES = 3;
@@ -26,10 +41,35 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const { admin, response } = await checkAdminAuthWithRateLimit(request);
+    const { admin, response } = await checkReviewAccessWithRateLimit(request);
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!actorHasPermission(admin, 'access_requests.provision')) {
+      try {
+        await logAuditAction({
+          action: AuditActions.SAVE_REQUEST_CREDENTIALS,
+          category: AuditCategories.ACCESS_REQUEST,
+          username: admin.username,
+          actorType: 'admin',
+          targetType: 'AccessRequest',
+          eventKind: 'security',
+          outcome: 'denied',
+          success: false,
+          details: {
+            reason: 'permission_denied',
+            missingPermission: 'access_requests.provision',
+            route: request.nextUrl.pathname,
+          },
+          ipAddress: getIpAddress(request),
+          userAgent: getUserAgent(request),
+        });
+      } catch (auditError) {
+        console.error('Failed to audit credential-save permission denial:', auditError);
+      }
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const resolvedParams = await params;
@@ -44,11 +84,33 @@ export async function POST(
     if (!accessRequest) {
       return NextResponse.json({ error: 'Request not found' }, { status: 404 });
     }
+    if (['in_progress', 'reconciliation_required'].includes(accessRequest.accountUpdateState || '')) {
+      return NextResponse.json(
+        { error: 'Account identity reconciliation must finish before credentials can change' },
+        { status: 409 }
+      );
+    }
+    const workflow = await resolveWorkflowForRequest(accessRequest);
+    const workflowConflict = workflowIntegrityConflict(workflow);
+    if (workflowConflict) {
+      return NextResponse.json({ error: workflowConflict, code: 'WORKFLOW_RECONCILIATION_REQUIRED' }, { status: 409 });
+    }
+    const stageIndex = findStageIndexByStatus(workflow.stages, accessRequest.status);
+    const currentStage = stageIndex >= 0 ? workflow.stages[stageIndex] : null;
+    if (!currentStage) {
+      return NextResponse.json(
+        { error: 'The current request status is not represented by its configured review workflow.' },
+        { status: 409 }
+      );
+    }
+    if (!actorCanActOnStage(admin, currentStage.reviewerRoleKey)) {
+      return NextResponse.json({ error: 'Forbidden for the current configured review stage.' }, { status: 403 });
+    }
 
     // Validate required fields based on account type
     if (!ldapUsername || !password) {
       return NextResponse.json(
-        { error: 'LDAP username and password are required' },
+        { error: 'Directory username and password are required' },
         { status: 400 }
       );
     }
@@ -108,7 +170,7 @@ export async function POST(
 
           if (!reusableAdRequest) {
             return NextResponse.json(
-              { error: `LDAP username "${ldapUsername}" already exists in Active Directory` },
+              { error: `Directory username "${ldapUsername}" already exists in Active Directory` },
               { status: 400 }
             );
           }
@@ -116,7 +178,7 @@ export async function POST(
       } catch (ldapError) {
         console.error('LDAP search error during credential save:', ldapError);
         return NextResponse.json(
-          { error: 'Failed to verify LDAP username availability. Please try again.' },
+          { error: 'Failed to verify directory username availability. Please try again.' },
           { status: 500 }
         );
       }
@@ -159,6 +221,16 @@ export async function POST(
 
         // Use a transaction to ensure atomicity and leverage database-level unique constraints
         const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+          await acquireDirectoryOwnershipFence(tx, ldapUsername);
+          const batchAdOwners = await findBatchDirectoryOwnershipClaims(tx, ldapUsername, 'AD');
+          if (batchAdOwners.length > 0) {
+            throw new BatchOwnershipConflict(
+              `Directory username "${ldapUsername}" is governed by batch ${batchAdOwners[0].batchId}`
+            );
+          }
+          if (reusableAdRequest && !await searchLDAPUserForProvisioning(ldapUsername)) {
+            throw new Error('The reusable Active Directory account disappeared before ownership was reserved');
+          }
           // Re-fetch the request within transaction to get latest state
           const currentRequest = await tx.accessRequest.findUnique({
             where: { id: resolvedParams.id },
@@ -175,8 +247,10 @@ export async function POST(
             throw new Error('Request not found');
           }
 
-          if (currentRequest.status !== 'pending_student_directors') {
-            throw new Error(`Request status is ${currentRequest.status}, expected pending_student_directors`);
+          if (currentRequest.status !== accessRequest.status) {
+            throw new Error(
+              `Request status changed from ${accessRequest.status} to ${currentRequest.status}`
+            );
           }
 
           // Build update data
@@ -278,7 +352,7 @@ export async function POST(
 
         // Success - log and return the result
         await logAuditAction({
-          action: AuditActions.CREATE_ACCOUNT,
+          action: AuditActions.SAVE_REQUEST_CREDENTIALS,
           category: AuditCategories.ACCESS_REQUEST,
           username: admin.username,
           targetId: resolvedParams.id,
@@ -291,7 +365,7 @@ export async function POST(
         return NextResponse.json({ 
           success: true, 
           message: 'Credentials saved successfully',
-          request: result 
+          request: toSafeAccessRequestResponse(result)
         });
 
       } catch (error) {
@@ -300,12 +374,18 @@ export async function POST(
         // Check if it's a unique constraint violation
         if (error && typeof error === 'object' && 'code' in error) {
           const prismaError = error as { code: string; meta?: { target?: string[] } };
+          if (prismaError.code === 'BATCH_ACCOUNT_OWNER') {
+            return NextResponse.json(
+              { error: error instanceof Error ? error.message : 'Directory username is governed by a batch run' },
+              { status: 409 }
+            );
+          }
           if (prismaError.code === 'P2002') {
             // Unique constraint violation - username already taken
             const target = prismaError.meta?.target;
             if (target?.includes('ldapUsername')) {
               return NextResponse.json(
-                { error: `LDAP username "${ldapUsername}" is already in use by another request` },
+                { error: `Directory username "${ldapUsername}" is already in use by another request` },
                 { status: 409 }
               );
             }
@@ -359,10 +439,10 @@ export async function POST(
     
     // Log the failure
     const resolvedParams = await params;
-    const { admin } = await checkAdminAuthWithRateLimit(request);
+    const { admin } = await checkReviewAccessWithRateLimit(request);
     if (admin) {
       await logAuditAction({
-        action: AuditActions.CREATE_ACCOUNT,
+        action: AuditActions.SAVE_REQUEST_CREDENTIALS,
         category: AuditCategories.ACCESS_REQUEST,
         username: admin.username,
         targetId: resolvedParams.id,

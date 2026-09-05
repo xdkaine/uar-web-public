@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: asset-store
+spec:
+  type: ClusterIP
+  selector:
+    app: asset-store
+  ports:
+  - name: tcp
+    port: 8090
+    targetPort: 8090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: asset-store
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: asset-store
+  template:
+    metadata:
+      labels:
+        app: asset-store
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: asset-store
+        image: nginx:1.27-alpine
+        command:
+        - sh
+        - -ec
+        args:
+        - test "${#ASSET_SHARED_SECRET}" = 64; case "$ASSET_SHARED_SECRET" in *[!0-9a-f]*)
+          exit 1;; esac; sed "s/__ASSET_SHARED_SECRET__/$ASSET_SHARED_SECRET/" /templates/nginx.conf
+          > /tmp/nginx.conf; mkdir -p /var/lib/assets; chown nginx:nginx /var/lib/assets;
+          exec nginx -c /tmp/nginx.conf -g "daemon off;"
+        env:
+        - name: ASSET_SHARED_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: uar-portal-runtime
+              key: ASSET_SHARED_SECRET
+        ports:
+        - containerPort: 8090
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8090
+        volumeMounts:
+        - name: assets
+          mountPath: /var/lib/assets
+        - name: template
+          mountPath: /templates
+          readOnly: true
+      volumes:
+      - name: assets
+        persistentVolumeClaim:
+          claimName: asset-data
+      - name: template
+        configMap:
+          name: asset-store-config

@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorCanActOnStage, actorHasPermission } from '@/lib/rbac/core';
+import { resolveWorkflowForRequest, stageStatus, supportsFacultyHandoffActions, workflowIntegrityConflict } from '@/lib/workflow/core';
 import { decryptPassword } from '@/lib/encryption';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 
@@ -27,23 +29,15 @@ export async function POST(
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'access_requests.provision')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
     const resolvedParams = await params;
     const requestId = resolvedParams.id;
 
     // Fetch the access request
-    const accessRequest = await prisma.accessRequest.findUnique({
-      where: { id: requestId },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        isInternal: true,
-        status: true,
-        accountPassword: true,
-        ldapUsername: true,
-      },
-    });
+    const accessRequest = await prisma.accessRequest.findUnique({ where: { id: requestId } });
 
     if (!accessRequest) {
       // Log attempt to access non-existent request
@@ -87,6 +81,23 @@ export async function POST(
       return NextResponse.json(
         { error: 'Password reveal is not available for internal accounts' },
         { status: 403 }
+      );
+    }
+
+    const workflow = await resolveWorkflowForRequest(accessRequest);
+    const workflowConflict = workflowIntegrityConflict(workflow);
+    if (workflowConflict) return NextResponse.json({ error: workflowConflict, code: 'WORKFLOW_RECONCILIATION_REQUIRED' }, { status: 409 });
+    const facultyStage = workflow.stages[1];
+    if (
+      !supportsFacultyHandoffActions(workflow.stages)
+      || !facultyStage
+      || accessRequest.status !== stageStatus(facultyStage)
+      || !actorCanActOnStage(admin, facultyStage.reviewerRoleKey)
+      || !['succeeded', 'completed'].includes(accessRequest.provisioningState || '')
+    ) {
+      return NextResponse.json(
+        { error: 'Password reveal is only available to the assigned faculty-stage provisioner after account creation completes.' },
+        { status: 409 }
       );
     }
 

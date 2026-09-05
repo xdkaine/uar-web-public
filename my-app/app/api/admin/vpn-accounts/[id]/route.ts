@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { requireModuleEnabled } from '@/lib/modules/guards';
+
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 
 function sanitizeAccount<T extends { password?: string | null }>(
@@ -19,6 +22,9 @@ export async function GET(
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const resolvedParams = await params;
@@ -79,7 +85,12 @@ export async function PATCH(
         NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
       );
     }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
+    const vpnModuleGuard = await requireModuleEnabled('vpn.management');
+    if (vpnModuleGuard) return vpnModuleGuard;
     const body = await request.json();
     const { name, email, notes, expiresAt } = body;
 
@@ -139,97 +150,17 @@ export async function PATCH(
 
 export async function DELETE(
   request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
+  _context: { params: Promise<{ id: string }> }
 ) {
-  try {
-    const { admin, response } = await checkAdminAuthWithRateLimit(request);
-
-    if (!admin || response) {
-      return (
-        response ||
-        NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-      );
-    }
-
-    const { searchParams } = new URL(request.url);
-    const changedBy = searchParams.get('changedBy') || 'System';
-    const reason = searchParams.get('reason') || 'Account deleted';
-
-    const resolvedParams = await params;
-    const account = await prisma.vPNAccount.findUnique({
-      where: { id: resolvedParams.id },
-    });
-
-    if (!account) {
-      return NextResponse.json(
-        { error: 'Account not found' },
-        { status: 404 }
-      );
-    }
-
-    // Log the status change before deletion
-    await prisma.vPNAccountStatusLog.create({
-      data: {
-        accountId: account.id,
-        oldStatus: account.status,
-        newStatus: 'disabled',
-        changedBy,
-        reason,
-      },
-    });
-
-    // Soft delete by setting status to disabled
-    const updated = await prisma.vPNAccount.update({
-      where: { id: resolvedParams.id },
-      data: {
-        status: 'disabled',
-        disabledAt: new Date(),
-        disabledBy: changedBy,
-        disabledReason: reason,
-      },
-    });
-
-    // Log audit action
-    await logAuditAction({
-      action: AuditActions.DELETE_VPN_ACCOUNT,
-      category: AuditCategories.VPN,
-      username: admin.username,
-      targetId: resolvedParams.id,
-      targetType: 'VPNAccount',
-      details: {
-        vpnUsername: account.username,
-        changedBy,
-        reason,
-        softDelete: true,
-      },
-      ipAddress: getIpAddress(request),
-      userAgent: getUserAgent(request),
-    });
-
-    return NextResponse.json(sanitizeAccount(updated));
-  } catch (error) {
-    console.error('Error deleting VPN account:', error);
-    
-    // Log failed deletion attempt
-    const { admin: adminRetry } = await checkAdminAuthWithRateLimit(request);
-    const resolvedParams = await params;
-    if (adminRetry) {
-      await logAuditAction({
-        action: AuditActions.DELETE_VPN_ACCOUNT,
-        category: AuditCategories.VPN,
-        username: adminRetry.username,
-        targetId: resolvedParams.id,
-        targetType: 'VPNAccount',
-        success: false,
-        errorMessage: error instanceof Error ? error.message : 'Unknown error',
-        ipAddress: getIpAddress(request),
-        userAgent: getUserAgent(request),
-      });
-    }
-    
-    return NextResponse.json(
-      { error: 'Failed to delete VPN account' },
-      { status: 500 }
-    );
+  const { admin, response } = await checkAdminAuthWithRateLimit(request);
+  if (!admin || response) {
+    return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
+  if (!actorHasPermission(admin, 'vpn.manage')) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+  }
+  return NextResponse.json({
+    error: 'Direct VPN deletion is retired. Revoke the account first, then use Account Lifecycle permanent VPN record deletion.',
+    code: 'USE_ACCOUNT_LIFECYCLE',
+  }, { status: 405, headers: { Allow: 'GET, PATCH' } });
 }

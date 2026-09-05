@@ -5,12 +5,18 @@ const prismaMock = vi.hoisted(() => {
     $transaction: vi.fn(),
     massEmailCampaign: {
       findUnique: vi.fn(),
+      findMany: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(),
     },
     massEmailRecipient: {
       deleteMany: vi.fn(),
       createMany: vi.fn(),
       groupBy: vi.fn(),
+      findMany: vi.fn(),
+      findUnique: vi.fn(),
+      updateMany: vi.fn(),
+      count: vi.fn(),
     },
     massEmailLog: {
       create: vi.fn(),
@@ -26,15 +32,123 @@ vi.mock('@/lib/ldap', () => ({ getLDAPGroupMembers: vi.fn(), listUsersInOU: vi.f
 vi.mock('@/lib/email', () => ({ sendMassEmail: vi.fn() }));
 
 import { getLDAPGroupMembers, listUsersInOU } from '@/lib/ldap';
-import { dedupeMassEmailRecipients, resolveMassEmailRecipients, updateMassEmailDraft } from './mass-email';
+import {
+  activateMassEmailCampaign,
+  dedupeMassEmailRecipients,
+  massEmailPreviewDigest,
+  massEmailResolutionDigest,
+  processMassEmailCampaigns,
+  reconcileMassEmailRecipient,
+  resolveMassEmailRecipients,
+  updateMassEmailDraft,
+} from './mass-email';
 
 beforeEach(() => {
   vi.clearAllMocks();
   prismaMock.$transaction.mockImplementation(async (callback: (client: typeof prismaMock) => Promise<unknown>) => callback(prismaMock));
   prismaMock.massEmailRecipient.groupBy.mockResolvedValue([]);
+  prismaMock.massEmailCampaign.updateMany.mockResolvedValue({ count: 1 });
+});
+
+describe('mass email delivery ownership', () => {
+  it('moves a stale send claim to delivery_unknown and counts it once', async () => {
+    prismaMock.massEmailRecipient.findMany.mockResolvedValueOnce([{
+      id: 'recipient-1',
+      campaignId: 'campaign-1',
+      email: 'user@example.test',
+      emailClaimId: 'stale-claim',
+    }]);
+    prismaMock.massEmailRecipient.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.massEmailCampaign.findMany.mockResolvedValue([]);
+
+    await processMassEmailCampaigns();
+
+    expect(prismaMock.massEmailRecipient.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ emailClaimId: 'stale-claim' }),
+      data: expect.objectContaining({
+        status: 'delivery_unknown',
+        deliveryFailureCounted: true,
+      }),
+    }));
+    expect(prismaMock.massEmailCampaign.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: { failedCount: { increment: 1 } },
+    }));
+  });
+
+  it('re-resolves recipients and rejects a stale activation digest', async () => {
+    prismaMock.massEmailCampaign.findUnique.mockResolvedValue({
+      id: 'campaign-1',
+      status: 'draft',
+      updatedAt: new Date('2026-08-29T00:00:00.000Z'),
+      eligibleRecipients: 1,
+      subject: 'Notice',
+      html: '<p>Hello</p>',
+      targetSnapshot: {
+        targets: { selectedUsernames: ['user1'], selectedGroups: [], includeAllDomainUsers: false },
+        previewDigest: 'stale-digest',
+      },
+    });
+    vi.mocked(listUsersInOU).mockResolvedValue([{
+      username: 'user1', displayName: 'User One', email: 'user1@example.test',
+      dn: 'CN=user1,OU=Users,DC=example,DC=test', description: '', accountEnabled: true,
+      accountExpires: null, whenCreated: '', memberOf: [],
+    }] as Awaited<ReturnType<typeof listUsersInOU>>);
+
+    await expect(activateMassEmailCampaign('campaign-1', 'admin')).rejects.toThrow('MASS_EMAIL_PREVIEW_STALE');
+    expect(prismaMock.massEmailCampaign.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'activating' }),
+    }));
+  });
+
+  it('does not decrement a failure counter that was never incremented', async () => {
+    prismaMock.massEmailRecipient.findUnique.mockResolvedValue({
+      id: 'recipient-1', campaignId: 'campaign-1', email: 'user@example.test',
+      status: 'delivery_unknown', deliveryFailureCounted: false,
+    });
+    prismaMock.massEmailRecipient.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.massEmailRecipient.count.mockResolvedValue(1);
+    prismaMock.massEmailCampaign.findUnique.mockResolvedValue({ id: 'campaign-1', recipients: [], logs: [] });
+
+    await reconcileMassEmailRecipient(
+      'campaign-1',
+      'recipient-1',
+      'admin',
+      'not_delivered',
+      'SMTP provider confirms no acceptance'
+    );
+
+    expect(prismaMock.massEmailCampaign.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.not.objectContaining({ failedCount: expect.anything() }),
+    }));
+  });
 });
 
 describe('dedupeMassEmailRecipients', () => {
+  it('binds a preview digest to the exact eligible audience', () => {
+    const base = {
+      candidates: [],
+      recipients: [{
+        email: 'alice@example.test', displayName: 'Alice', adUsername: 'alice', adDn: null,
+        accountEnabled: true, sources: [{ type: 'manual' as const, label: 'Selected user' }],
+      }],
+      skipped: [],
+      summary: { totalCandidates: 1, eligibleRecipients: 1, skippedRecipients: 0, duplicateSourcesMerged: 0 },
+      targets: { selectedUsernames: ['alice'], selectedGroups: [], includeAllDomainUsers: false },
+    };
+
+    expect(massEmailResolutionDigest(base)).toMatch(/^[a-f0-9]{64}$/);
+    expect(massEmailResolutionDigest(base)).not.toBe(massEmailResolutionDigest({
+      ...base,
+      recipients: [{ ...base.recipients[0], email: 'bob@example.test' }],
+    }));
+    expect(massEmailPreviewDigest(base, 'Notice', '<p>Hello</p>')).not.toBe(
+      massEmailPreviewDigest(base, 'Changed', '<p>Hello</p>')
+    );
+    expect(massEmailPreviewDigest(base, 'Notice', '<p>Hello</p>')).not.toBe(
+      massEmailPreviewDigest(base, 'Notice', '<p>Changed</p>')
+    );
+  });
+
   it('deduplicates by normalized email and preserves all sources', () => {
     const result = dedupeMassEmailRecipients([
       {
@@ -187,6 +301,7 @@ describe('dedupeMassEmailRecipients', () => {
       .mockResolvedValueOnce({
         id: 'campaign-1',
         status: 'draft',
+        updatedAt: new Date('2026-08-29T00:00:00.000Z'),
         subject: 'Old subject',
         html: '<p>Old message</p>',
         totalRecipients: 1,
@@ -209,8 +324,8 @@ describe('dedupeMassEmailRecipients', () => {
       targets: { selectedUsernames: ['eligible'] },
     }, 'admin');
 
-    expect(prismaMock.massEmailCampaign.update).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 'campaign-1' },
+    expect(prismaMock.massEmailCampaign.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: 'campaign-1', status: 'draft' }),
       data: expect.objectContaining({
         subject: 'New subject',
         eligibleRecipients: 1,

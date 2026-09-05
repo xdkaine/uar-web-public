@@ -311,10 +311,10 @@ flowchart TB
 | Route Group | Purpose |
 | :--- | :--- |
 | `/api/admin/batch-accounts` | List and create batch provisioning jobs. |
-| `/api/admin/batch-accounts/create` | Run bulk account creation from uploaded/admin-entered data. |
+| `/api/admin/batch-accounts/create` | Retired (`410 Gone`); use the governed `/api/admin/batch-accounts` endpoint. |
 | `/api/admin/batch-accounts/[id]` | Inspect batch job details. |
 | `/api/admin/batch-accounts/[id]/cancel` | Cancel an in-flight batch. |
-| `/api/admin/batch-accounts/cleanup` | Clean stale batch data. |
+| `/api/admin/batch-accounts/cleanup` | Retired; use authenticated per-batch cancellation and reconciliation. |
 | `/api/admin/account-lifecycle` | Create and list lifecycle actions. |
 | `/api/admin/account-lifecycle/[id]*` | Inspect, retry, cancel, or update a specific lifecycle action. |
 | `/api/admin/account-lifecycle/batch` | Submit grouped lifecycle operations. |

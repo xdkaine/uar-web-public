@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
-interface UsePollingOptions {
+interface UsePollingOptions<T> {
   interval?: number;
-  onSuccess?: (data: any) => void;
-  onError?: (error: any) => void;
+  onSuccess?: (data: T) => void;
+  onError?: (error: Error) => void;
   enabled?: boolean;
 }
 
@@ -21,7 +21,7 @@ interface UsePollingResult<T> {
 
 export function usePolling<T>(
   fetcher: () => Promise<T>,
-  options: UsePollingOptions = {}
+  options: UsePollingOptions<T> = {}
 ): UsePollingResult<T> {
   const {
     interval = 30000, // 30 seconds default
@@ -36,7 +36,6 @@ export function usePolling<T>(
   const [isPolling, setIsPolling] = useState<boolean>(enabled);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
   const mountedRef = useRef<boolean>(true);
   const inFlightRef = useRef<Promise<void> | null>(null);
   
@@ -101,35 +100,32 @@ export function usePolling<T>(
   // Initial fetch - runs only once on mount
   useEffect(() => {
     mountedRef.current = true;
-    fetchData();
-    
+    const initialFetch = setTimeout(fetchData, 0);
+
     return () => {
       mountedRef.current = false;
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
+      clearTimeout(initialFetch);
     };
   }, [fetchData]);
 
   // Polling logic
   useEffect(() => {
-    if (isPolling && interval > 0) {
-      const poll = async () => {
-        await fetchData(true); // Silent update
-        if (mountedRef.current && isPolling) {
-          timeoutRef.current = setTimeout(poll, interval);
-        }
-      };
+    if (!isPolling || interval <= 0) return;
 
-      // Start the loop
-      timeoutRef.current = setTimeout(poll, interval);
+    let cancelled = false;
+    const poll = async () => {
+      await fetchData(true); // Silent update
+      if (!cancelled && mountedRef.current) {
+        timeout = setTimeout(poll, interval);
+      }
+    };
 
-      return () => {
-        if (timeoutRef.current) {
-          clearTimeout(timeoutRef.current);
-        }
-      };
-    }
+    let timeout = setTimeout(poll, interval);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeout);
+    };
   }, [isPolling, interval, fetchData]);
 
   const stopPolling = useCallback(() => setIsPolling(false), []);

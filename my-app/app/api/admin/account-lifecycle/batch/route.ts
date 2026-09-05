@@ -1,9 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 import { prisma } from '@/lib/prisma';
 import { processLifecycleAction } from '@/lib/lifecycle-processor';
 import { secureJsonResponse } from '@/lib/apiResponse';
+import { isProductionCloneReadOnly } from '@/lib/clone-safety';
+
+const LEGACY_BATCH_INTAKE_ENABLED = false;
 
 /**
  * POST /api/admin/account-lifecycle/batch
@@ -14,6 +19,18 @@ export async function POST(request: NextRequest) {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!actorHasPermission(admin, 'lifecycle.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+    if (isProductionCloneReadOnly()) {
+      return NextResponse.json({ error: 'Lifecycle mutations are disabled in this production-clone environment.' }, { status: 409 });
+    }
+    if (!LEGACY_BATCH_INTAKE_ENABLED) {
+      return NextResponse.json({
+        error: 'Legacy caller-supplied lifecycle batches are disabled. Use the validated Account Lifecycle workspace.',
+      }, { status: 410 });
     }
 
     const body = await request.json();
@@ -59,7 +76,7 @@ export async function POST(request: NextRequest) {
     const processResults = [];
     
     for (const actionData of actions) {
-      // Create action with processing status
+      // Persist queued work; each processor call must acquire its own claim.
       const action = await prisma.accountLifecycleAction.create({
         data: {
           batchId: batch.id,
@@ -72,9 +89,7 @@ export async function POST(request: NextRequest) {
           relatedTicketId: relatedTicketId || actionData.relatedTicketId,
           vpnRoleChange: actionData.vpnRoleChange,
           notes: actionData.notes,
-          status: 'processing',
-          processedAt: new Date(),
-          processedBy: 'system',
+          status: 'queued',
         },
       });
 
@@ -84,7 +99,7 @@ export async function POST(request: NextRequest) {
           actionId: action.id,
           event: 'created',
           performedBy: admin.username,
-          newStatus: 'processing',
+          newStatus: 'queued',
           details: JSON.stringify({
             batchId: batch.id,
             actionType: actionData.actionType,
@@ -206,11 +221,15 @@ export async function GET(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
+    if (!actorHasPermission(admin, 'lifecycle.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
     const { searchParams } = new URL(request.url);
     const status = searchParams.get('status');
     const batchType = searchParams.get('batchType');
 
-    const where: any = {};
+    const where: Prisma.AccountLifecycleBatchWhereInput = {};
     if (status) where.status = status;
     if (batchType) where.batchType = batchType;
 

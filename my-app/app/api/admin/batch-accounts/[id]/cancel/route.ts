@@ -1,52 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { searchLDAPUser, deleteLDAPUser, disableLDAPUser, setLDAPUserExpiration } from '@/lib/ldap';
+import { rollbackBatchAccounts } from '@/lib/batch-account-rollback';
+import { rollbackBatchVpnAccounts } from '@/lib/batch-vpn-rollback';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
-
-/**
- * Rollback batch accounts by cleaning up LDAP accounts.
- * This is a copy of the function in the main route.ts for use in cancellation.
- */
-async function rollbackBatchAccounts(
-  usernames: string[],
-  batchId: string
-): Promise<{
-  successful: string[];
-  failed: Array<{ username: string; error: string }>;
-}> {
-  const successful: string[] = [];
-  const failed: Array<{ username: string; error: string }> = [];
-
-  console.log(`[Batch Cancellation] Starting rollback for batch ${batchId}. Accounts to clean: ${usernames.length}`);
-
-  await Promise.all(
-    usernames.map(async (username) => {
-      try {
-        await deleteLDAPUser(username, undefined, false);
-        successful.push(username);
-        console.log(`[Batch Cancellation] Successfully deleted account: ${username}`);
-      } catch (deleteError) {
-        console.warn(`[Batch Cancellation] Delete failed for ${username}, attempting disable+expire`, deleteError);
-        
-        try {
-          await disableLDAPUser(username);
-          await setLDAPUserExpiration(username, new Date());
-          successful.push(username);
-          console.log(`[Batch Cancellation] Successfully disabled account: ${username}`);
-        } catch (disableError) {
-          const errorMsg = disableError instanceof Error ? disableError.message : 'Unknown error';
-          failed.push({ username, error: errorMsg });
-          console.error(`[Batch Cancellation] Failed to rollback account ${username}:`, disableError);
-        }
-      }
-    })
-  );
-
-  console.log(`[Batch Cancellation] Completed for batch ${batchId}. Successful: ${successful.length}, Failed: ${failed.length}`);
-  
-  return { successful, failed };
-}
 
 /**
  * DELETE - Cancel a batch and rollback all successfully created accounts
@@ -58,11 +16,16 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  let claimedBatchId: string | null = null;
   try {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!actorHasPermission(admin, 'batch.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     const resolvedParams = await params;
@@ -73,10 +36,7 @@ export async function DELETE(
       where: { id: batchId },
       include: {
         accounts: {
-          where: {
-            status: 'completed',
-            ldapCreatedAt: { not: null },
-          },
+          orderBy: { createdAt: 'asc' },
         },
       },
     });
@@ -85,7 +45,54 @@ export async function DELETE(
       return NextResponse.json({ error: 'Batch not found' }, { status: 404 });
     }
 
-    // Only allow cancellation of non-completed batches or failed batches
+    const staleProcessing = batch.status === 'processing'
+      && (!batch.processingClaimedUntil || batch.processingClaimedUntil.getTime() <= Date.now());
+    const hasAmbiguousExternalMutation = batch.accounts.some(account =>
+      account.mutationStage?.endsWith('_started')
+    );
+
+    if ((batch.status === 'processing' && !staleProcessing) || batch.status === 'rolling_back') {
+      return NextResponse.json(
+        { error: 'Wait for active processing to stop before cancelling this batch' },
+        { status: 409 }
+      );
+    }
+
+    if (hasAmbiguousExternalMutation) {
+      if (staleProcessing) {
+        await prisma.batchAccountCreation.updateMany({
+          where: {
+            id: batchId,
+            status: 'processing',
+            OR: [
+              { processingClaimedUntil: null },
+              { processingClaimedUntil: { lte: new Date() } },
+            ],
+          },
+          data: {
+            status: 'reconciliation_required',
+            processingClaimId: null,
+            processingClaimedUntil: null,
+            completedAt: new Date(),
+          },
+        });
+      }
+      return NextResponse.json(
+        {
+          error: 'An external account mutation may still be completing. The batch requires reconciliation before rollback.',
+          code: 'BATCH_EXTERNAL_MUTATION_RECONCILIATION_REQUIRED',
+        },
+        { status: 409 }
+      );
+    }
+
+    if (batch.totalAccounts > 0 && batch.accounts.length === 0 && !staleProcessing) {
+      return NextResponse.json(
+        { error: 'Legacy batch has no durable account items and requires manual reconciliation' },
+        { status: 409 }
+      );
+    }
+
     if (batch.status === 'completed' && batch.failedAccounts === 0) {
       return NextResponse.json(
         { error: 'Cannot cancel a successfully completed batch. All accounts have been created.' },
@@ -100,37 +107,68 @@ export async function DELETE(
       );
     }
 
-    // Collect usernames of successfully created accounts to rollback
-    const accountsToRollback: string[] = [];
-    
-    for (const account of batch.accounts) {
-      // Check if account actually exists in LDAP before attempting rollback
-      try {
-        const ldapUser = await searchLDAPUser(account.ldapUsername);
-        if (ldapUser) {
-          accountsToRollback.push(account.ldapUsername);
+    const accountsToRollback = batch.accounts
+      .filter(account => account.accountType === 'AD')
+      .map(account => {
+        // Rows created before immutable request/directory tracking were added
+        // retain their narrowly constrained legacy rollback behavior. A new row
+        // with any tracking field present must fail closed if evidence is missing.
+        if (
+          !account.accessRequestId
+          && !account.targetDirectoryDn
+          && !account.targetDirectoryObjectGuid
+        ) {
+          return account.ldapUsername;
         }
-      } catch (searchError) {
-        console.warn(`[Batch Cancellation] Could not verify existence of ${account.ldapUsername}:`, searchError);
-        // Include it anyway - rollback function will handle if it doesn't exist
-        accountsToRollback.push(account.ldapUsername);
-      }
-    }
+        return {
+          username: account.ldapUsername,
+          accessRequestId: account.accessRequestId,
+          targetDirectoryDn: account.targetDirectoryDn,
+          targetDirectoryObjectGuid: account.targetDirectoryObjectGuid,
+        };
+      });
+    const vpnAccountsToRollback = batch.accounts
+      .filter(account => account.accountType === 'VPN')
+      .map(account => account.vpnUsername || account.ldapUsername);
 
-    console.log(`[Batch Cancellation] Cancelling batch ${batchId}. Found ${accountsToRollback.length} accounts to rollback.`);
+    console.log(`[Batch Cancellation] Cancelling batch ${batchId}. Found ${accountsToRollback.length} AD and ${vpnAccountsToRollback.length} VPN accounts to rollback.`);
 
-    // Update batch status to rolling_back
-    await prisma.batchAccountCreation.update({
-      where: { id: batchId },
-      data: { status: 'rolling_back' },
+    // Atomically claim the cancellation so concurrent requests cannot repeat mutations.
+    const claim = await prisma.batchAccountCreation.updateMany({
+      where: {
+        id: batchId,
+        OR: [
+          { status: { in: ['failed', 'partial', 'reconciliation_required'] } },
+          {
+            status: 'processing',
+            OR: [
+              { processingClaimedUntil: null },
+              { processingClaimedUntil: { lte: new Date() } },
+            ],
+          },
+        ],
+      },
+      data: {
+        status: 'rolling_back',
+        processingClaimId: null,
+        processingClaimedUntil: null,
+      },
     });
+
+    if (claim.count !== 1) {
+      return NextResponse.json(
+        { error: 'Batch cancellation is already running or requires reconciliation' },
+        { status: 409 }
+      );
+    }
+    claimedBatchId = batchId;
 
     // Create audit log for cancellation start
     await prisma.batchAuditLog.create({
       data: {
         batchId: batchId,
         action: 'batch_cancellation_started',
-        details: `Batch cancellation initiated by ${admin.username}. Rolling back ${accountsToRollback.length} accounts: ${accountsToRollback.join(', ')}`,
+        details: `${staleProcessing ? 'Expired processing lease recovery' : 'Batch cancellation'} initiated by ${admin.username}. Rolling back ${accountsToRollback.length} AD and ${vpnAccountsToRollback.length} VPN accounts.`,
         performedBy: admin.username,
         success: true,
       },
@@ -138,12 +176,29 @@ export async function DELETE(
 
     let rollbackResult: {
       successful: string[];
-      failed: Array<{ username: string; error: string }>;
-    } = { successful: [], failed: [] };
+      failed: Array<{ username: string; error: string; outcome: string }>;
+      items: Array<{ username: string; outcome: string; resolved: boolean; error?: string }>;
+    } = { successful: [], failed: [], items: [] };
+    let vpnRollbackResult: Awaited<ReturnType<typeof rollbackBatchVpnAccounts>> = {
+      successful: [],
+      failed: [],
+      items: [],
+    };
     
     // Perform rollback if there are accounts to clean up
     if (accountsToRollback.length > 0) {
-      rollbackResult = await rollbackBatchAccounts(accountsToRollback, batchId);
+      rollbackResult = await prisma.$transaction(async tx => {
+        const usernames = [...new Set(accountsToRollback.map(target => (
+          typeof target === 'string' ? target : target.username
+        ).trim().toLowerCase()))].sort();
+        for (const username of usernames) {
+          await tx.$queryRaw<Array<{ lock_acquired: string }>>`
+            SELECT 'locked'::text AS lock_acquired
+            FROM pg_advisory_xact_lock(hashtextextended(${username}, 873211))
+          `;
+        }
+        return rollbackBatchAccounts(accountsToRollback, batchId);
+      }, { timeout: 15 * 60 * 1000 });
 
       // Log rollback results
       if (rollbackResult.failed.length > 0) {
@@ -152,8 +207,8 @@ export async function DELETE(
         await prisma.batchAuditLog.create({
           data: {
             batchId: batchId,
-            action: 'batch_cancellation_partial',
-            details: `⚠️ Cancellation rollback partially failed. Successfully rolled back: ${rollbackResult.successful.length}. Failed: ${rollbackResult.failed.length}. Manual cleanup required for: ${rollbackResult.failed.map(f => `${f.username} (${f.error})`).join(', ')}`,
+            action: 'ad_rollback_partial',
+            details: `AD rollback partially failed. Resolved: ${rollbackResult.successful.length}. Unresolved: ${rollbackResult.failed.length}.`,
             performedBy: admin.username,
             success: false,
           },
@@ -164,14 +219,24 @@ export async function DELETE(
         await prisma.batchAuditLog.create({
           data: {
             batchId: batchId,
-            action: 'batch_cancellation_completed',
-            details: `All ${rollbackResult.successful.length} accounts successfully rolled back. Batch cancelled by ${admin.username}.`,
+            action: 'ad_rollback_completed',
+            details: `All ${rollbackResult.successful.length} AD accounts were resolved.`,
             performedBy: admin.username,
             success: true,
           },
         });
       }
-    } else {
+    }
+
+    if (vpnAccountsToRollback.length > 0) {
+      vpnRollbackResult = await rollbackBatchVpnAccounts(
+        vpnAccountsToRollback,
+        batchId,
+        admin.username
+      );
+    }
+
+    if (accountsToRollback.length === 0 && vpnAccountsToRollback.length === 0) {
       console.log(`[Batch Cancellation] No accounts to rollback.`);
       
       await prisma.batchAuditLog.create({
@@ -185,11 +250,112 @@ export async function DELETE(
       });
     }
 
-    // Update batch to cancelled status
+    if (rollbackResult.successful.length > 0) {
+      const successfulUsernames = new Set(rollbackResult.successful);
+      await prisma.batchAccountItem.updateMany({
+        where: {
+          batchId,
+          accountType: 'AD',
+          ldapUsername: { in: rollbackResult.successful },
+        },
+        data: {
+          status: 'rolled_back',
+          errorMessage: null,
+        },
+      });
+      const resolvedRequestIds = accountsToRollback.flatMap(account => {
+        if (
+          typeof account === 'string'
+          || !account.accessRequestId
+          || !successfulUsernames.has(account.username)
+        ) {
+          return [];
+        }
+        return [account.accessRequestId];
+      });
+      if (resolvedRequestIds.length > 0) {
+        await prisma.accessRequest.updateMany({
+          where: { id: { in: resolvedRequestIds } },
+          data: {
+            status: 'rejected',
+            rejectedAt: new Date(),
+            rejectedBy: admin.username,
+            rejectionReason: `Rolled back during cancellation of batch ${batchId}`,
+            provisioningState: 'batch_rolled_back',
+            provisioningCompletedAt: new Date(),
+            provisioningError: null,
+            adAccountStatus: 'deleted',
+          },
+        });
+      }
+    }
+
+    for (const failed of rollbackResult.failed) {
+      await prisma.batchAccountItem.updateMany({
+        where: { batchId, accountType: 'AD', ldapUsername: failed.username },
+        data: {
+          status: 'reconciliation_required',
+          errorMessage: `${failed.outcome}: ${failed.error}`,
+        },
+      });
+      const unresolvedRequestId = accountsToRollback.find(
+        account => typeof account !== 'string' && account.username === failed.username
+      );
+      const unresolvedTrackedRequestId = typeof unresolvedRequestId === 'string'
+        ? null
+        : unresolvedRequestId?.accessRequestId;
+      if (unresolvedTrackedRequestId) {
+        await prisma.accessRequest.updateMany({
+          where: { id: unresolvedTrackedRequestId },
+          data: {
+            provisioningState: 'reconciliation_required',
+            provisioningCompletedAt: new Date(),
+            provisioningError: `${failed.outcome}: ${failed.error}`,
+          },
+        });
+      }
+    }
+
+    if (vpnRollbackResult.successful.length > 0) {
+      await prisma.batchAccountItem.updateMany({
+        where: {
+          batchId,
+          accountType: 'VPN',
+          vpnUsername: { in: vpnRollbackResult.successful },
+        },
+        data: { status: 'rolled_back', errorMessage: null },
+      });
+    }
+
+    for (const failed of vpnRollbackResult.failed) {
+      await prisma.batchAccountItem.updateMany({
+        where: { batchId, accountType: 'VPN', vpnUsername: failed.username },
+        data: {
+          status: 'reconciliation_required',
+          errorMessage: `${failed.outcome}: ${failed.error}`,
+        },
+      });
+    }
+
+    const cancellationResolved =
+      rollbackResult.failed.length === 0 && vpnRollbackResult.failed.length === 0;
+    await prisma.batchAuditLog.create({
+      data: {
+        batchId,
+        action: cancellationResolved
+          ? 'batch_cancellation_completed'
+          : 'batch_cancellation_partial',
+        details: cancellationResolved
+          ? `All ${rollbackResult.successful.length} AD and ${vpnRollbackResult.successful.length} VPN targets were resolved.`
+          : `${rollbackResult.failed.length} AD and ${vpnRollbackResult.failed.length} VPN targets require reconciliation.`,
+        performedBy: admin.username,
+        success: cancellationResolved,
+      },
+    });
     const updatedBatch = await prisma.batchAccountCreation.update({
       where: { id: batchId },
       data: {
-        status: 'cancelled',
+        status: cancellationResolved ? 'cancelled' : 'reconciliation_required',
         completedAt: new Date(),
       },
       include: {
@@ -202,40 +368,62 @@ export async function DELETE(
 
     // Log batch cancellation
     await logAuditAction({
-      action: AuditActions.VIEW_BATCH_DETAILS,
+      action: AuditActions.CANCEL_BATCH,
       category: AuditCategories.BATCH,
       username: admin.username,
       targetId: batchId,
       targetType: 'Batch',
       details: { 
         action: 'cancel',
-        accountsRolledBack: rollbackResult.successful.length,
-        accountsFailedRollback: rollbackResult.failed.length
+        accountsRolledBack: rollbackResult.successful.length + vpnRollbackResult.successful.length,
+        accountsFailedRollback: rollbackResult.failed.length + vpnRollbackResult.failed.length,
       },
       ipAddress: getIpAddress(request),
       userAgent: getUserAgent(request),
     });
 
+    const redactedBatch = {
+      ...updatedBatch,
+      accounts: updatedBatch.accounts.map(({ password: _password, ...account }) => account),
+    };
+
     return NextResponse.json({
-      success: true,
-      message: 'Batch cancelled successfully',
-      batch: updatedBatch,
+      success: cancellationResolved,
+      partial: !cancellationResolved,
+      message: cancellationResolved
+        ? 'Batch cancelled successfully'
+        : 'Batch cancellation requires manual reconciliation',
+      batch: redactedBatch,
       rollback: {
-        total: accountsToRollback.length,
-        successful: rollbackResult.successful.length,
-        failed: rollbackResult.failed.length,
-        failedAccounts: rollbackResult.failed,
+        total: accountsToRollback.length + vpnAccountsToRollback.length,
+        successful: rollbackResult.successful.length + vpnRollbackResult.successful.length,
+        failed: rollbackResult.failed.length + vpnRollbackResult.failed.length,
+        failedAccounts: [
+          ...rollbackResult.failed.map(item => ({ ...item, accountType: 'AD' })),
+          ...vpnRollbackResult.failed.map(item => ({ ...item, accountType: 'VPN' })),
+        ],
+        outcomes: [
+          ...rollbackResult.items.map(item => ({ ...item, accountType: 'AD' })),
+          ...vpnRollbackResult.items.map(item => ({ ...item, accountType: 'VPN' })),
+        ],
       },
-    });
+    }, { status: cancellationResolved ? 200 : 207 });
   } catch (error) {
     console.error('Error cancelling batch:', error);
+
+    if (claimedBatchId) {
+      await prisma.batchAccountCreation.updateMany({
+        where: { id: claimedBatchId, status: 'rolling_back' },
+        data: { status: 'reconciliation_required' },
+      }).catch(() => {});
+    }
     
     // Log the failure
     const resolvedParams = await params;
     const { admin } = await checkAdminAuthWithRateLimit(request);
     if (admin) {
       await logAuditAction({
-        action: AuditActions.VIEW_BATCH_DETAILS,
+        action: AuditActions.CANCEL_BATCH,
         category: AuditCategories.BATCH,
         username: admin.username,
         targetId: resolvedParams.id,

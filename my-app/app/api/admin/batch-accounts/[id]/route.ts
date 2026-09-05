@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { inspectBatchAccountSummary, projectBatchAccountDetail } from '@/lib/batch-account-detail';
 
 // GET - Get batch details with full audit trail
 export async function GET(
@@ -15,16 +17,60 @@ export async function GET(
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
+    if (!actorHasPermission(admin, 'batch.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
     const resolvedParams = await params;
 
     const batch = await prisma.batchAccountCreation.findUnique({
       where: { id: resolvedParams.id },
-      include: {
+      select: {
+        id: true,
+        createdAt: true,
+        updatedAt: true,
+        createdBy: true,
+        description: true,
+        totalAccounts: true,
+        successfulAccounts: true,
+        failedAccounts: true,
+        status: true,
+        completedAt: true,
         accounts: {
           orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            createdAt: true,
+            updatedAt: true,
+            accountType: true,
+            name: true,
+            email: true,
+            ldapUsername: true,
+            vpnUsername: true,
+            accessRequestId: true,
+            accountExpiresAt: true,
+            isInternal: true,
+            status: true,
+            mutationStage: true,
+            ldapCreatedAt: true,
+            vpnCreatedAt: true,
+            errorMessage: true,
+            completedAt: true,
+            targetDirectoryDn: true,
+            targetDirectoryObjectGuid: true,
+          },
         },
         auditLogs: {
           orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            createdAt: true,
+            action: true,
+            details: true,
+            performedBy: true,
+            accountName: true,
+            success: true,
+          },
         },
         linkedTicket: {
           select: {
@@ -42,9 +88,22 @@ export async function GET(
       return NextResponse.json({ error: 'Batch not found' }, { status: 404 });
     }
 
-    const sanitizedBatch = {
-      ...batch,
-      accounts: batch.accounts.map(({ password: _password, ...account }: { password: string; [key: string]: unknown }) => account),
+    const accounts = batch.accounts.map(account => projectBatchAccountDetail(account, { batchStatus: batch.status }));
+    const batchView = {
+      id: batch.id,
+      createdAt: batch.createdAt,
+      updatedAt: batch.updatedAt,
+      createdBy: batch.createdBy,
+      description: batch.description,
+      totalAccounts: batch.totalAccounts,
+      successfulAccounts: batch.successfulAccounts,
+      failedAccounts: batch.failedAccounts,
+      status: batch.status,
+      completedAt: batch.completedAt,
+      linkedTicket: batch.linkedTicket,
+      accounts,
+      auditLogs: batch.auditLogs,
+      integrityIssues: inspectBatchAccountSummary(batch, accounts),
     };
 
     // Log viewing batch details
@@ -65,7 +124,7 @@ export async function GET(
       userAgent: getUserAgent(request),
     });
 
-    return NextResponse.json({ batch: sanitizedBatch });
+    return NextResponse.json({ batch: batchView });
   } catch (error) {
     console.error('Error fetching batch details:', error);
     return NextResponse.json(

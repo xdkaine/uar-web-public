@@ -1,11 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { prisma } from '@/lib/prisma';
 import { secureJsonResponse, secureErrorResponse } from '@/lib/apiResponse';
+import {
+  ADMIN_SEARCH_SCOPE_PERMISSIONS,
+  getAvailableAdminSearchTypes,
+  isAdminSearchType,
+} from '@/lib/rbac/search-access';
+import { resolveRequestReviews } from '@/lib/workflow/request-review';
+
+const MIN_QUERY_LENGTH = 2;
+const MAX_LIMIT = 100;
 
 /**
  * GET /api/admin/search
- * Global search across all entities (requests, lifecycle actions, VPN accounts, tickets, audit logs)
+ * Global search across all entities (requests, lifecycle actions, VPN accounts, tickets, audit logs).
+ * All entity queries run in parallel; each category is capped independently.
  */
 export async function GET(request: NextRequest) {
   try {
@@ -14,28 +25,40 @@ export async function GET(request: NextRequest) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const { searchParams } = new URL(request.url);
-    const query = searchParams.get('q') || '';
-    const type = searchParams.get('type') || 'all'; // all, requests, lifecycle, vpn, tickets, audit
-    const limit = parseInt(searchParams.get('limit') || '50');
-
-    if (!query || query.length < 2) {
-      return secureErrorResponse('Search query must be at least 2 characters', 400);
+    if (!actorHasPermission(admin, 'admin.search')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
-    const searchLower = query.toLowerCase();
-    const results: any = {
-      query,
-      accessRequests: [],
-      lifecycleActions: [],
-      vpnAccounts: [],
-      supportTickets: [],
-      auditLogs: [],
-    };
+    const { searchParams } = new URL(request.url);
+    const query = (searchParams.get('q') || '').trim();
+    const requestedType = searchParams.get('type') || 'all';
+    const parsedLimit = parseInt(searchParams.get('limit') || '50', 10);
+    const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), MAX_LIMIT) : 50;
 
-    // Search Access Requests
-    if (type === 'all' || type === 'requests') {
-      const accessRequests = await prisma.accessRequest.findMany({
+    if (!query || query.length < MIN_QUERY_LENGTH) {
+      return secureErrorResponse(`Search query must be at least ${MIN_QUERY_LENGTH} characters`, 400);
+    }
+
+    if (!isAdminSearchType(requestedType)) {
+      return secureErrorResponse('Unknown search type', 400);
+    }
+    const type = requestedType;
+    const availableSearchTypes = getAvailableAdminSearchTypes(admin.permissions);
+    if (
+      type !== 'all'
+      && !actorHasPermission(admin, ADMIN_SEARCH_SCOPE_PERMISSIONS[type])
+    ) {
+      return secureErrorResponse(
+        `Your privileges do not include ${type} search`,
+        403
+      );
+    }
+
+    // Each searcher returns its mapped category payload; they run concurrently.
+    const searchAccessRequests = async () => {
+      if (type !== 'all' && type !== 'requests') return [];
+      if (!actorHasPermission(admin, ADMIN_SEARCH_SCOPE_PERMISSIONS.requests)) return [];
+      const rows = await prisma.accessRequest.findMany({
         where: {
           OR: [
             { id: { contains: query, mode: 'insensitive' } },
@@ -58,8 +81,8 @@ export async function GET(request: NextRequest) {
           },
         },
       });
-
-      results.accessRequests = accessRequests.map((req: any) => ({
+      const reviews = await resolveRequestReviews(rows, admin);
+      return rows.map((req, index) => ({
         id: req.id,
         type: 'access_request',
         name: req.name,
@@ -70,12 +93,14 @@ export async function GET(request: NextRequest) {
         event: req.event?.name || req.eventReason,
         createdAt: req.createdAt,
         institution: req.institution,
+        review: reviews[index],
       }));
-    }
+    };
 
-    // Search Lifecycle Actions
-    if (type === 'all' || type === 'lifecycle') {
-      const lifecycleActions = await prisma.accountLifecycleAction.findMany({
+    const searchLifecycleActions = async () => {
+      if (type !== 'all' && type !== 'lifecycle') return [];
+      if (!actorHasPermission(admin, ADMIN_SEARCH_SCOPE_PERMISSIONS.lifecycle)) return [];
+      const rows = await prisma.accountLifecycleAction.findMany({
         where: {
           OR: [
             { id: { contains: query, mode: 'insensitive' } },
@@ -90,8 +115,7 @@ export async function GET(request: NextRequest) {
         take: limit,
         orderBy: { createdAt: 'desc' },
       });
-
-      results.lifecycleActions = lifecycleActions.map((action: any) => ({
+      return rows.map((action) => ({
         id: action.id,
         type: 'lifecycle_action',
         actionType: action.actionType,
@@ -105,11 +129,12 @@ export async function GET(request: NextRequest) {
         createdAt: action.createdAt,
         completedAt: action.completedAt,
       }));
-    }
+    };
 
-    // Search VPN Accounts
-    if (type === 'all' || type === 'vpn') {
-      const vpnAccounts = await prisma.vPNAccount.findMany({
+    const searchVpnAccounts = async () => {
+      if (type !== 'all' && type !== 'vpn') return [];
+      if (!actorHasPermission(admin, ADMIN_SEARCH_SCOPE_PERMISSIONS.vpn)) return [];
+      const rows = await prisma.vPNAccount.findMany({
         where: {
           OR: [
             { id: { contains: query, mode: 'insensitive' } },
@@ -122,8 +147,7 @@ export async function GET(request: NextRequest) {
         take: limit,
         orderBy: { createdAt: 'desc' },
       });
-
-      results.vpnAccounts = vpnAccounts.map((vpn: any) => ({
+      return rows.map((vpn) => ({
         id: vpn.id,
         type: 'vpn_account',
         username: vpn.username,
@@ -136,11 +160,12 @@ export async function GET(request: NextRequest) {
         revokedAt: vpn.revokedAt,
         revokedReason: vpn.revokedReason,
       }));
-    }
+    };
 
-    // Search Support Tickets
-    if (type === 'all' || type === 'tickets') {
-      const supportTickets = await prisma.supportTicket.findMany({
+    const searchSupportTickets = async () => {
+      if (type !== 'all' && type !== 'tickets') return [];
+      if (!actorHasPermission(admin, ADMIN_SEARCH_SCOPE_PERMISSIONS.tickets)) return [];
+      const rows = await prisma.supportTicket.findMany({
         where: {
           OR: [
             { id: { contains: query, mode: 'insensitive' } },
@@ -148,13 +173,18 @@ export async function GET(request: NextRequest) {
             { body: { contains: query, mode: 'insensitive' } },
             { username: { contains: query, mode: 'insensitive' } },
             { relatedRequestId: { contains: query, mode: 'insensitive' } },
+            {
+              // Ticket bodies hide inside threaded replies; match those too.
+              responses: {
+                some: { message: { contains: query, mode: 'insensitive' } },
+              },
+            },
           ],
         },
         take: limit,
         orderBy: { createdAt: 'desc' },
       });
-
-      results.supportTickets = supportTickets.map((ticket: any) => ({
+      return rows.map((ticket) => ({
         id: ticket.id,
         type: 'support_ticket',
         ticketNumber: ticket.id.substring(0, 8).toUpperCase(), // Use first 8 chars of ID as ticket number
@@ -167,11 +197,12 @@ export async function GET(request: NextRequest) {
         assignedTo: ticket.closedBy,
         createdAt: ticket.createdAt,
       }));
-    }
+    };
 
-    // Search Audit Logs (limited fields for performance)
-    if (type === 'all' || type === 'audit') {
-      const auditLogs = await prisma.auditLog.findMany({
+    const searchAuditLogs = async () => {
+      if (type !== 'all' && type !== 'audit') return [];
+      if (!actorHasPermission(admin, ADMIN_SEARCH_SCOPE_PERMISSIONS.audit)) return [];
+      const rows = await prisma.auditLog.findMany({
         where: {
           OR: [
             { username: { contains: query, mode: 'insensitive' } },
@@ -182,8 +213,7 @@ export async function GET(request: NextRequest) {
         take: limit,
         orderBy: { createdAt: 'desc' },
       });
-
-      results.auditLogs = auditLogs.map((log: any) => ({
+      return rows.map((log) => ({
         id: log.id,
         type: 'audit_log',
         action: log.action,
@@ -194,27 +224,42 @@ export async function GET(request: NextRequest) {
         timestamp: log.createdAt,
         ipAddress: log.ipAddress,
       }));
-    }
+    };
 
-    // Calculate total results
-    const totalResults = 
-      results.accessRequests.length +
-      results.lifecycleActions.length +
-      results.vpnAccounts.length +
-      results.supportTickets.length +
-      results.auditLogs.length;
+    const [accessRequests, lifecycleActions, vpnAccounts, supportTickets, auditLogs] =
+      await Promise.all([
+        searchAccessRequests(),
+        searchLifecycleActions(),
+        searchVpnAccounts(),
+        searchSupportTickets(),
+        searchAuditLogs(),
+      ]);
+
+    const results = {
+      query,
+      accessRequests,
+      lifecycleActions,
+      vpnAccounts,
+      supportTickets,
+      auditLogs,
+    };
+
+    const totalResults =
+      accessRequests.length +
+      lifecycleActions.length +
+      vpnAccounts.length +
+      supportTickets.length +
+      auditLogs.length;
 
     return secureJsonResponse({
       ...results,
       totalResults,
       searchQuery: query,
       searchType: type,
+      availableSearchTypes,
     });
   } catch (error) {
     console.error('Search error:', error);
-    return secureErrorResponse(
-      error instanceof Error ? error.message : 'Failed to perform search',
-      500
-    );
+    return secureErrorResponse('Failed to perform search', 500);
   }
 }

@@ -8,6 +8,7 @@ export const LDAP_RETRY_DELAY = parseInt(getOptionalEnv('LDAP_RETRY_DELAY', '100
 
 // UAR description prefix for tracking accounts
 export const UAR_DESCRIPTION_PREFIX = 'UAR | Request ID:';
+export const UAR_BATCH_DESCRIPTION_PREFIX = 'UAR | Batch ID:';
 
 /**
  * Format request description for LDAP account tracking
@@ -19,8 +20,14 @@ export function formatRequestDescription(identifier?: string | number | null): s
   return `${UAR_DESCRIPTION_PREFIX} ${normalized}`;
 }
 
+export function formatBatchDescription(identifier: string | number): string {
+  const normalized = String(identifier).trim();
+  if (!normalized) throw new Error('A batch ID is required for LDAP account tracking');
+  return `${UAR_BATCH_DESCRIPTION_PREFIX} ${normalized}`;
+}
+
 /**
- * Check if description matches a specific request tag
+ * Check whether the operational description identifies a specific request
  */
 export function descriptionMatchesRequestTag(
   description: string,

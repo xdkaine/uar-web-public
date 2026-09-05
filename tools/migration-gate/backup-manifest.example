@@ -1,0 +1,13 @@
+# Paths are absolute and restricted to the deployment operator. Digests are
+# lowercase hexadecimal. created_at_epoch is UTC Unix time.
+backup_scope=full
+database_path=/restricted/backups/uar-database.dump
+database_sha256=replace_with_64_lowercase_hex_characters
+created_at_epoch=0
+source_schema_fingerprint=replace_with_32_lowercase_hex_characters
+# md5 of the source database name and the operator-approved source stack ID.
+# These are identifiers, not secret hashes; the clear identifiers stay out of logs.
+source_database_name_digest=replace_with_32_lowercase_hex_characters
+source_stack_digest=replace_with_32_lowercase_hex_characters
+assets_path=/restricted/backups/uar-assets.tar
+assets_sha256=replace_with_64_lowercase_hex_characters

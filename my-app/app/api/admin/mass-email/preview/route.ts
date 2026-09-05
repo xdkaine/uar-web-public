@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { parseAdminJson, isJsonBodyError, MAX_REQUEST_BODY_SIZE } from '@/lib/admin-json-parser';
 import { secureErrorResponse, secureJsonResponse } from '@/lib/apiResponse';
 import { AuditActions, AuditCategories, getIpAddress, getUserAgent, logAuditAction } from '@/lib/audit-log';
@@ -9,6 +10,9 @@ export async function POST(request: NextRequest) {
   try {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    if (!actorHasPermission(admin, 'communications.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
     const body = await parseAdminJson<Record<string, unknown>>(request, MAX_REQUEST_BODY_SIZE.LARGE);
     const preview = previewMassEmailContent(String(body.subject || ''), String(body.html || ''));

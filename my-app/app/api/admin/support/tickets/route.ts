@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
-import { searchLDAPUser } from '@/lib/ldap';
+import { resolveLDAPUserDisplayNames } from '@/lib/ldap';
+import { serializeSupportTicket } from '@/lib/support/ticket-json';
 
 // Pagination limits to prevent DoS with large datasets
 const DEFAULT_PAGE_SIZE = 50;
@@ -10,26 +12,15 @@ const MAX_PAGE_SIZE = 200;
 
 // Helper to get display names from AD for a list of usernames
 async function getDisplayNames(usernames: string[]): Promise<Record<string, string>> {
-  const displayNameMap: Record<string, string> = {};
-
-  await Promise.all(
-    usernames.map(async (username) => {
-      try {
-        const userInfo = await searchLDAPUser(username);
-        if (userInfo) {
-          const displayNameAttr = userInfo.attributes.find(a => a.type === 'displayName');
-          const cnAttr = userInfo.attributes.find(a => a.type === 'cn');
-          displayNameMap[username] = displayNameAttr?.values[0] || cnAttr?.values[0] || username;
-        } else {
-          displayNameMap[username] = username;
-        }
-      } catch {
-        displayNameMap[username] = username;
-      }
-    })
-  );
-
-  return displayNameMap;
+  try {
+    const resolved = await resolveLDAPUserDisplayNames(usernames);
+    return Object.fromEntries(usernames.map((username) => [
+      username,
+      resolved.get(username.toLowerCase()) || username,
+    ]));
+  } catch {
+    return Object.fromEntries(usernames.map((username) => [username, username]));
+  }
 }
 
 // Get all support tickets (admin only)
@@ -39,6 +30,9 @@ export async function GET(request: NextRequest) {
 
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    if (!actorHasPermission(admin, 'tickets.read')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     // Parse pagination parameters
@@ -65,12 +59,23 @@ export async function GET(request: NextRequest) {
         statusLogs: {
           orderBy: { createdAt: 'desc' },
         },
+        assignments: {
+          where: { isActive: true },
+          select: {
+            targetType: true,
+            targetUsername: true,
+            targetGroupDn: true,
+            targetLabel: true,
+          },
+          orderBy: { assignedAt: 'desc' },
+        },
+        _count: { select: { attachments: true } },
       },
     });
 
     // Collect unique usernames to fetch display names
     const usernames = new Set<string>();
-    tickets.forEach((ticket: any) => {
+    tickets.forEach((ticket) => {
       usernames.add(ticket.username);
     });
 
@@ -78,9 +83,11 @@ export async function GET(request: NextRequest) {
     const displayNameMap = await getDisplayNames(Array.from(usernames));
 
     // Enrich tickets with display names
-    const enrichedTickets = tickets.map((ticket: any) => ({
+    const enrichedTickets = tickets.map((ticket) => serializeSupportTicket({
       ...ticket,
       displayName: displayNameMap[ticket.username] || ticket.username,
+      assignees: ticket.assignments.map((assignment) => assignment.targetLabel),
+      attachmentCount: ticket._count.attachments,
     }));
 
     // Log audit action

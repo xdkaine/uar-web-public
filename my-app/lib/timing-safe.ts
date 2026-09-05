@@ -12,3 +12,15 @@ export function timingSafeCompare(a: string, b: string): boolean {
 
   return result === 0;
 }
+
+const BEARER_PREFIX = 'Bearer ';
+
+export function bearerTokenMatches(
+  headerValue: string | null | undefined,
+  expectedToken: string
+): boolean {
+  if (!headerValue || !expectedToken || !headerValue.startsWith(BEARER_PREFIX)) {
+    return false;
+  }
+  return timingSafeCompare(headerValue.slice(BEARER_PREFIX.length), expectedToken);
+}

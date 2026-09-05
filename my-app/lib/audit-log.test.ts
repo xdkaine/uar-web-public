@@ -18,7 +18,14 @@ vi.mock('@/lib/ratelimit', () => ({
   getClientIp: vi.fn(() => '127.0.0.1'),
 }));
 
-import { sanitizeAuditDetails, sanitizeDatabaseText } from './audit-log';
+import logger from '@/lib/logger';
+import { prisma } from '@/lib/prisma';
+import {
+  emitAuditActionLog,
+  logAuditAction,
+  sanitizeAuditDetails,
+  sanitizeDatabaseText,
+} from './audit-log';
 
 describe('sanitizeDatabaseText', () => {
   it('removes null and control bytes before database writes', () => {
@@ -55,5 +62,26 @@ describe('sanitizeAuditDetails', () => {
       '2026-05-16T00:00:00.000Z',
       '[REDACTED]',
     ]);
+  });
+});
+
+describe('transaction-aware audit emission', () => {
+  it('can defer the operational success event until after the database commit', async () => {
+    const entry = {
+      action: 'assign_ticket',
+      category: 'support',
+      username: 'admin1',
+      targetId: 'ticket-1',
+    };
+    vi.mocked(logger.info).mockClear();
+
+    await logAuditAction(entry, prisma, { emitOperationalLog: false });
+
+    expect(logger.info).not.toHaveBeenCalled();
+    emitAuditActionLog(entry);
+    expect(logger.info).toHaveBeenCalledWith(
+      'assign_ticket',
+      expect.objectContaining({ type: 'audit_log', outcome: 'success' })
+    );
   });
 });

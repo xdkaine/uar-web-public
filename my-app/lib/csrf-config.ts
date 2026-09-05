@@ -4,13 +4,21 @@
  * - Logout endpoints (session termination is idempotent)
  * - Read-only/public endpoints
  * - Unauthenticated flows (where CSRF isn't needed)
- * - Initial authentication endpoints (login handles its own security)
  */
 export const CSRF_EXEMPT_PATHS = [
-  // Authentication endpoints - these handle their own security
-  '/api/auth/login',
+  // Logout endpoints. Login requires a token pair even before a session exists
+  // to prevent a cross-site request from signing the browser into another user.
   '/api/auth/logout',
   '/api/admin/logout',
+
+  // OIDC Back-Channel Logout receiver (issue #36). Deliberate exemption:
+  // this is a bearer-less machine-to-machine endpoint called by the auth
+  // service per the OIDC Back-Channel Logout spec - there is no browser
+  // session and therefore no CSRF token to pair. The RS256-signed
+  // logout_token JWT (verified against the IdP JWKS with mandatory
+  // iss/aud/iat/event/no-nonce checks) IS the authentication; a forged or
+  // replayed token fails closed as a generic 400 with no side effects.
+  '/api/auth/oidc/backchannel-logout',
   
   // Read-only/public endpoints
   '/api/auth/check-admin',
@@ -40,7 +48,9 @@ export const CSRF_EXEMPT_PATHS = [
  * Check if a given path should be exempt from CSRF validation.
  */
 export function isCsrfExempt(pathname: string): boolean {
-  return CSRF_EXEMPT_PATHS.some(path => pathname.startsWith(path));
+  return CSRF_EXEMPT_PATHS.some(
+    path => pathname === path || pathname.startsWith(`${path}/`)
+  );
 }
 
 /**

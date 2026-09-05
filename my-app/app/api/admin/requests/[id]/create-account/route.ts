@@ -10,12 +10,21 @@ import {
   descriptionMatchesRequestTag,
 } from '@/lib/ldap';
 import { prisma } from '@/lib/prisma';
-import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { checkReviewAccessWithRateLimit } from '@/lib/adminAuth';
+import { actorCanActOnStage, actorHasPermission } from '@/lib/rbac/core';
 import { decryptPassword } from '@/lib/encryption';
 
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent, sanitizeDatabaseText } from '@/lib/audit-log';
 import { extractBronconame } from '@/lib/validation';
 import { findReusableOffboardedRequest } from '@/lib/offboard-reenrollment';
+import { isModuleEnabled } from '@/lib/modules/core';
+import { toSafeAccessRequestResponse } from '@/lib/access-request-response';
+import {
+  findStageIndexByStatus,
+  nextReviewStatusAfter,
+  resolveWorkflowForRequest,
+  workflowIntegrityConflict,
+} from '@/lib/workflow/core';
 
 const PROVISIONING_STATE_IN_PROGRESS = 'in_progress';
 const PROVISIONING_STATE_SUCCEEDED = 'succeeded';
@@ -79,17 +88,50 @@ export async function POST(
   let requestId: string | null = null;
 
   try {
-    const { admin, response } = await checkAdminAuthWithRateLimit(request);
+    const { admin, response } = await checkReviewAccessWithRateLimit(request);
 
     if (!admin || response) {
       if (response) return response;
       throw new HttpError('Unauthorized', 401);
     }
 
+    if (!actorHasPermission(admin, 'access_requests.provision')) {
+      try {
+        await logAuditAction({
+          action: AuditActions.CREATE_ACCOUNT,
+          category: AuditCategories.ACCESS_REQUEST,
+          username: admin.username,
+          actorType: 'admin',
+          targetType: 'AccessRequest',
+          eventKind: 'security',
+          outcome: 'denied',
+          success: false,
+          details: {
+            reason: 'permission_denied',
+            missingPermission: 'access_requests.provision',
+            route: request.nextUrl.pathname,
+          },
+          ipAddress: getIpAddress(request),
+          userAgent: getUserAgent(request),
+        });
+      } catch (auditError) {
+        console.error('Failed to audit provisioning permission denial:', auditError);
+      }
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
     const resolvedParams = await params;
     requestId = resolvedParams.id;
 
-    const { accessRequest, lockedVersion } = await prisma.$transaction(
+    const vpnModuleEnabled = await isModuleEnabled('vpn.management');
+
+    const {
+      accessRequest,
+      lockedVersion,
+      nextStatus,
+      currentStageLabel,
+      nextStageLabel,
+    } = await prisma.$transaction(
       async (tx: Prisma.TransactionClient) => {
         const staleProvisioningStartedBefore = new Date(Date.now() - PROVISIONING_LOCK_STALE_AFTER_MS);
         const requestRecord = await tx.accessRequest.findUnique({
@@ -104,11 +146,21 @@ export async function POST(
           throw new HttpError('Cannot create account for unverified request');
         }
 
-        if (requestRecord.status !== 'pending_student_directors') {
+        const workflow = await resolveWorkflowForRequest(requestRecord);
+        const workflowConflict = workflowIntegrityConflict(workflow);
+        if (workflowConflict) throw new HttpError(workflowConflict, 409);
+        const stageIndex = findStageIndexByStatus(workflow.stages, requestRecord.status);
+        const currentStage = stageIndex >= 0 ? workflow.stages[stageIndex] : null;
+        if (!currentStage) {
           throw new HttpError(
-            `Request status is ${requestRecord.status}, expected pending_student_directors`
+            'The current request status is not represented by its configured review workflow.',
+            409
           );
         }
+        if (!actorCanActOnStage(admin, currentStage.reviewerRoleKey)) {
+          throw new HttpError('Forbidden for the current configured review stage.', 403);
+        }
+        const nextStatus = nextReviewStatusAfter(workflow.stages, requestRecord.status);
 
         if (requestRecord.accountCreatedAt) {
           throw new HttpError(
@@ -130,12 +182,12 @@ export async function POST(
 
         if (!requestRecord.ldapUsername || !requestRecord.accountPassword) {
           throw new HttpError(
-            'LDAP username and password must be set before creating account'
+            'Directory username and password must be set before creating the account'
           );
         }
 
         if (!requestRecord.isInternal) {
-          if (!requestRecord.vpnUsername) {
+          if (vpnModuleEnabled && !requestRecord.vpnUsername) {
             throw new HttpError('VPN username required for external users');
           }
           if (!requestRecord.accountExpiresAt) {
@@ -165,13 +217,23 @@ export async function POST(
           where: {
             id: resolvedParams.id,
             version: requestRecord.version,
-            status: 'pending_student_directors',
-            OR: [
-              { provisioningState: null },
-              { provisioningState: PROVISIONING_STATE_FAILED },
+            status: requestRecord.status,
+            AND: [
               {
-                provisioningState: PROVISIONING_STATE_IN_PROGRESS,
-                provisioningStartedAt: { lt: staleProvisioningStartedBefore },
+                OR: [
+                  { provisioningState: null },
+                  { provisioningState: PROVISIONING_STATE_FAILED },
+                  {
+                    provisioningState: PROVISIONING_STATE_IN_PROGRESS,
+                    provisioningStartedAt: { lt: staleProvisioningStartedBefore },
+                  },
+                ],
+              },
+              {
+                OR: [
+                  { accountUpdateState: null },
+                  { accountUpdateState: { in: ['failed', 'succeeded'] } },
+                ],
               },
             ],
           },
@@ -194,6 +256,9 @@ export async function POST(
         return {
           accessRequest: requestRecord,
           lockedVersion: requestRecord.version + 1,
+          nextStatus,
+          currentStageLabel: currentStage.label,
+          nextStageLabel: nextStatus === null ? null : workflow.stages[stageIndex + 1]?.label ?? null,
         };
       },
       {
@@ -206,8 +271,10 @@ export async function POST(
     provisioningLockVersion = lockedVersion;
 
     const ldapUsername = accessRequest.ldapUsername!;
+    // With VPN management disabled, no VPN-side provisioning happens at all:
+    // the effective vpn username is treated as unset for this flow.
     const vpnUsername =
-      !accessRequest.isInternal && accessRequest.vpnUsername
+      vpnModuleEnabled && !accessRequest.isInternal && accessRequest.vpnUsername
         ? accessRequest.vpnUsername
         : null;
     let reusingOffboardedAd = false;
@@ -233,7 +300,7 @@ export async function POST(
           });
 
           if (!reusableRequest) {
-            throw new HttpError('LDAP username already exists in Active Directory');
+            throw new HttpError('Directory username already exists in Active Directory');
           }
 
           reusingOffboardedAd = true;
@@ -249,7 +316,7 @@ export async function POST(
 
       console.error('LDAP search error during provisioning:', ldapError);
       throw new HttpError(
-        'Failed to verify LDAP username availability. Please try again.',
+        'Failed to verify directory username availability. Please try again.',
         500
       );
     }
@@ -274,7 +341,7 @@ export async function POST(
             });
 
             if (!reusableRequest) {
-              throw new HttpError('LDAP username already exists in Active Directory');
+              throw new HttpError('Directory username already exists in Active Directory');
             }
 
             reusingOffboardedVpn = true;
@@ -364,22 +431,26 @@ export async function POST(
           where: {
             id: resolvedParams.id,
             version: lockedVersion,
-            status: 'pending_student_directors',
+            status: accessRequest.status,
             provisioningState: PROVISIONING_STATE_IN_PROGRESS,
           },
           data: {
             accountCreatedAt: completionTime,
-            acknowledgedByDirector: true,
-            acknowledgedAt: completionTime,
-            acknowledgedBy: admin.username,
-            status: 'pending_faculty',
+            ...(nextStatus !== null
+              ? {
+                  acknowledgedByDirector: true,
+                  acknowledgedAt: completionTime,
+                  acknowledgedBy: admin.username,
+                }
+              : {}),
+            status: nextStatus ?? accessRequest.status,
             ...(reusingOffboardedAd || reusingOffboardedVpn
               ? {
                   isManuallyAssigned: true,
                   manuallyAssignedAt: completionTime,
                   manuallyAssignedBy: admin.username,
                   linkedAdUsername: ldapUsername,
-                  linkedVpnUsername: vpnUsername || ldapUsername,
+                  ...(vpnModuleEnabled ? { linkedVpnUsername: vpnUsername || ldapUsername } : {}),
                   manualAssignmentNotes: `Prepared for reactivation from campaign-offboarded request ${reusableOffboardedRequestId}`,
                 }
               : {}),
@@ -401,77 +472,80 @@ export async function POST(
           where: { id: resolvedParams.id },
         });
 
-        let vpnAccountUsername: string;
-        if (accessRequest.isInternal) {
-          vpnAccountUsername = extractBronconame(accessRequest.email) || accessRequest.ldapUsername!;
-        } else {
-          vpnAccountUsername = accessRequest.vpnUsername || accessRequest.ldapUsername!;
-        }
-        const portalType = accessRequest.isInternal ? 'Limited' : 'External';
+        // VPN tracking entry: only maintained while VPN management is enabled.
+        if (vpnModuleEnabled) {
+          const vpnAccountUsername = accessRequest.isInternal
+            ? extractBronconame(accessRequest.email) || accessRequest.ldapUsername!
+            : accessRequest.vpnUsername || accessRequest.ldapUsername!;
+          const portalType = accessRequest.isInternal ? 'Limited' : 'External';
 
-        const existingVpnAccount = await tx.vPNAccount.findUnique({
-          where: { username: vpnAccountUsername },
-        });
-
-        if (existingVpnAccount) {
-          const vpnAccount = await tx.vPNAccount.update({
+          const existingVpnAccount = await tx.vPNAccount.findUnique({
             where: { username: vpnAccountUsername },
-            data: {
-              name: accessRequest.name,
-              email: accessRequest.email,
-              portalType,
-              isInternal: accessRequest.isInternal,
-              status: 'pending_faculty',
-              password: accessRequest.accountPassword!,
-              expiresAt: accessRequest.accountExpiresAt,
-              accessRequestId: resolvedParams.id,
-              adUsername: accessRequest.ldapUsername!,
-            },
           });
 
-          await tx.vPNAccountStatusLog.create({
-            data: {
-              accountId: vpnAccount.id,
-              oldStatus: existingVpnAccount.status,
-              newStatus: 'pending_faculty',
-              changedBy: admin.username,
-              reason:
-                'Updated from access request with LDAP account creation',
-            },
-          });
-        } else {
-          const vpnAccount = await tx.vPNAccount.create({
-            data: {
-              username: vpnAccountUsername,
-              name: accessRequest.name,
-              email: accessRequest.email,
-              portalType,
-              isInternal: accessRequest.isInternal,
-              status: 'pending_faculty',
-              password: accessRequest.accountPassword!,
-              expiresAt: accessRequest.accountExpiresAt,
-              createdBy: admin.username,
-              createdByFaculty: false,
-              accessRequestId: resolvedParams.id,
-              adUsername: accessRequest.ldapUsername!,
-            },
-          });
+          if (existingVpnAccount) {
+            const vpnAccount = await tx.vPNAccount.update({
+              where: { username: vpnAccountUsername },
+              data: {
+                name: accessRequest.name,
+                email: accessRequest.email,
+                portalType,
+                isInternal: accessRequest.isInternal,
+                status: nextStatus ?? accessRequest.status,
+                password: accessRequest.accountPassword!,
+                expiresAt: accessRequest.accountExpiresAt,
+                accessRequestId: resolvedParams.id,
+                adUsername: accessRequest.ldapUsername!,
+              },
+            });
 
-          await tx.vPNAccountStatusLog.create({
-            data: {
-              accountId: vpnAccount.id,
-              oldStatus: null,
-              newStatus: 'pending_faculty',
-              changedBy: admin.username,
-              reason: 'Created from access request with LDAP account',
-            },
-          });
+            await tx.vPNAccountStatusLog.create({
+              data: {
+                accountId: vpnAccount.id,
+                liveAccountId: vpnAccount.id,
+                oldStatus: existingVpnAccount.status,
+                newStatus: nextStatus ?? accessRequest.status,
+                changedBy: admin.username,
+                reason:
+                  'Updated from access request with LDAP account creation',
+              },
+            });
+          } else {
+            const vpnAccount = await tx.vPNAccount.create({
+              data: {
+                username: vpnAccountUsername,
+                name: accessRequest.name,
+                email: accessRequest.email,
+                portalType,
+                isInternal: accessRequest.isInternal,
+                status: nextStatus ?? accessRequest.status,
+                password: accessRequest.accountPassword!,
+                expiresAt: accessRequest.accountExpiresAt,
+                createdBy: admin.username,
+                createdByFaculty: false,
+                accessRequestId: resolvedParams.id,
+                adUsername: accessRequest.ldapUsername!,
+              },
+            });
+
+            await tx.vPNAccountStatusLog.create({
+              data: {
+                accountId: vpnAccount.id,
+                liveAccountId: vpnAccount.id,
+                oldStatus: null,
+                newStatus: nextStatus ?? accessRequest.status,
+                changedBy: admin.username,
+                reason: 'Created from access request with LDAP account',
+              },
+            });
+          }
         }
 
         let commentText = reusingOffboardedAd || reusingOffboardedVpn
-          ? `Campaign-offboarded LDAP account prepared for reactivation by ${admin.username}. Username: ${accessRequest.ldapUsername}`
-          : `LDAP account created by ${admin.username} in Active Directory. Username: ${accessRequest.ldapUsername}`;
+          ? `Campaign-offboarded directory account prepared for reactivation by ${admin.username}. Username: ${accessRequest.ldapUsername}`
+          : `Directory account created by ${admin.username} in Active Directory. Username: ${accessRequest.ldapUsername}`;
         if (
+          vpnModuleEnabled &&
           !accessRequest.isInternal &&
           accessRequest.vpnUsername &&
           accessRequest.vpnUsername !== accessRequest.ldapUsername
@@ -484,10 +558,12 @@ export async function POST(
           ).toLocaleString();
           commentText += `. Account will be automatically disabled on: ${disableDate}`;
         }
-        commentText +=
-          reusingOffboardedAd || reusingOffboardedVpn
-            ? '. Request moved to Pending Faculty. The account remains disabled until faculty approval re-enables access.'
-            : '. Request moved to Pending Faculty. VPN account entry created for tracking.';
+        commentText += nextStatus
+          ? `. Request moved from ${currentStageLabel} to ${nextStageLabel || nextStatus}.`
+          : `. Account preparation completed; the request remains in ${currentStageLabel} for final approval.`;
+        commentText += vpnModuleEnabled
+          ? ' VPN account entry created or updated for tracking.'
+          : ' VPN management is disabled; no VPN entry was created.';
 
         await tx.requestComment.create({
           data: {
@@ -535,9 +611,13 @@ export async function POST(
     return NextResponse.json({
       success: true,
       message: reusedOffboardedAccounts.size > 0
-        ? 'Offboarded account prepared for reactivation and moved to Faculty Review'
-        : 'Account created successfully in Active Directory and moved to Faculty Review',
-      request: updatedRequest,
+        ? nextStatus
+          ? `Offboarded account prepared for reactivation and moved to ${nextStageLabel || 'the next review stage'}`
+          : `Offboarded account prepared for reactivation; final approval remains in ${currentStageLabel}`
+        : nextStatus
+          ? `Account created successfully in Active Directory and moved to ${nextStageLabel || 'the next review stage'}`
+          : `Account created successfully in Active Directory; final approval remains in ${currentStageLabel}`,
+      request: toSafeAccessRequestResponse(updatedRequest),
     });
   } catch (error) {
     const rawErrorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -569,7 +649,7 @@ export async function POST(
             await prisma.requestComment.create({
               data: {
                 requestId,
-                comment: sanitizeDatabaseText(`CRITICAL: Automatic LDAP cleanup failed. Manual deletion required for: ${
+                comment: sanitizeDatabaseText(`CRITICAL: Automatic directory cleanup failed. Manual deletion required for: ${
                   cleanupResult.failed.map(f => `${f.username} (${sanitizeDatabaseText(f.error)})`).join(', ')
                 }. Original error: ${errorMessage}`),
                 author: 'System',
@@ -630,7 +710,7 @@ export async function POST(
 
     if (requestId) {
       try {
-        const { admin } = await checkAdminAuthWithRateLimit(request);
+        const { admin } = await checkReviewAccessWithRateLimit(request);
         if (admin) {
           await logAuditAction({
             action: AuditActions.CREATE_ACCOUNT,

@@ -1,64 +1,18 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import type { ReactNode } from 'react';
+import { formatDate, type VPNAccountDetail, type VPNAccountComment } from './vpnAccountDetails';
+import { InfoRow } from './VPNAccountInfoRow';
+import { VPNAccountTimeline, VPNAccountComments, VPNAccountStatusHistory } from './VPNAccountDetailPanels';
 import { useToast } from '@/hooks/useToast';
+import Toast from '@/components/Toast';
 import { fetchWithCsrf } from '@/lib/csrf';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Info, User, Clock, Shield, AlertTriangle, MessageSquare, History } from 'lucide-react';
-
-interface VPNAccountDetail {
-  id: string;
-  username: string;
-  name: string;
-  email: string;
-  portalType: string;
-  isInternal: boolean;
-  status: string;
-  expiresAt?: string;
-  password: string;
-  createdAt: string;
-  updatedAt: string;
-  createdBy: string;
-  createdByFaculty: boolean;
-  facultyCreatedAt?: string;
-  disabledAt?: string;
-  disabledBy?: string;
-  disabledReason?: string;
-  revokedAt?: string;
-  revokedBy?: string;
-  revokedReason?: string;
-  restoredAt?: string;
-  restoredBy?: string;
-  canRestore: boolean;
-  notes?: string;
-  batchId?: string;
-  accessRequestId?: string;
-  importId?: string;
-  adUsername?: string;
-  statusLogs?: Array<{
-    id: string;
-    createdAt: string;
-    oldStatus?: string;
-    newStatus: string;
-    changedBy: string;
-    reason?: string;
-  }>;
-}
-
-interface Comment {
-  id: string;
-  createdAt: string;
-  updatedAt: string;
-  comment: string;
-  author: string;
-  type?: string;
-}
+import { Info, User, Clock, Shield, History } from 'lucide-react';
 
 interface VPNAccountDetailModalProps {
   accountId: string;
@@ -66,10 +20,29 @@ interface VPNAccountDetailModalProps {
   onRefresh?: () => void;
 }
 
+const getStatusBadge = (status: string) => {
+   switch(status) {
+     case 'active': return <Badge className="bg-green-100 dark:bg-green-950/60 text-green-800 border-green-200 dark:border-green-900">Active</Badge>;
+     case 'pending_faculty': return <Badge className="bg-yellow-100 dark:bg-yellow-950/60 text-yellow-800 border-yellow-200 dark:border-yellow-900">Pending Faculty</Badge>;
+     case 'disabled': return <Badge variant="destructive" className="bg-red-100 dark:bg-red-950/60 text-red-800 border-red-200 dark:border-red-900">Disabled</Badge>;
+     case 'revoked': return <Badge variant="destructive" className="bg-purple-100 dark:bg-purple-950/60 text-purple-800 border-purple-200 dark:border-purple-900">Revoked</Badge>;
+     default: return <Badge variant="outline">{status}</Badge>;
+   }
+};
+
+const getPortalBadge = (portalType: string) => {
+  switch(portalType) {
+    case 'Management': return <Badge variant="outline" className="bg-blue-100 dark:bg-blue-950/60 text-blue-800 border-blue-200 dark:border-blue-900">Management</Badge>;
+    case 'Limited': return <Badge variant="outline" className="bg-purple-100 dark:bg-purple-950/60 text-purple-800 border-purple-200 dark:border-purple-900">Limited</Badge>;
+    case 'External': return <Badge variant="outline" className="bg-orange-100 dark:bg-orange-950/60 text-orange-800 border-orange-200 dark:border-orange-900">External</Badge>;
+    default: return <Badge variant="outline">{portalType}</Badge>;
+  }
+};
+
 export default function VPNAccountDetailModal({ accountId, onClose }: VPNAccountDetailModalProps) {
-  const { showToast } = useToast();
+  const { toast, showToast, hideToast } = useToast();
   const [account, setAccount] = useState<VPNAccountDetail | null>(null);
-  const [comments, setComments] = useState<Comment[]>([]);
+  const [comments, setComments] = useState<VPNAccountComment[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadingComments, setLoadingComments] = useState(true);
   const [newComment, setNewComment] = useState('');
@@ -151,53 +124,13 @@ export default function VPNAccountDetailModal({ accountId, onClose }: VPNAccount
     }
   };
 
-  const getStatusBadge = (status: string) => {
-     switch(status) {
-       case 'active': return <Badge className="bg-green-100 text-green-800 border-green-200">Active</Badge>;
-       case 'pending_faculty': return <Badge className="bg-yellow-100 text-yellow-800 border-yellow-200">Pending Faculty</Badge>;
-       case 'disabled': return <Badge variant="destructive" className="bg-red-100 text-red-800 border-red-200">Disabled</Badge>;
-       case 'revoked': return <Badge variant="destructive" className="bg-purple-100 text-purple-800 border-purple-200">Revoked</Badge>;
-       default: return <Badge variant="outline">{status}</Badge>;
-     }
-  };
-
-  const getPortalBadge = (portalType: string) => {
-    switch(portalType) {
-      case 'Management': return <Badge variant="outline" className="bg-blue-100 text-blue-800 border-blue-200">Management</Badge>;
-      case 'Limited': return <Badge variant="outline" className="bg-purple-100 text-purple-800 border-purple-200">Limited</Badge>;
-      case 'External': return <Badge variant="outline" className="bg-orange-100 text-orange-800 border-orange-200">External</Badge>;
-      default: return <Badge variant="outline">{portalType}</Badge>;
-    }
-  };
-
-  const formatDate = (date?: string) => {
-    if (!date) return 'N/A';
-    return new Date(date).toLocaleString('en-US', {
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
-  };
-
-  const InfoRow = ({ label, value, highlight = false, icon = null }: { label: string; value?: ReactNode; highlight?: boolean; icon?: ReactNode }) => (
-    <div className="flex py-3 border-b last:border-b-0 items-center">
-      <dt className="w-1/3 text-sm font-medium text-muted-foreground flex items-center gap-2">
-        {icon}
-        {label}
-      </dt>
-      <dd className={`w-2/3 text-sm ${highlight ? 'font-semibold text-foreground' : 'text-foreground'} break-all`}>
-        {value || 'N/A'}
-      </dd>
-    </div>
-  );
-
   if (loading) {
     return (
       <Dialog open={true} onOpenChange={(open) => !open && onClose()}>
         <DialogContent>
+           <DialogHeader>
+             <DialogTitle>Loading VPN account details</DialogTitle>
+           </DialogHeader>
            <div className="flex justify-center items-center py-12">
              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
            </div>
@@ -210,6 +143,9 @@ export default function VPNAccountDetailModal({ accountId, onClose }: VPNAccount
     return (
       <Dialog open={true} onOpenChange={(open) => !open && onClose()}>
          <DialogContent>
+           <DialogHeader>
+             <DialogTitle>VPN account unavailable</DialogTitle>
+           </DialogHeader>
            <div className="text-center py-8">
              <p className="text-muted-foreground">VPN account not found</p>
              <Button onClick={onClose} className="mt-4">Close</Button>
@@ -231,12 +167,12 @@ export default function VPNAccountDetailModal({ accountId, onClose }: VPNAccount
             <CardContent className="p-6">
               <div className="flex items-start justify-between">
                 <div>
-                  <h3 className="text-2xl font-bold text-gray-900 mb-1">{account.name}</h3>
-                  <div className="flex items-center gap-2 text-gray-600 mb-2">
+                  <h3 className="text-2xl font-bold text-foreground mb-1">{account.name}</h3>
+                  <div className="flex items-center gap-2 text-muted-foreground mb-2">
                     <User className="w-4 h-4" />
                     <span className="font-mono text-sm">{account.username}</span>
                   </div>
-                  <div className="flex items-center gap-2 text-gray-600">
+                  <div className="flex items-center gap-2 text-muted-foreground">
                      <span className="text-sm">{account.email}</span>
                   </div>
                 </div>
@@ -251,9 +187,9 @@ export default function VPNAccountDetailModal({ accountId, onClose }: VPNAccount
                   <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Type</span>
                   <div className="mt-1 flex items-center gap-2 font-medium">
                     {account.isInternal ? (
-                       <Badge variant="secondary" className="bg-blue-100/50 text-blue-800 hover:bg-blue-100">Internal</Badge>
+                       <Badge variant="secondary" className="bg-blue-100/50 text-blue-800 hover:bg-blue-100 dark:bg-blue-950/60">Internal</Badge>
                     ) : ( 
-                       <Badge variant="secondary" className="bg-purple-100/50 text-purple-800 hover:bg-purple-100">External</Badge>
+                       <Badge variant="secondary" className="bg-purple-100/50 text-purple-800 hover:bg-purple-100 dark:bg-purple-950/60">External</Badge>
                     )}
                   </div>
                 </div>
@@ -275,7 +211,7 @@ export default function VPNAccountDetailModal({ accountId, onClose }: VPNAccount
             <div className="mt-4 max-h-[50vh] overflow-y-auto pr-1">
               <TabsContent value="overview" className="space-y-6">
                 <Card>
-                  <CardHeader className="py-3 bg-gray-50/50 border-b">
+                  <CardHeader className="py-3 bg-muted/50 border-b">
                     <CardTitle className="text-base flex items-center gap-2">
                       <Info className="w-4 h-4 text-primary" />
                       Basic Information
@@ -298,7 +234,7 @@ export default function VPNAccountDetailModal({ accountId, onClose }: VPNAccount
                 </Card>
 
                 <Card>
-                  <CardHeader className="py-3 bg-gray-50/50 border-b">
+                  <CardHeader className="py-3 bg-muted/50 border-b">
                     <CardTitle className="text-base flex items-center gap-2">
                       <History className="w-4 h-4 text-primary" />
                       Creation Details
@@ -319,57 +255,21 @@ export default function VPNAccountDetailModal({ accountId, onClose }: VPNAccount
                   </CardContent>
                 </Card>
 
-                {(account.disabledAt || account.revokedAt || account.restoredAt) && (
-                  <Card>
-                    <CardHeader className="py-3 bg-gray-50/50 border-b">
-                      <CardTitle className="text-base flex items-center gap-2 text-destructive">
-                        <AlertTriangle className="w-4 h-4" />
-                        Status History
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent className="p-0">
-                      <div className="px-6 py-2">
-                        <dl>
-                          {account.disabledAt && (
-                            <>
-                              <InfoRow label="Disabled At" value={formatDate(account.disabledAt)} />
-                              <InfoRow label="Disabled By" value={account.disabledBy} />
-                              {account.disabledReason && <InfoRow label="Disable Reason" value={account.disabledReason} />}
-                            </>
-                          )}
-                          {account.revokedAt && (
-                            <>
-                              <InfoRow label="Revoked At" value={formatDate(account.revokedAt)} />
-                              <InfoRow label="Revoked By" value={account.revokedBy} />
-                              {account.revokedReason && <InfoRow label="Revoke Reason" value={account.revokedReason} />}
-                              <InfoRow label="Can Restore" value={account.canRestore ? '✓ Yes' : '✗ No'} />
-                            </>
-                          )}
-                          {account.restoredAt && (
-                            <>
-                              <InfoRow label="Restored At" value={formatDate(account.restoredAt)} />
-                              <InfoRow label="Restored By" value={account.restoredBy} />
-                            </>
-                          )}
-                        </dl>
-                      </div>
-                    </CardContent>
-                  </Card>
-                )}
+                <VPNAccountStatusHistory account={account} />
 
                 {account.notes && (
                   <Card>
-                    <CardHeader className="py-3 bg-gray-50/50 border-b">
+                    <CardHeader className="py-3 bg-muted/50 border-b">
                       <CardTitle className="text-base">Notes</CardTitle>
                     </CardHeader>
                     <CardContent className="p-4">
-                      <p className="text-sm text-gray-700 whitespace-pre-wrap">{account.notes}</p>
+                      <p className="text-sm text-muted-foreground whitespace-pre-wrap">{account.notes}</p>
                     </CardContent>
                   </Card>
                 )}
 
                 <Card>
-                  <CardHeader className="py-3 bg-gray-50/50 border-b">
+                  <CardHeader className="py-3 bg-muted/50 border-b">
                      <CardTitle className="text-base flex items-center gap-2">
                        <Shield className="w-4 h-4 text-primary" />
                        System Information
@@ -387,115 +287,9 @@ export default function VPNAccountDetailModal({ accountId, onClose }: VPNAccount
                 </Card>
               </TabsContent>
 
-              <TabsContent value="timeline">
-                <div className="space-y-4">
-                  {loadingComments ? (
-                    <div className="flex justify-center items-center py-8">
-                       <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
-                    </div>
-                  ) : account.statusLogs && account.statusLogs.length > 0 ? (
-                    <div className="space-y-4 pl-2">
-                      {account.statusLogs.map((log) => (
-                        <div key={log.id} className="relative pl-6 pb-6 border-l-2 border-gray-200 last:pb-0 last:border-l-0">
-                          <div className="absolute -left-[9px] top-0 w-4 h-4 rounded-full bg-primary border-4 border-white"></div>
-                          <div className="bg-white border rounded-lg p-4 shadow-sm">
-                              <div className="flex items-start justify-between">
-                                <div>
-                                  <p className="font-medium text-sm">
-                                    Status changed from <span className="text-muted-foreground">{log.oldStatus || 'none'}</span> to{' '}
-                                    <span className="font-bold text-primary">{log.newStatus}</span>
-                                  </p>
-                                  <p className="text-xs text-muted-foreground mt-1">
-                                    Changed by <span className="font-medium text-foreground">{log.changedBy}</span>
-                                  </p>
-                                  {log.reason && (
-                                    <div className="mt-2 text-sm bg-muted/50 p-2 rounded border text-muted-foreground">
-                                      {log.reason}
-                                    </div>
-                                  )}
-                                </div>
-                                <span className="text-xs text-muted-foreground whitespace-nowrap ml-4">
-                                  {formatDate(log.createdAt)}
-                                </span>
-                              </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="text-center py-12 text-muted-foreground border-2 border-dashed rounded-lg">
-                      No status changes recorded
-                    </div>
-                  )}
-                </div>
-              </TabsContent>
+              <VPNAccountTimeline account={account} loadingComments={loadingComments} />
 
-              <TabsContent value="comments" className="space-y-6">
-                 <Card>
-                    <CardHeader>
-                       <CardTitle className="text-base flex items-center gap-2">
-                          <MessageSquare className="w-4 h-4" />
-                          Add Comment
-                       </CardTitle>
-                    </CardHeader>
-                    <CardContent>
-                       <form onSubmit={handleAddComment}>
-                          <Textarea
-                              value={newComment}
-                              onChange={(e) => setNewComment(e.target.value)}
-                              placeholder="Enter your comment here..."
-                              className="min-h-[100px] mb-4"
-                              disabled={submittingComment}
-                          />
-                          <div className="flex justify-end">
-                            <Button 
-                               type="submit" 
-                               disabled={submittingComment || !newComment.trim()}
-                            >
-                               {submittingComment ? 'Adding...' : 'Add Comment'}
-                            </Button>
-                          </div>
-                       </form>
-                    </CardContent>
-                 </Card>
-
-                 <div className="space-y-4">
-                    <h4 className="font-semibold text-sm text-muted-foreground">Comments ({comments.length})</h4>
-                    {loadingComments ? (
-                       <div className="flex justify-center items-center py-8">
-                          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
-                       </div>
-                    ) : comments.length > 0 ? (
-                       comments.map((comment) => (
-                          <Card key={comment.id}>
-                             <CardContent className="p-4">
-                                <div className="flex items-start justify-between mb-2">
-                                   <div className="flex items-center gap-2">
-                                      <span className="font-semibold text-sm">{comment.author}</span>
-                                      {comment.type && (
-                                         <Badge variant="secondary" className="text-xs font-normal">
-                                            {comment.type}
-                                         </Badge>
-                                      )}
-                                   </div>
-                                   <span className="text-xs text-muted-foreground">{formatDate(comment.createdAt)}</span>
-                                </div>
-                                <p className="text-sm text-gray-700 whitespace-pre-wrap">{comment.comment}</p>
-                                {comment.createdAt !== comment.updatedAt && (
-                                   <p className="text-xs text-muted-foreground mt-2 italic">
-                                      Edited: {formatDate(comment.updatedAt)}
-                                   </p>
-                                )}
-                             </CardContent>
-                          </Card>
-                       ))
-                    ) : (
-                       <div className="text-center py-12 text-muted-foreground bg-muted/30 rounded-lg border-2 border-dashed">
-                          No comments yet. Be the first to add one!
-                       </div>
-                    )}
-                 </div>
-              </TabsContent>
+              <VPNAccountComments comments={comments} loadingComments={loadingComments} newComment={newComment} submittingComment={submittingComment} onCommentChange={setNewComment} onSubmit={handleAddComment} />
             </div>
           </Tabs>
         </div>
@@ -505,6 +299,7 @@ export default function VPNAccountDetailModal({ accountId, onClose }: VPNAccount
             Close
           </Button>
         </div>
+        <Toast {...toast} onClose={hideToast} />
       </DialogContent>
     </Dialog>
   );

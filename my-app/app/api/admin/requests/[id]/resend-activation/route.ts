@@ -3,6 +3,7 @@ import type { Prisma } from '@prisma/client';
 import { randomBytes, createHash } from 'crypto';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { sendAccountActivationEmail } from '@/lib/email';
 import { appLogger } from '@/lib/logger';
 import {
@@ -50,6 +51,9 @@ export async function POST(
 
         if (!admin || response) {
             return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+        }
+        if (!actorHasPermission(admin, 'access_requests.provision')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
         }
 
         const { id: requestId } = await params;

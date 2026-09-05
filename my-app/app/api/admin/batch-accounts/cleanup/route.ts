@@ -1,23 +1,33 @@
-import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { NextRequest, NextResponse } from 'next/server';
+import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 
 export async function GET() {
-    try {
-        const itemResult = await prisma.batchAccountItem.updateMany({
-            where: { status: 'processing' },
-            data: {
-                status: 'failed',
-                errorMessage: 'Cleaned up stuck processing state from previous crash'
-            }
-        });
-
-        const batchResult = await prisma.batchAccountCreation.updateMany({
-            where: { status: 'processing' },
-            data: { status: 'failed' }
-        });
-
-        return NextResponse.json({ success: true, itemResult, batchResult });
-    } catch (error) {
-        return NextResponse.json({ success: false, error: String(error) }, { status: 500 });
+  return NextResponse.json(
+    { error: 'Method not allowed' },
+    {
+      status: 405,
+      headers: { Allow: 'POST' },
     }
+  );
+}
+
+export async function POST(request: NextRequest) {
+  const { admin, response } = await checkAdminAuthWithRateLimit(request);
+  if (!admin || response) {
+    return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  if (!actorHasPermission(admin, 'batch.manage')) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+  }
+
+  return NextResponse.json(
+    {
+      error: 'Stale batch cleanup is disabled',
+      recovery:
+        'Use authenticated per-batch cancellation only for durable batches with account items. Legacy CSV batches require manual directory and database reconciliation.',
+    },
+    { status: 410 }
+  );
 }

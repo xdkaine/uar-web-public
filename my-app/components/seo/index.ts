@@ -1,6 +1,6 @@
-export { 
-  StructuredData,
+export { StructuredData } from './StructuredData';
+export {
   getOrganizationStructuredData,
   getWebApplicationStructuredData,
   getBreadcrumbStructuredData
-} from './StructuredData';
+} from './seoDocuments';

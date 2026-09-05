@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { after, NextRequest, NextResponse } from 'next/server';
 import type { Prisma } from '@prisma/client';
 import { nanoid } from 'nanoid';
 import { prisma } from '@/lib/prisma';
@@ -9,6 +9,14 @@ import { searchLDAPUser } from '@/lib/ldap';
 import { appLogger } from '@/lib/logger';
 import { verifyTurnstileToken } from '@/lib/turnstile';
 import { findReusableOffboardedRequest, reusableOffboardedUsername } from '@/lib/offboard-reenrollment';
+import { notifyActiveAdministrators } from '@/lib/notifications';
+import { hashAccessRequestVerificationToken } from '@/lib/access-request-verification';
+import {
+  acquireDirectoryOwnershipFence,
+  directoryObjectIdentity,
+  directoryObjectIdentityMatches,
+  type DirectoryObjectIdentity,
+} from '@/lib/directory-ownership-fence';
 
 interface RequestBody {
   name?: string;
@@ -33,6 +41,14 @@ type AccessRequestCreateResult =
       accessRequest: { id: string };
     };
 
+const ACTIVE_REQUEST_STATUSES = [
+  'pending_verification',
+  'verification_email_failed',
+  'verification_email_sending',
+  'pending_student_directors',
+  'pending_faculty',
+] as const;
+
 function rateLimitedResponse(rateLimitResult: {
   limit: number;
   remaining: number;
@@ -52,6 +68,15 @@ function rateLimitedResponse(rateLimitResult: {
         'Retry-After': Math.ceil((rateLimitResult.reset - Date.now()) / 1000).toString(),
       },
     }
+  );
+}
+
+function successfulAccessRequestResponse() {
+  return NextResponse.json(
+    {
+      message: 'Request submitted successfully. Please check your email for verification.',
+    },
+    { status: 201 }
   );
 }
 
@@ -103,18 +128,6 @@ export async function POST(request: NextRequest) {
 
     if (!ipRateLimitResult.success) {
       return rateLimitedResponse(ipRateLimitResult);
-    }
-
-    if (normalizedEmail) {
-      const emailRateLimitResult = await checkRateLimitAsync('access-request-email', {
-        maxRequests: 2,
-        windowMs: RateLimitPresets.requestSubmission.windowMs,
-        identifier: normalizedEmail,
-      });
-
-      if (!emailRateLimitResult.success) {
-        return rateLimitedResponse(emailRateLimitResult);
-      }
     }
 
     if (!turnstileToken) {
@@ -214,8 +227,8 @@ export async function POST(request: NextRequest) {
         });
 
         if (validEvents.length !== normalizedEventIds.length) {
-          const validIds = validEvents.map((e: { id: string }) => e.id);
-          const invalidIds = normalizedEventIds.filter((id: string) => !validIds.includes(id));
+          const validIds = new Set(validEvents.map((event: { id: string }) => event.id));
+          const invalidIds = normalizedEventIds.filter((id: string) => !validIds.has(id));
           return NextResponse.json(
             { error: `One or more selected events are invalid or inactive: ${invalidIds.join(', ')}` },
             { status: 400 }
@@ -244,6 +257,16 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    const emailRateLimitResult = await checkRateLimitAsync('access-request-email', {
+      maxRequests: 2,
+      windowMs: RateLimitPresets.requestSubmission.windowMs,
+      identifier: normalizedEmail,
+    });
+
+    if (!emailRateLimitResult.success) {
+      return rateLimitedResponse(emailRateLimitResult);
+    }
+
     // Check if email is blocked
     const blockedEmail = await prisma.blockedEmail.findFirst({
       where: {
@@ -265,7 +288,7 @@ export async function POST(request: NextRequest) {
       where: {
         email: { equals: normalizedEmail, mode: 'insensitive' },
         status: {
-          in: ['pending_verification', 'pending_student_directors', 'pending_faculty'],
+          in: [...ACTIVE_REQUEST_STATUSES],
         },
       },
     });
@@ -292,27 +315,11 @@ export async function POST(request: NextRequest) {
         ip: clientIp,
       });
 
-      return NextResponse.json(
-        {
-          message: 'Request submitted successfully. Please check your email for verification.',
-          // We don't return the ID here to avoid leaking that it's a duplicate if we were careful, 
-          // but strictly speaking the message is the most important part. 
-          // However, to be fully indistinguishable, we should probably not return an ID if we can't key it to a new request.
-          // Yet the frontend might expect an ID. Let's return a fake one or just undefined?
-          // Looking at the success response below (line 346), it returns `requestId`.
-          // If we want to be truly indistinguishable, we should probably generate a fake ID or just return a mismatch.
-          // But simply returning success message is usually enough for basic enumeration protection.
-          // Let's check if the frontend uses the request ID.
-          // If I look at the success response: { message: '...', requestId: accessRequest.id }
-          // If I don't return requestId, the frontend might error out if it tries to redirect to a status page.
-          // For now, let's just return the success message. Most bots just look for 409 vs 201.
-          // To be safe, let's act like we created it.
-        },
-        { status: 201 }
-      );
+      return successfulAccessRequestResponse();
     }
 
     const verificationToken = nanoid(32);
+    const verificationTokenHash = hashAccessRequestVerificationToken(verificationToken);
     const verificationTokenExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
 
     // Use the first eventId from eventIds array if provided, otherwise fall back to single eventId
@@ -325,6 +332,7 @@ export async function POST(request: NextRequest) {
     let offboardedReenrollmentRequestId: string | null = null;
     let detectedUsername: string | null = null;
     let bronconameForVpn: string | null = null;
+    let detectedDirectoryIdentity: DirectoryObjectIdentity | null = null;
 
     if (isInternal) {
       // Extract bronconame from email (username before @cpp.edu)
@@ -338,6 +346,7 @@ export async function POST(request: NextRequest) {
           const existingAdUser = await searchLDAPUser(bronconame);
 
           if (existingAdUser) {
+            detectedDirectoryIdentity = directoryObjectIdentity(existingAdUser);
             // Check if the AD account already has an email set
             const mailAttr = existingAdUser.attributes.find((attr: { type: string }) => attr.type === 'mail');
             const hasEmail = mailAttr && mailAttr.values && mailAttr.values.length > 0 && mailAttr.values[0];
@@ -394,11 +403,30 @@ export async function POST(request: NextRequest) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         createResult = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+          if (detectedUsername) {
+            await acquireDirectoryOwnershipFence(tx, detectedUsername);
+            const currentDirectoryUser = await searchLDAPUser(detectedUsername);
+            if (
+              !detectedDirectoryIdentity
+              || !directoryObjectIdentityMatches(detectedDirectoryIdentity, currentDirectoryUser)
+            ) {
+              appLogger.warn('Existing directory identity changed while access request ownership was being reserved', {
+                email: normalizedEmail,
+                detectedUsername,
+              });
+              isGrandfatheredAccount = false;
+              isOffboardedReenrollment = false;
+              offboardedReenrollmentRequestId = null;
+              detectedUsername = null;
+              detectedDirectoryIdentity = null;
+            }
+          }
+
           const duplicatePendingRequest = await tx.accessRequest.findFirst({
             where: {
               email: { equals: normalizedEmail, mode: 'insensitive' },
               status: {
-                in: ['pending_verification', 'pending_student_directors', 'pending_faculty'],
+                in: [...ACTIVE_REQUEST_STATUSES],
               },
             },
             select: { id: true },
@@ -433,7 +461,8 @@ export async function POST(request: NextRequest) {
               institution: isInternal ? null : normalizedInstitution,
               eventReason: normalizedEventReason || null,
               eventId: primaryEventId || null,
-              verificationToken,
+              verificationToken: null,
+              verificationTokenHash,
               verificationTokenExpiresAt,
               status: 'pending_verification',
               isGrandfatheredAccount, // Mark if this is a grandfathered account
@@ -477,15 +506,23 @@ export async function POST(request: NextRequest) {
         ip: clientIp,
       });
 
-      return NextResponse.json(
-        {
-          message: 'Request submitted successfully. Please check your email for verification.',
-        },
-        { status: 201 }
-      );
+      return successfulAccessRequestResponse();
     }
 
     const accessRequest = createResult.accessRequest;
+
+    notifyActiveAdministrators({
+      dedupeKey: `access-request-created:${accessRequest.id}`,
+      kind: 'access_request',
+      title: 'New access request',
+      message: `${normalizedName} submitted an access request.`,
+      href: `/admin/requests/${accessRequest.id}`,
+    }).catch((error) => {
+      appLogger.error('Failed to create access-request in-app notifications', {
+        requestId: accessRequest.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
 
     // Add system comment if grandfathered account detected
     if (isGrandfatheredAccount && detectedUsername) {
@@ -539,58 +576,46 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    try {
-      await sendVerificationEmail(normalizedEmail, normalizedName, verificationToken);
-    } catch (emailError) {
-      appLogger.error('Failed to send verification email after access request creation', {
-        requestId: accessRequest.id,
-        email: normalizedEmail,
-        error: emailError instanceof Error ? emailError.message : 'Unknown error',
-      });
-
+    after(async () => {
       try {
-        await prisma.accessRequest.deleteMany({
-          where: {
-            id: accessRequest.id,
-            status: 'pending_verification',
-            isVerified: false,
-            verificationToken,
-          },
-        });
-      } catch (cleanupError) {
-        appLogger.error('Failed to remove access request after verification email failure', {
+        await sendVerificationEmail(normalizedEmail, normalizedName, verificationToken);
+      } catch (emailError) {
+        appLogger.error('Failed to send verification email after access request creation', {
           requestId: accessRequest.id,
           email: normalizedEmail,
-          error: cleanupError instanceof Error ? cleanupError.message : 'Unknown error',
+          error: emailError instanceof Error ? emailError.message : 'Unknown error',
         });
 
-        await prisma.accessRequest.updateMany({
-          where: {
-            id: accessRequest.id,
-            status: 'pending_verification',
-            isVerified: false,
-          },
-          data: {
-            status: 'verification_email_failed',
-            provisioningState: 'verification_email_failed',
-            provisioningError: emailError instanceof Error ? emailError.message : 'Unknown verification email error',
-          },
-        }).catch(() => {});
+        try {
+          const stateResult = await prisma.accessRequest.updateMany({
+            where: {
+              id: accessRequest.id,
+              status: 'pending_verification',
+              isVerified: false,
+              verificationTokenHash,
+            },
+            data: {
+              status: 'verification_email_failed',
+              provisioningState: 'verification_email_failed',
+              provisioningError: 'Verification email delivery failed',
+            },
+          });
+          if (stateResult.count !== 1) {
+            appLogger.error('Verification email failure state was not claimed', {
+              requestId: accessRequest.id,
+            });
+          }
+        } catch (stateError) {
+          appLogger.error('Failed to record verification email delivery failure', {
+            requestId: accessRequest.id,
+            email: normalizedEmail,
+            error: stateError instanceof Error ? stateError.message : 'Unknown error',
+          });
+        }
       }
+    });
 
-      return NextResponse.json(
-        { error: 'Failed to send verification email. Please try again.' },
-        { status: 500 }
-      );
-    }
-
-    return NextResponse.json(
-      {
-        message: 'Request submitted successfully. Please check your email for verification.',
-        requestId: accessRequest.id,
-      },
-      { status: 201 }
-    );
+    return successfulAccessRequestResponse();
   } catch (error) {
     if (isJsonBodyError(error)) {
       return NextResponse.json({ error: error.message }, { status: error.statusCode });

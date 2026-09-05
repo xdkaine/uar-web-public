@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { searchLDAPGroups } from '@/lib/ldap';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 
@@ -9,6 +10,10 @@ export async function GET(request: NextRequest) {
 
         if (!admin || response) {
             return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+        }
+
+        if (!actorHasPermission(admin, 'users.read')) {
+            return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
         }
 
         const searchParams = request.nextUrl.searchParams;

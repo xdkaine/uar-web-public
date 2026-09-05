@@ -13,9 +13,10 @@ Sessions are managed server-side using the database and client-side using secure
 *   **Storage**: Session data is stored in the PostgreSQL database (`Session` model).
 *   **Cookies**: A secure, HTTP-only cookie (`session_token`) stores the session token.
 *   **Timeouts**:
-    *   **Admin Sessions**: 30 minutes absolute timeout.
+    *   **Native AD and local admin sessions**: 30 minutes absolute timeout by default.
+    *   **OIDC/SSO portal sessions**: bounded by the signed upstream provider-session expiry and an independent portal cap (`AUTH_OIDC_SESSION_MAX_AGE`, 8 hours by default). Their idle window follows that effective expiry, and provider logout can end them sooner.
     *   **User Sessions**: 60 minutes absolute timeout.
-    *   **Idle Timeout**: 15 minutes of inactivity (for both).
+    *   **Idle Timeout**: 15 minutes for native AD, local break-glass, and ordinary user sessions; OIDC/SSO uses its effective provider-bounded expiry.
 *   **Security Flags**:
     *   `httpOnly`: Prevents JavaScript access to the cookie (mitigates XSS).
     *   `secure`: Requires HTTPS (in production).

@@ -11,12 +11,13 @@ export function sanitizeCsvCell(value: string | number | boolean | null | undefi
   }
 
   const stringValue = String(value);
-  
-  // Check if the cell starts with a potentially dangerous character
-  const dangerousChars = ['=', '+', '-', '@', '|', '\\', '\t', '\r', '\n'];
-  const firstChar = stringValue.charAt(0);
-  
-  if (dangerousChars.includes(firstChar)) {
+  // Normalize only for detection so full-width formula prefixes are caught
+  // without changing the exported value.
+  const comparisonValue = stringValue.normalize('NFKC');
+  const startsWithControlCharacter = /^[\t\r\n]/u.test(comparisonValue);
+  const startsWithFormula = /^\s*[=+\-@|\\]/u.test(comparisonValue);
+
+  if (startsWithControlCharacter || startsWithFormula) {
     // Prefix with single quote to prevent formula interpretation
     // The single quote is the standard Excel/Sheets way to indicate "text, not formula"
     return `'${stringValue}`;
@@ -55,6 +56,83 @@ export function generateCsvContent(
   );
   
   return [headerRow, ...dataRows].join('\n');
+}
+
+/**
+ * Parses RFC 4180-style CSV, including quoted commas, escaped quotes, and
+ * embedded CRLF/newline characters.
+ */
+export function parseCsvContent(content: string): string[][] {
+  if (!content) {
+    return [];
+  }
+
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = '';
+  let inQuotes = false;
+  let afterClosingQuote = false;
+
+  const finishField = () => {
+    row.push(field);
+    field = '';
+    afterClosingQuote = false;
+  };
+
+  const finishRow = () => {
+    finishField();
+    rows.push(row);
+    row = [];
+  };
+
+  for (let index = 0; index < content.length; index += 1) {
+    const character = content[index];
+
+    if (inQuotes) {
+      if (character === '"') {
+        if (content[index + 1] === '"') {
+          field += '"';
+          index += 1;
+        } else {
+          inQuotes = false;
+          afterClosingQuote = true;
+        }
+      } else {
+        field += character;
+      }
+      continue;
+    }
+
+    if (afterClosingQuote && character !== ',' && character !== '\r' && character !== '\n') {
+      throw new Error('Invalid character after a closing CSV quote');
+    }
+
+    if (character === '"') {
+      if (field) {
+        throw new Error('Unexpected quote in an unquoted CSV field');
+      }
+      inQuotes = true;
+    } else if (character === ',') {
+      finishField();
+    } else if (character === '\r' || character === '\n') {
+      finishRow();
+      if (character === '\r' && content[index + 1] === '\n') {
+        index += 1;
+      }
+    } else {
+      field += character;
+    }
+  }
+
+  if (inQuotes) {
+    throw new Error('Unterminated quoted CSV field');
+  }
+
+  if (field || row.length > 0 || afterClosingQuote) {
+    finishRow();
+  }
+
+  return rows;
 }
 
 /**

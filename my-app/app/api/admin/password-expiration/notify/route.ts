@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { requireModuleEnabled } from '@/lib/modules/guards';
 import {
   runLockedPasswordExpirationNotifications,
   type PasswordExpirationStatus,
@@ -48,6 +50,12 @@ export async function POST(request: NextRequest) {
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'password_expiration.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    const moduleGuard = await requireModuleEnabled('password.expiration');
+    if (moduleGuard) return moduleGuard;
 
     const body = await parseJsonWithLimit<NotifyRequestBody>(request, MAX_REQUEST_BODY_SIZE.SMALL);
     const usernames = normalizeStringArray(body.usernames);

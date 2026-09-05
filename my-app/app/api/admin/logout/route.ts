@@ -8,6 +8,7 @@ import {
   revokeSessionByToken,
 } from '@/lib/session';
 import { logAuditAction, AuditActions, AuditCategories, getUserAgent, getIpAddress } from '@/lib/audit-log';
+import { recordProviderLogoutOutcome } from '@/lib/auth/provider-logout-audit';
 
 export async function POST(request: NextRequest) {
   // Apply rate limiting even for logout
@@ -48,7 +49,22 @@ export async function POST(request: NextRequest) {
     });
   }
 
-  await revokeSessionByToken(token);
+  // revokeSessionByToken returns the deleted row's providerSid so the IdP
+  // session dies with the portal session (same full-logout path as
+  // /api/auth/logout - otherwise the next /auth silently SSOs back in).
+  // The ACTUAL backchannel outcome is recorded durably (ADR-0014).
+  const revoked = await revokeSessionByToken(token, 'admin_logout');
+  await recordProviderLogoutOutcome({
+    surface: 'admin_console',
+    username: session?.username,
+    sessionId: session?.id,
+    isAdmin: session?.isAdmin,
+    hadSession: Boolean(revoked),
+    providerSid: revoked?.providerSid,
+    providerLogoutTaskId: revoked?.providerLogoutTaskId,
+    ipAddress: getIpAddress(request),
+    userAgent: getUserAgent(request),
+  });
   const response = NextResponse.json({ success: true });
 
   clearSession(response);

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { getSessionFromCookies } from '@/lib/session';
 import { searchLDAPUser } from '@/lib/ldap';
+import { prisma } from '@/lib/prisma';
 import { appLogger } from '@/lib/logger';
 
 export async function GET() {
@@ -36,6 +37,24 @@ export async function GET() {
       return attr?.values || [];
     };
 
+    // Identity-provider context for the profile's sign-in section: how this
+    // session authenticated and whether it is bound to a live IdP session
+    // (ADR-0012/ADR-0014). Directory data above stays the source of truth for
+    // attributes; nothing sensitive (no sid value) leaves the server.
+    let idpLinked = false;
+    try {
+      const sessionRow = await prisma.session.findUnique({
+        where: { id: session.id },
+        select: { providerSid: true },
+      });
+      idpLinked = Boolean(sessionRow?.providerSid);
+    } catch (lookupError) {
+      appLogger.warn('Failed to resolve IdP linkage for profile', {
+        username: session.username,
+        error: lookupError instanceof Error ? lookupError.message : 'unknown',
+      });
+    }
+
     const profile = {
       username: getAttributeValue('sAMAccountName'),
       // Prefer displayName, then cn, then username
@@ -43,6 +62,10 @@ export async function GET() {
       email: getAttributeValue('mail'),
       groups: getAttributeValues('memberOf'),
       distinguishedName: userInfo.objectName,
+      identityProvider: {
+        authProvider: session.authProvider,
+        idpLinked,
+      },
     };
 
     appLogger.info('Profile fetched successfully', { username: session.username });

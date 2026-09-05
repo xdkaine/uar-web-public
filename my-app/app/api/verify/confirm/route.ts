@@ -6,6 +6,8 @@ import { markNotificationPending } from '@/lib/notification-queue';
 import { appLogger } from '@/lib/logger';
 import { logActionHistoryEvent } from '@/lib/action-history';
 import { AuditActions, AuditCategories, getUserAgent } from '@/lib/audit-log';
+import { firstReviewStatus, getActiveWorkflow } from '@/lib/workflow/core';
+import { hashAccessRequestVerificationToken } from '@/lib/access-request-verification';
 
 export async function POST(request: NextRequest) {
   try {
@@ -37,10 +39,9 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const accessRequest = await prisma.accessRequest.findUnique({
-      where: {
-        verificationToken: token,
-      },
+    const tokenHash = hashAccessRequestVerificationToken(token);
+    const accessRequest = await prisma.accessRequest.findFirst({
+      where: { verificationTokenHash: tokenHash },
     });
 
     if (!accessRequest) {
@@ -121,9 +122,13 @@ export async function POST(request: NextRequest) {
           id: accessRequest.id,
           isVerified: false,
           verificationAttempts: { lt: 5 },
+          verificationTokenHash: tokenHash,
         },
         data: {
           verificationAttempts: { increment: 1 },
+          verificationToken: null,
+          verificationTokenHash: null,
+          verificationTokenExpiresAt: null,
         },
       }).catch(() => { /* ignore errors */ });
       await logActionHistoryEvent({
@@ -149,13 +154,21 @@ export async function POST(request: NextRequest) {
     }
 
     const verifiedAt = new Date();
+
+    // Land the request in the first review stage of the currently configured
+    // governance workflow (defaults to pending_student_directors).
+    const workflow = await getActiveWorkflow();
+    const firstReviewStatusValue = firstReviewStatus(workflow.stages);
+
     const claimResult = await prisma.accessRequest.updateMany({
       where: {
         id: accessRequest.id,
-        verificationToken: token,
         isVerified: false,
-        status: 'pending_verification',
+        status: {
+          in: ['pending_verification', 'verification_email_failed', 'verification_email_sending'],
+        },
         verificationAttempts: { lt: 5 },
+        verificationTokenHash: tokenHash,
         OR: [
           { verificationTokenExpiresAt: null },
           { verificationTokenExpiresAt: { gt: verifiedAt } },
@@ -165,9 +178,15 @@ export async function POST(request: NextRequest) {
         isVerified: true,
         verifiedAt,
         verificationAttempts: { increment: 1 },
-        status: 'pending_student_directors',
+        status: firstReviewStatusValue,
         provisioningState: null,
         provisioningError: null,
+        // Pin the workflow version governing this request from here on.
+        workflowVersionId: workflow.id,
+        requestTypeKey: workflow.requestTypeKey,
+        verificationToken: null,
+        verificationTokenHash: null,
+        verificationTokenExpiresAt: null,
       },
     });
 
@@ -206,7 +225,7 @@ export async function POST(request: NextRequest) {
       eventKind: 'security',
       outcome: 'success',
       success: true,
-      details: { nextStatus: 'pending_student_directors' },
+      details: { nextStatus: firstReviewStatusValue },
       ipAddress: clientIp,
       userAgent: getUserAgent(request),
     });

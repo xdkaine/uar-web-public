@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { controlOffboardCampaign } from '@/lib/offboard-campaign';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
+import { prisma } from '@/lib/prisma';
 
 function auditActionForControl(action: string) {
   if (action.startsWith('pause')) return AuditActions.PAUSE_OFFBOARD_CAMPAIGN;
@@ -20,12 +22,24 @@ export async function POST(
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'offboard.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
     const { id } = await params;
     const body = await request.json();
     const action = String(body.action || '');
     if (!action) {
       return NextResponse.json({ error: 'Action is required' }, { status: 400 });
+    }
+    const campaignRecord = await prisma.offboardCampaign.findUnique({
+      where: { id },
+      select: { workflowMode: true },
+    });
+    if (campaignRecord?.workflowMode === 'direct'
+      && action.startsWith('resume')
+      && !actorHasPermission(admin, 'offboard.execute_direct')) {
+      return NextResponse.json({ error: 'Direct offboarding permission is required' }, { status: 403 });
     }
 
     const campaign = await controlOffboardCampaign(id, action, admin.username);

@@ -1,7 +1,9 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import useSWR from 'swr';
 import { fetchWithCsrf } from '@/lib/csrf';
+import { fetchJson } from '@/lib/client-query';
 import {
   getMinimumOffboardExtensionReminderDate,
   OFFBOARD_EXTENSION_REMINDER_MIN_LEAD_HOURS,
@@ -9,6 +11,7 @@ import {
 import DateTimePicker from '@/components/DateTimePicker';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
+import { StatusBadge } from '@/components/ui/status-badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -21,6 +24,10 @@ import { Switch } from '@/components/ui/switch';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
+import { ActionImpactDialog } from '@/components/admin/ActionImpactDialog';
+import { requestActionImpact } from '@/components/admin/actionImpactRequest';
+import { useAdminNavigation } from '@/components/admin/AdminShell';
+import { ClientLocalDate } from '@/components/admin/ClientLocalDate';
 import {
   AlertTriangle,
   ArrowUpDown,
@@ -63,6 +70,7 @@ interface CampaignSummary {
   id: string;
   name: string;
   status: string;
+  workflowMode: 'verification' | 'direct';
   createdAt: string;
   activatedAt: string | null;
   createdBy: string;
@@ -81,6 +89,11 @@ interface CampaignSummary {
   sendingPaused: boolean;
   remindersPaused: boolean;
   enforcementPaused: boolean;
+  executionPaused: boolean;
+  directOffboardReason: string | null;
+  directOffboardReference: string | null;
+  finalNoticeSentCount: number;
+  finalNoticeFailureCount: number;
   currentWave: number;
 }
 
@@ -102,6 +115,9 @@ interface CampaignRecipient {
   verifiedAt: string | null;
   enforcedAt: string | null;
   lastError: string | null;
+  finalNoticeStatus: string;
+  finalNoticeSentAt: string | null;
+  finalNoticeError: string | null;
   latestExtension?: {
     id: string;
     status: string;
@@ -129,7 +145,14 @@ interface CampaignDetail extends CampaignSummary {
   statusCounts?: Record<string, number>;
 }
 
-interface RollbackPreview {
+interface OperationPreview {
+  previewId: string;
+  digest: string;
+  expiresAt: string;
+  kind: 'activation' | 'rollback';
+  idempotencyKey: string;
+  downloadUrl?: string;
+  summary: { workflowMode?: 'verification' | 'direct'; total: number; executable: number; conflicts: number };
   total: number;
   rollbackable: number;
   conflicts: number;
@@ -140,12 +163,16 @@ interface RollbackPreview {
     actions: string[];
     conflicts: string[];
     rollbackable: boolean;
+    executable?: boolean;
   }>;
 }
 
 interface ProcessAllPreview {
   campaignId: string;
+  previewDigest: string;
+  previewedAt: string;
   campaignStatus: string;
+  workflowMode: 'verification' | 'direct';
   runnable: boolean;
   sections: {
     initialEmails: { count: number; paused: boolean; description: string };
@@ -162,6 +189,15 @@ interface ProcessAllPreview {
       count: number;
       adDisables: number;
       vpnRevocations: number;
+      paused: boolean;
+      description: string;
+    };
+    directOffboarding: {
+      count: number;
+      adDisables: number;
+      vpnRevocations: number;
+      sessionRevocations: number;
+      finalNotices: number;
       paused: boolean;
       description: string;
     };
@@ -194,12 +230,90 @@ interface ExtensionPreview {
   items: ExtensionPreviewItem[];
 }
 
+interface ExtensionReminder {
+  id: string;
+  value: string;
+}
+
 type SortDirection = 'asc' | 'desc';
 type SortState<T extends string> = { key: T; direction: SortDirection };
 
 interface OffboardCampaignsPanelProps {
   accounts?: SelectableCampaignAccount[];
   accountsLoading?: boolean;
+  activeView?: 'campaigns' | 'dry-run';
+  onViewChange?: (view: 'campaigns' | 'dry-run') => void;
+}
+
+const EMPTY_CAMPAIGN_ACCOUNTS: SelectableCampaignAccount[] = [];
+
+type ActivationDraft = {
+  preview: OperationPreview | null;
+  dialogOpen: boolean;
+  directAcknowledgement: string;
+  directIrreversibleAcknowledgement: boolean;
+};
+
+const EMPTY_ACTIVATION_DRAFT: ActivationDraft = {
+  preview: null,
+  dialogOpen: false,
+  directAcknowledgement: '',
+  directIrreversibleAcknowledgement: false,
+};
+
+type ActivationDraftAction =
+  | { type: 'open'; preview: OperationPreview }
+  | { type: 'close' }
+  | { type: 'setAcknowledgement'; value: string }
+  | { type: 'setIrreversibleAcknowledgement'; value: boolean };
+
+function activationDraftReducer(
+  state: ActivationDraft,
+  action: ActivationDraftAction,
+): ActivationDraft {
+  switch (action.type) {
+    case 'open':
+      return {
+        preview: action.preview,
+        dialogOpen: true,
+        directAcknowledgement: '',
+        directIrreversibleAcknowledgement: false,
+      };
+    case 'close':
+      return EMPTY_ACTIVATION_DRAFT;
+    case 'setAcknowledgement':
+      return { ...state, directAcknowledgement: action.value };
+    case 'setIrreversibleAcknowledgement':
+      return { ...state, directIrreversibleAcknowledgement: action.value };
+  }
+}
+
+type CampaignLoadState = {
+  campaigns: CampaignSummary[];
+  selectedCampaign: CampaignDetail | null;
+  selectedCampaignId: string | null;
+  isLoading: boolean;
+};
+
+const INITIAL_CAMPAIGN_LOAD_STATE: CampaignLoadState = {
+  campaigns: [],
+  selectedCampaign: null,
+  selectedCampaignId: null,
+  isLoading: false,
+};
+
+type CampaignLoadAction =
+  | { type: 'loading'; value: boolean }
+  | { type: 'loaded'; campaigns: CampaignSummary[]; selectedCampaign: CampaignDetail | null };
+
+function campaignLoadReducer(state: CampaignLoadState, action: CampaignLoadAction): CampaignLoadState {
+  if (action.type === 'loading') return { ...state, isLoading: action.value };
+  return {
+    campaigns: action.campaigns,
+    selectedCampaign: action.selectedCampaign,
+    selectedCampaignId: action.selectedCampaign?.id || action.campaigns[0]?.id || null,
+    isLoading: false,
+  };
 }
 
 function splitLines(value: string): string[] {
@@ -284,7 +398,7 @@ function InfoTip({ label, children }: { label: string; children: React.ReactNode
         type="button"
         aria-describedby={id}
         aria-label={`${label} information`}
-        className="inline-flex h-7 items-center gap-1 rounded-full border bg-background px-2 text-xs font-medium text-muted-foreground transition-colors hover:border-blue-300 hover:text-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+        className="inline-flex h-7 items-center gap-1 rounded-full border bg-background px-2 text-xs font-medium text-muted-foreground transition-colors hover:border-blue-300 dark:hover:border-blue-700 hover:text-blue-700 dark:hover:text-blue-200 dark:text-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
       >
         <Info className="h-3.5 w-3.5" />
         {label}
@@ -300,25 +414,29 @@ function InfoTip({ label, children }: { label: string; children: React.ReactNode
   );
 }
 
-function StatusBadge({ status }: { status: string }) {
+function OperationalStatusBadge({ status }: { status: string }) {
   if (['active', 'sent', 'verified', 'enforced', 'completed', 'rolled_back', 'info'].includes(status)) {
-    return <Badge className="bg-green-100 text-green-800 hover:bg-green-100">{status.replaceAll('_', ' ')}</Badge>;
+    return <StatusBadge tone="success">{status.replaceAll('_', ' ')}</StatusBadge>;
   }
   if (['skipped', 'enforcement_skipped', 'dry_run', 'warn'].includes(status)) {
-    return <Badge variant="secondary">{status.replaceAll('_', ' ')}</Badge>;
+    return <StatusBadge tone="warning">{status.replaceAll('_', ' ')}</StatusBadge>;
   }
   if (['cancelled', 'emergency_stopped', 'email_unknown', 'enforcement_failed', 'rollback_failed', 'error'].includes(status)) {
-    return <Badge variant="destructive">{status.replaceAll('_', ' ')}</Badge>;
+    return <StatusBadge tone={status === 'email_unknown' ? 'critical' : 'danger'}>{status.replaceAll('_', ' ')}</StatusBadge>;
   }
-  return <Badge variant="outline">{status.replaceAll('_', ' ')}</Badge>;
+  return <StatusBadge tone="neutral" emphasis="outline">{status.replaceAll('_', ' ')}</StatusBadge>;
 }
 
-function formatDate(value: string | null | undefined) {
-  return value ? new Date(value).toLocaleString() : '-';
-}
-
-function formatLastVerified(value: string | null | undefined) {
-  return value ? new Date(value).toLocaleDateString() : 'N/A';
+function CampaignDate({
+  value,
+  fallback = '-',
+  format = 'date-time',
+}: {
+  value: string | null | undefined;
+  fallback?: string;
+  format?: 'date' | 'date-time';
+}) {
+  return value ? <ClientLocalDate value={value} format={format} /> : fallback;
 }
 
 function verificationSourceLabel(source: string | null | undefined) {
@@ -336,16 +454,117 @@ function verificationSourceLabel(source: string | null | undefined) {
   }
 }
 
-export default function OffboardCampaignsPanel({ accounts = [], accountsLoading = false }: OffboardCampaignsPanelProps) {
+function OffboardRecipientsTable({
+  campaign, recipients, sort, selectedIds, allExtendableSelected, extendableIds,
+  working, canExecuteDirect, onSort, onSelectionChange, onRetryExtension,
+  onReconcileEnforcement, onReconcileFinalNotice,
+}: {
+  campaign: CampaignDetail;
+  recipients: CampaignRecipient[];
+  sort: SortState<'adUsername' | 'email' | 'linkedVpnUsername' | 'lastVerifiedAt' | 'waveNumber' | 'status' | 'deadlineAt' | 'issue'>;
+  selectedIds: Set<string>;
+  allExtendableSelected: boolean;
+  extendableIds: string[];
+  working: boolean;
+  canExecuteDirect: boolean;
+  onSort: (key: 'adUsername' | 'email' | 'linkedVpnUsername' | 'lastVerifiedAt' | 'waveNumber' | 'status' | 'deadlineAt' | 'issue') => void;
+  onSelectionChange: React.Dispatch<React.SetStateAction<Set<string>>>;
+  onRetryExtension: (extensionId: string) => Promise<void>;
+  onReconcileEnforcement: (recipientId: string, outcome: 'not_applied' | 'verified_complete') => Promise<void>;
+  onReconcileFinalNotice: (recipientId: string, outcome: 'not_delivered' | 'verified_delivered') => Promise<void>;
+}) {
+  const toggleAll = (checked: boolean) => onSelectionChange(previous => {
+    const next = new Set(previous);
+    extendableIds.forEach(id => checked ? next.add(id) : next.delete(id));
+    return next;
+  });
+  const toggleRecipient = (id: string, checked: boolean) => onSelectionChange(previous => {
+    const next = new Set(previous);
+    if (checked) next.add(id); else next.delete(id);
+    return next;
+  });
+  return <TabsContent value="recipients" className="rounded-lg border"><Table><TableHeader><TableRow><TableHead className="w-11"><Checkbox checked={allExtendableSelected} onCheckedChange={checked => toggleAll(Boolean(checked))} aria-label="Select all extendable recipients" /></TableHead>{([
+    ['User', 'adUsername'], ['Email', 'email'], ['VPN', 'linkedVpnUsername'], ['Last verified', 'lastVerifiedAt'], ['Wave', 'waveNumber'], ['Status', 'status'], ['Deadline', 'deadlineAt'], ['Issue', 'issue'],
+  ] as const).map(([label, key]) => <SortHead key={key} label={label} sortKey={key} sort={sort} onSort={onSort} />)}</TableRow></TableHeader><TableBody>{recipients.map(recipient => <OffboardRecipientRow key={recipient.id} recipient={recipient} workflowMode={campaign.workflowMode} selected={selectedIds.has(recipient.id)} working={working} canExecuteDirect={canExecuteDirect} onSelect={toggleRecipient} onRetryExtension={onRetryExtension} onReconcileEnforcement={onReconcileEnforcement} onReconcileFinalNotice={onReconcileFinalNotice} />)}{campaign.recipients.length === 0 && <TableRow><TableCell colSpan={9} className="py-8 text-center text-muted-foreground">No recipients in preview.</TableCell></TableRow>}</TableBody></Table></TabsContent>;
+}
+
+function OffboardRecipientRow({ recipient, workflowMode, selected, working, canExecuteDirect, onSelect, onRetryExtension, onReconcileEnforcement, onReconcileFinalNotice }: {
+  recipient: CampaignRecipient; workflowMode: CampaignSummary['workflowMode']; selected: boolean; working: boolean; canExecuteDirect: boolean;
+  onSelect: (id: string, checked: boolean) => void; onRetryExtension: (id: string) => Promise<void>;
+  onReconcileEnforcement: (id: string, outcome: 'not_applied' | 'verified_complete') => Promise<void>;
+  onReconcileFinalNotice: (id: string, outcome: 'not_delivered' | 'verified_delivered') => Promise<void>;
+}) {
+  const selectable = ['sent', 'enforced'].includes(recipient.status) && !recipient.verifiedAt;
+  return <TableRow><TableCell><Checkbox checked={selected} disabled={!selectable} onCheckedChange={checked => onSelect(recipient.id, Boolean(checked))} aria-label={`Select ${recipient.adUsername} for extension`} /></TableCell><TableCell className="font-mono text-sm">{recipient.adUsername}</TableCell><TableCell className="text-xs">{recipient.email}</TableCell><TableCell className="font-mono text-xs">{recipient.linkedVpnUsername || '-'}</TableCell><TableCell className="text-xs"><div><CampaignDate value={recipient.lastVerifiedAt} fallback="N/A" format="date" /></div><div className="text-muted-foreground">{verificationSourceLabel(recipient.lastVerifiedSource)}</div></TableCell><TableCell>{recipient.waveNumber >= 0 ? recipient.waveNumber : '-'}</TableCell><TableCell><OperationalStatusBadge status={recipient.status} /></TableCell><TableCell className="text-xs"><CampaignDate value={recipient.deadlineAt} /></TableCell><OffboardRecipientActions recipient={recipient} workflowMode={workflowMode} working={working} canExecuteDirect={canExecuteDirect} onRetryExtension={onRetryExtension} onReconcileEnforcement={onReconcileEnforcement} onReconcileFinalNotice={onReconcileFinalNotice} /></TableRow>;
+}
+
+function OffboardRecipientActions({ recipient, workflowMode, working, canExecuteDirect, onRetryExtension, onReconcileEnforcement, onReconcileFinalNotice }: {
+  recipient: CampaignRecipient; workflowMode: CampaignSummary['workflowMode']; working: boolean; canExecuteDirect: boolean;
+  onRetryExtension: (id: string) => Promise<void>; onReconcileEnforcement: (id: string, outcome: 'not_applied' | 'verified_complete') => Promise<void>; onReconcileFinalNotice: (id: string, outcome: 'not_delivered' | 'verified_delivered') => Promise<void>;
+}) {
+  const controlsDisabled = working || (workflowMode === 'direct' && !canExecuteDirect);
+  const retryExtension = recipient.latestExtension?.status === 'notification_failed';
+  const reconcileEnforcement = recipient.status === 'enforcement_reconciliation_required';
+  const directEnforced = workflowMode === 'direct' && recipient.status === 'enforced';
+  return <TableCell className="max-w-[320px] text-xs text-muted-foreground"><div className="truncate">{recipient.skipReason || recipient.lastError || recipient.projectedAction || '-'}</div>{retryExtension && <Button size="sm" variant="link" className="mt-1 h-auto p-0 text-xs" disabled={working} onClick={() => void onRetryExtension(recipient.latestExtension!.id)}>Retry extension email</Button>}{reconcileEnforcement && <div className="mt-2 flex flex-wrap gap-1"><Button size="sm" variant="outline" disabled={controlsDisabled} onClick={() => void onReconcileEnforcement(recipient.id, 'not_applied')}>Re-arm with evidence</Button><Button size="sm" variant="outline" disabled={controlsDisabled} onClick={() => void onReconcileEnforcement(recipient.id, 'verified_complete')}>Certify complete</Button></div>}{directEnforced && <OffboardFinalNoticeControls recipient={recipient} working={working} canExecuteDirect={canExecuteDirect} onReconcile={onReconcileFinalNotice} />}</TableCell>;
+}
+
+function OffboardFinalNoticeControls({ recipient, working, canExecuteDirect, onReconcile }: { recipient: CampaignRecipient; working: boolean; canExecuteDirect: boolean; onReconcile: (id: string, outcome: 'not_delivered' | 'verified_delivered') => Promise<void> }) {
+  return <div className="mt-2 space-y-2"><div className="flex items-center gap-2"><span>Final notice</span><OperationalStatusBadge status={recipient.finalNoticeStatus} /></div>{recipient.finalNoticeStatus === 'reconciliation_required' && <div className="flex flex-wrap gap-1"><Button size="sm" variant="outline" disabled={working || !canExecuteDirect} onClick={() => void onReconcile(recipient.id, 'not_delivered')}>Verify not delivered and retry</Button><Button size="sm" variant="outline" disabled={working || !canExecuteDirect} onClick={() => void onReconcile(recipient.id, 'verified_delivered')}>Certify delivered</Button></div>}<Button asChild size="sm" variant="link" className="h-auto p-0 text-xs"><a href={`/admin/lifecycle?search=${encodeURIComponent(recipient.adUsername)}`}>Review manual deletion eligibility in Account Lifecycle</a></Button></div>;
+}
+
+function OffboardTargetAccountsTable({ accounts, accountsLoading, selectedUsernames, workflowMode, sort, allVisibleSelected, onSort, onToggleAccount, onSelectVisible, onDeselectVisible }: {
+  accounts: SelectableCampaignAccount[]; accountsLoading: boolean; selectedUsernames: Set<string>; workflowMode: 'verification' | 'direct';
+  sort: SortState<'username' | 'email' | 'lastVerifiedAt' | 'accountEnabled'>; allVisibleSelected: boolean;
+  onSort: (key: 'username' | 'email' | 'lastVerifiedAt' | 'accountEnabled') => void; onToggleAccount: (username: string, checked: boolean | 'indeterminate') => void;
+  onSelectVisible: () => void; onDeselectVisible: () => void;
+}) {
+  return <div className="max-h-[420px] overflow-auto rounded-lg border"><Table><TableHeader><TableRow><TableHead className="w-11"><Checkbox checked={allVisibleSelected} onCheckedChange={checked => checked ? onSelectVisible() : onDeselectVisible()} aria-label="Select visible accounts" /></TableHead>{([['Account', 'username'], ['Email', 'email'], ['Last verified', 'lastVerifiedAt'], ['Status', 'accountEnabled']] as const).map(([label, key]) => <SortHead key={key} label={label} sortKey={key} sort={sort} onSort={onSort} />)}</TableRow></TableHeader><TableBody>{accounts.map(account => <OffboardTargetAccountRow key={account.dn || account.username} account={account} selected={selectedUsernames.has(normalizeUsername(account.username))} direct={workflowMode === 'direct'} onToggle={onToggleAccount} />)}{!accountsLoading && accounts.length === 0 && <TableRow><TableCell colSpan={5} className="py-8 text-center text-muted-foreground">No accounts found.</TableCell></TableRow>}{accountsLoading && <TableRow><TableCell colSpan={5} className="py-8 text-center text-muted-foreground">Loading accounts...</TableCell></TableRow>}</TableBody></Table></div>;
+}
+
+function OffboardTargetAccountRow({ account, selected, direct, onToggle }: { account: SelectableCampaignAccount; selected: boolean; direct: boolean; onToggle: (username: string, checked: boolean | 'indeterminate') => void }) {
+  return <TableRow className={selected ? 'bg-blue-50/70 dark:bg-blue-950/40' : ''}><TableCell><Checkbox checked={selected} disabled={!account.accountEnabled && !direct} onCheckedChange={checked => onToggle(account.username, checked)} aria-label={`Select ${account.username}`} /></TableCell><TableCell><div className="font-mono text-sm font-medium">{account.username}</div><div className="max-w-60 truncate text-xs text-muted-foreground">{account.displayName || '-'}</div></TableCell><TableCell className="max-w-[260px] truncate text-xs">{account.email || '-'}</TableCell><TableCell className="text-xs"><div><CampaignDate value={account.lastVerifiedAt} fallback="N/A" format="date" /></div><div className="text-muted-foreground">{verificationSourceLabel(account.lastVerifiedSource)}</div></TableCell><TableCell>{account.accountEnabled ? <Badge className="bg-green-100 dark:bg-green-950/60 text-green-800 dark:text-green-200 hover:bg-green-100 dark:bg-green-950/60">enabled</Badge> : <Badge variant="secondary">disabled</Badge>}</TableCell></TableRow>;
+}
+
+function OffboardRollbackPreviewTable({ items, sort, onSort }: { items: OperationPreview['items']; sort: SortState<'adUsername' | 'actions' | 'conflicts' | 'rollbackable'>; onSort: (key: 'adUsername' | 'actions' | 'conflicts' | 'rollbackable') => void }) {
+  return <Table><TableHeader><TableRow>{([['User', 'adUsername'], ['Actions', 'actions'], ['Conflicts', 'conflicts'], ['Ready', 'rollbackable']] as const).map(([label, key]) => <SortHead key={key} label={label} sortKey={key} sort={sort} onSort={onSort} />)}</TableRow></TableHeader><TableBody>{items.slice(0, 50).map(item => <TableRow key={item.recipientId}><TableCell className="font-mono text-sm">{item.adUsername}</TableCell><TableCell className="text-xs">{item.actions.join(', ') || '-'}</TableCell><TableCell className="max-w-[420px] whitespace-normal text-xs text-muted-foreground">{item.conflicts.join('; ') || '-'}</TableCell><TableCell>{item.rollbackable ? <Badge className="bg-green-100 dark:bg-green-950/60 text-green-800 dark:text-green-200 hover:bg-green-100 dark:bg-green-950/60">yes</Badge> : <Badge variant="secondary">no</Badge>}</TableCell></TableRow>)}</TableBody></Table>;
+}
+
+function useOffboardCampaignController({
+  accounts = EMPTY_CAMPAIGN_ACCOUNTS,
+  accountsLoading = false,
+  activeView,
+  onViewChange,
+}: OffboardCampaignsPanelProps) {
+  const navigation = useAdminNavigation();
+  const canExecuteDirect = navigation?.permissions.has('offboard.execute_direct') ?? false;
   const [isOpen, setIsOpen] = useState(true);
-  const [activeTab, setActiveTab] = useState('campaigns');
-  const [campaigns, setCampaigns] = useState<CampaignSummary[]>([]);
-  const [selectedCampaign, setSelectedCampaign] = useState<CampaignDetail | null>(null);
-  const [selectedCampaignId, setSelectedCampaignId] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
+  const [internalActiveTab, setInternalActiveTab] = useState<'campaigns' | 'dry-run'>('campaigns');
+  const activeTab = activeView ?? internalActiveTab;
+  const setActiveTab = (view: string) => {
+    if (view !== 'campaigns' && view !== 'dry-run') return;
+    setInternalActiveTab(view);
+    onViewChange?.(view);
+  };
+  const [campaignLoad, dispatchCampaignLoad] = useReducer(
+    campaignLoadReducer,
+    INITIAL_CAMPAIGN_LOAD_STATE,
+  );
+  const { campaigns, selectedCampaign, selectedCampaignId, isLoading } = campaignLoad;
   const [isWorking, setIsWorking] = useState(false);
-  const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [rollbackPreview, setRollbackPreview] = useState<RollbackPreview | null>(null);
+  const [message, setMessage] = useState<{ type: 'success' | 'warning' | 'error'; text: string } | null>(null);
+  const [rollbackPreview, setRollbackPreview] = useState<OperationPreview | null>(null);
+  const [activationDraft, dispatchActivationDraft] = useReducer(
+    activationDraftReducer,
+    EMPTY_ACTIVATION_DRAFT,
+  );
+  const {
+    preview: activationPreview,
+    dialogOpen: activationDialogOpen,
+    directAcknowledgement,
+    directIrreversibleAcknowledgement,
+  } = activationDraft;
+  const [rollbackDialogOpen, setRollbackDialogOpen] = useState(false);
   const [campaignSort, setCampaignSort] = useState<SortState<'name' | 'status' | 'createdAt' | 'eligibleRecipients' | 'sentCount' | 'verifiedCount' | 'enforcedCount'>>({ key: 'createdAt', direction: 'desc' });
   const [recipientSort, setRecipientSort] = useState<SortState<'adUsername' | 'email' | 'linkedVpnUsername' | 'lastVerifiedAt' | 'waveNumber' | 'status' | 'deadlineAt' | 'issue'>>({ key: 'waveNumber', direction: 'asc' });
   const [logSort, setLogSort] = useState<SortState<'createdAt' | 'level' | 'eventType' | 'actor' | 'message'>>({ key: 'createdAt', direction: 'desc' });
@@ -360,18 +579,23 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
     initialEmails: true,
     reminders: true,
     enforcement: true,
+    directOffboarding: false,
     overrideSendingPause: false,
     overrideRemindersPause: false,
     overrideEnforcementPause: false,
+    overrideExecutionPause: false,
   });
   const [extensionOpen, setExtensionOpen] = useState(false);
+  const [extensionMinimumDate, setExtensionMinimumDate] = useState<Date | null>(null);
   const [extensionPreview, setExtensionPreview] = useState<ExtensionPreview | null>(null);
   const [extensionRecipientIds, setExtensionRecipientIds] = useState<string[] | null>(null);
+  const reminderSequence = useRef(0);
   const [extensionForm, setExtensionForm] = useState({
     newDeadline: '',
-    reminderDates: [] as string[],
+    reminderDates: [] as ExtensionReminder[],
     note: '',
   });
+
   const minimumExtensionReminderDate = getMinimumOffboardExtensionReminderDate();
   const [logs, setLogs] = useState<CampaignLog[]>([]);
   const [logPage, setLogPage] = useState(1);
@@ -379,6 +603,7 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
   const [logTotalCount, setLogTotalCount] = useState(0);
   const [logTotalPages, setLogTotalPages] = useState(1);
   const [form, setForm] = useState({
+    workflowMode: 'verification' as 'verification' | 'direct',
     name: '',
     waveSize: 25,
     canarySize: 0,
@@ -386,6 +611,8 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
     includedUsernames: '',
     excludedUsernames: '',
     excludedEmails: '',
+    directOffboardReason: '',
+    directOffboardReference: '',
   });
 
   const targetUsernames = useMemo(() => {
@@ -414,8 +641,8 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
   ), [filteredAccounts, targetSort]);
 
   const visibleSelectableAccounts = useMemo(() => (
-    sortedTargetAccounts.filter(account => account.accountEnabled)
-  ), [sortedTargetAccounts]);
+    sortedTargetAccounts.filter(account => account.accountEnabled || form.workflowMode === 'direct')
+  ), [form.workflowMode, sortedTargetAccounts]);
 
   const allVisibleSelected = visibleSelectableAccounts.length > 0 &&
     visibleSelectableAccounts.every(account => selectedUsernames.has(normalizeUsername(account.username)));
@@ -432,6 +659,19 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
     });
   }, [selectedCampaign, recipientSort]);
 
+  const extendableRecipientIds = useMemo(() => {
+    const ids: string[] = [];
+    for (const recipient of sortedRecipients) {
+      if ((recipient.status === 'sent' || recipient.status === 'enforced') && !recipient.verifiedAt) {
+        ids.push(recipient.id);
+      }
+    }
+    return ids;
+  }, [sortedRecipients]);
+
+  const allExtendableRecipientsSelected = extendableRecipientIds.length > 0
+    && extendableRecipientIds.every(id => selectedRecipientIds.has(id));
+
   const sortedRollbackItems = useMemo(() => {
     if (!rollbackPreview) return [];
     return sortedBy(rollbackPreview.items, rollbackSort, (item, key) => {
@@ -444,6 +684,16 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
 
   const stats = useMemo(() => {
     if (!selectedCampaign) return [];
+    if (selectedCampaign.workflowMode === 'direct') {
+      return [
+        ['Eligible', selectedCampaign.eligibleRecipients],
+        ['Skipped', selectedCampaign.skippedRecipients],
+        ['Enforced', selectedCampaign.enforcedCount],
+        ['Notices sent', selectedCampaign.finalNoticeSentCount],
+        ['Notice review', selectedCampaign.finalNoticeFailureCount],
+        ['Failures', selectedCampaign.failedCount],
+      ];
+    }
     return [
       ['Eligible', selectedCampaign.eligibleRecipients],
       ['Skipped', selectedCampaign.skippedRecipients],
@@ -455,7 +705,7 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
   }, [selectedCampaign]);
 
   const fetchCampaigns = async (campaignId = selectedCampaignId) => {
-    setIsLoading(true);
+    dispatchCampaignLoad({ type: 'loading', value: true });
     try {
       const url = campaignId
         ? `/api/admin/offboard-campaigns?id=${encodeURIComponent(campaignId)}`
@@ -463,20 +713,29 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
       const response = await fetch(url);
       if (!response.ok) throw new Error('Failed to load offboard campaigns');
       const data = await response.json();
-      setCampaigns(data.campaigns || []);
-      setSelectedCampaign(data.selectedCampaign || null);
-      setSelectedCampaignId(data.selectedCampaign?.id || data.campaigns?.[0]?.id || null);
+      dispatchCampaignLoad({ type: 'loaded', campaigns: data.campaigns || [], selectedCampaign: data.selectedCampaign || null });
     } catch (error) {
       setMessage({ type: 'error', text: error instanceof Error ? error.message : 'Failed to load campaigns' });
     } finally {
-      setIsLoading(false);
+      dispatchCampaignLoad({ type: 'loading', value: false });
     }
   };
 
-  useEffect(() => {
-    fetchCampaigns(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  useSWR<{ campaigns?: CampaignSummary[]; selectedCampaign?: CampaignDetail | null }>(
+    '/api/admin/offboard-campaigns',
+    fetchJson,
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      onSuccess: (data) => {
+        dispatchCampaignLoad({ type: 'loaded', campaigns: data.campaigns || [], selectedCampaign: data.selectedCampaign || null });
+      },
+      onError: (error) => {
+        setMessage({ type: 'error', text: error instanceof Error ? error.message : 'Failed to load campaigns' });
+        dispatchCampaignLoad({ type: 'loading', value: false });
+      },
+    }
+  );
 
   const fetchLogs = async () => {
     if (!selectedCampaignId) {
@@ -505,12 +764,36 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
     }
   };
 
-  useEffect(() => {
-    fetchLogs();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedCampaignId, logPage, logPageSize, logSort.key, logSort.direction]);
+  const logParams = new URLSearchParams({
+    page: String(logPage),
+    pageSize: String(logPageSize),
+    sortKey: logSort.key,
+    sortDirection: logSort.direction,
+  });
+  useSWR<{ logs?: CampaignLog[]; pagination?: { page?: number; totalCount?: number; totalPages?: number } }>(
+    selectedCampaignId
+      ? `/api/admin/offboard-campaigns/${selectedCampaignId}/logs?${logParams}`
+      : null,
+    fetchJson,
+    {
+      keepPreviousData: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      onSuccess: (data) => {
+        setLogs(data.logs || []);
+        setLogPage(data.pagination?.page || 1);
+        setLogTotalCount(data.pagination?.totalCount || 0);
+        setLogTotalPages(data.pagination?.totalPages || 1);
+      },
+      onError: (error) => setMessage({
+        type: 'error',
+        text: error instanceof Error ? error.message : 'Failed to load campaign logs',
+      }),
+    }
+  );
 
   useEffect(() => {
+    setLogs([]);
     setSelectedRecipientIds(new Set());
     setExtensionPreview(null);
     setLogPage(1);
@@ -523,9 +806,9 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
       const response = await fn();
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || `${label} failed`);
-      setMessage({ type: 'success', text: data.message || `${label} completed` });
+      setMessage({ type: data.partial ? 'warning' : 'success', text: data.message || `${label} completed` });
       await fetchCampaigns(nextCampaignId === undefined ? data.campaign?.id || selectedCampaignId : nextCampaignId);
-      return true;
+      return !data.partial;
     } catch (error) {
       setMessage({ type: 'error', text: error instanceof Error ? error.message : `${label} failed` });
       return false;
@@ -574,6 +857,16 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
       setActiveTab('dry-run');
       return;
     }
+    if (form.workflowMode === 'direct') {
+      if (!canExecuteDirect) {
+        setMessage({ type: 'error', text: 'You need the Direct Offboarding privilege to create this reviewed route.' });
+        return;
+      }
+      if (form.directOffboardReason.trim().length < 10 || form.directOffboardReference.trim().length < 3) {
+        setMessage({ type: 'error', text: 'Direct offboarding requires a substantive reason and a ticket or change reference.' });
+        return;
+      }
+    }
 
     await runAction('Dry run', () =>
       fetchWithCsrf('/api/admin/offboard-campaigns/dry-run', {
@@ -592,14 +885,47 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
 
   const activateCampaign = async () => {
     if (!selectedCampaign) return;
-    if (!window.confirm('Activate this offboard campaign and begin wave sending?')) return;
-    await runAction('Activate campaign', () =>
-      fetchWithCsrf(`/api/admin/offboard-campaigns/${selectedCampaign.id}/activate`, { method: 'POST' })
+    setIsWorking(true);
+    setMessage(null);
+    try {
+      const response = await fetchWithCsrf(`/api/admin/offboard-campaigns/${selectedCampaign.id}/activate-preview`, { method: 'POST' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Activation preview failed');
+      dispatchActivationDraft({
+        type: 'open',
+        preview: { ...data.preview, idempotencyKey: crypto.randomUUID() },
+      });
+    } catch (error) {
+      setMessage({ type: 'error', text: error instanceof Error ? error.message : 'Activation preview failed' });
+    } finally {
+      setIsWorking(false);
+    }
+  };
+
+  const executeActivation = async () => {
+    if (!selectedCampaign || !activationPreview) return;
+    const succeeded = await runAction('Activate campaign', () =>
+      fetchWithCsrf(`/api/admin/offboard-campaigns/${selectedCampaign.id}/activate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': activationPreview.idempotencyKey },
+        body: JSON.stringify({
+          previewId: activationPreview.previewId,
+          digest: activationPreview.digest,
+          ...(selectedCampaign.workflowMode === 'direct' ? {
+            directAcknowledgement,
+            irreversibleAcknowledgement: directIrreversibleAcknowledgement,
+          } : {}),
+        }),
+      })
     );
+    if (succeeded) {
+      dispatchActivationDraft({ type: 'close' });
+    }
   };
 
   const deleteDryRun = async (campaign: CampaignSummary) => {
-    if (!window.confirm(`Delete dry run "${campaign.name}"? This removes the snapshot and cannot be undone.`)) return;
+    const decision = await requestActionImpact({ title: 'Delete offboarding dry run', description: `Delete "${campaign.name}". This removes only the dry-run snapshot and cannot be undone.`, items: [{ label: 'Campaign', value: campaign.name }, { label: 'External effects', value: 'None; this is a dry-run snapshot' }], confirmLabel: 'Delete dry run', destructive: true, evidence: 'The deletion is audited; no directory, VPN, or email action is performed.' });
+    if (!decision.confirmed) return;
     await runAction('Delete dry run', () =>
       fetchWithCsrf(`/api/admin/offboard-campaigns/${campaign.id}`, { method: 'DELETE' }),
       selectedCampaignId === campaign.id ? null : selectedCampaignId
@@ -609,7 +935,10 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
   const controlCampaign = async (action: string) => {
     if (!selectedCampaign) return;
     const destructive = action === 'cancel' || action === 'emergency_stop';
-    if (destructive && !window.confirm(`Confirm ${action.replaceAll('_', ' ')} for this campaign.`)) return;
+    if (destructive) {
+      const decision = await requestActionImpact({ title: `${action.replaceAll('_', ' ')} campaign`, description: `Apply ${action.replaceAll('_', ' ')} to ${selectedCampaign.name}.`, items: [{ label: 'Campaign', value: selectedCampaign.name }, { label: 'Queued effects', value: 'No uncertain external action is replayed automatically', tone: 'warning' }], confirmLabel: action === 'cancel' ? 'Cancel campaign' : 'Emergency stop', destructive: true, evidence: 'The control change and subsequent reconciliation state are audited.' });
+      if (!decision.confirmed) return;
+    }
     await runAction(action.replaceAll('_', ' '), () =>
       fetchWithCsrf(`/api/admin/offboard-campaigns/${selectedCampaign.id}/control`, {
         method: 'POST',
@@ -630,12 +959,14 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
       const preview = data.preview as ProcessAllPreview;
       setProcessAllPreview(preview);
       setProcessAllSelection({
-        initialEmails: preview.sections.initialEmails.count > 0,
-        reminders: preview.sections.reminders.count > 0,
-        enforcement: preview.sections.enforcement.count > 0,
+        initialEmails: preview.workflowMode === 'verification' && preview.sections.initialEmails.count > 0,
+        reminders: preview.workflowMode === 'verification' && preview.sections.reminders.count > 0,
+        enforcement: preview.workflowMode === 'verification' && preview.sections.enforcement.count > 0,
+        directOffboarding: preview.workflowMode === 'direct' && preview.sections.directOffboarding.count > 0,
         overrideSendingPause: false,
         overrideRemindersPause: false,
         overrideEnforcementPause: false,
+        overrideExecutionPause: false,
       });
       setProcessAllOpen(true);
     } catch (error) {
@@ -651,7 +982,11 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
       fetchWithCsrf(`/api/admin/offboard-campaigns/${selectedCampaign.id}/process-all`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(processAllSelection),
+        body: JSON.stringify({
+          ...processAllSelection,
+          previewDigest: processAllPreview?.previewDigest,
+          previewedAt: processAllPreview?.previewedAt,
+        }),
       })
     );
     if (succeeded) {
@@ -664,21 +999,33 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
     if (!extensionForm.newDeadline) {
       throw new Error('Choose a new deadline');
     }
+    const reminderDates: string[] = [];
+    for (const reminder of extensionForm.reminderDates) {
+      if (reminder.value) reminderDates.push(new Date(reminder.value).toISOString());
+    }
     return {
       ...(extensionRecipientIds ? { recipientIds: extensionRecipientIds } : {}),
       newDeadline: new Date(extensionForm.newDeadline).toISOString(),
-      reminderDates: extensionForm.reminderDates
-        .filter(Boolean)
-        .map(value => new Date(value).toISOString()),
+      reminderDates,
       note: extensionForm.note,
     };
   };
 
   const openExtension = (recipientIds: string[] | null) => {
+    setExtensionMinimumDate(new Date());
     setExtensionRecipientIds(recipientIds);
     setExtensionPreview(null);
     setExtensionForm({ newDeadline: '', reminderDates: [], note: '' });
     setExtensionOpen(true);
+  };
+
+  const addExtensionReminder = () => {
+    reminderSequence.current += 1;
+    setExtensionPreview(null);
+    setExtensionForm(previous => ({
+      ...previous,
+      reminderDates: [...previous.reminderDates, { id: `reminder-${reminderSequence.current}`, value: '' }],
+    }));
   };
 
   const previewExtension = async () => {
@@ -728,14 +1075,71 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
     if (succeeded) await fetchLogs();
   };
 
+  const reconcileEnforcement = async (
+    recipientId: string,
+    resolution: 'not_applied' | 'verified_complete'
+  ) => {
+    if (!selectedCampaign) return;
+    const evidence = window.prompt(
+      resolution === 'not_applied'
+        ? 'Enter evidence that no directory, VPN, or session effect occurred. This will re-arm enforcement.'
+        : 'Enter evidence that directory, VPN, and session revocation are all complete.'
+    )?.trim();
+    if (!evidence) return;
+    const succeeded = await runAction('Reconcile enforcement', () =>
+      fetchWithCsrf(
+        `/api/admin/offboard-campaigns/${selectedCampaign.id}/recipients/${recipientId}/reconcile-enforcement`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ resolution, evidence }),
+        }
+      )
+    );
+    if (succeeded) await fetchLogs();
+  };
+
+  const reconcileFinalNotice = async (
+    recipientId: string,
+    resolution: 'not_delivered' | 'verified_delivered',
+  ) => {
+    if (!selectedCampaign) return;
+    const evidence = window.prompt(
+      resolution === 'not_delivered'
+        ? 'Enter evidence that SMTP did not deliver the notice. The notice will be retried once.'
+        : 'Enter provider evidence that the completed-offboarding notice was delivered.',
+    )?.trim();
+    if (!evidence) return;
+    const succeeded = await runAction('Reconcile final notice', () =>
+      fetchWithCsrf(
+        `/api/admin/offboard-campaigns/${selectedCampaign.id}/recipients/${recipientId}/reconcile-notice`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ resolution, evidence }),
+        },
+      ),
+    );
+    if (succeeded) await fetchLogs();
+  };
+
   const loadRollbackPreview = async () => {
     if (!selectedCampaign) return;
     setIsWorking(true);
     try {
-      const response = await fetch(`/api/admin/offboard-campaigns/${selectedCampaign.id}/rollback-preview`);
+      const response = await fetchWithCsrf(`/api/admin/offboard-campaigns/${selectedCampaign.id}/rollback-preview`, { method: 'POST' });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Rollback preview failed');
-      setRollbackPreview(data.preview);
+      const preview = data.preview as OperationPreview;
+      setRollbackPreview({
+        ...preview,
+        idempotencyKey: crypto.randomUUID(),
+        total: preview.summary.total,
+        rollbackable: preview.summary.executable,
+        conflicts: preview.summary.conflicts,
+        items: preview.items.map(item => ({ ...item, rollbackable: item.executable === true })),
+      });
+      setRollbackDialogOpen(true);
     } catch (error) {
       setMessage({ type: 'error', text: error instanceof Error ? error.message : 'Rollback preview failed' });
     } finally {
@@ -744,21 +1148,138 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
   };
 
   const executeRollback = async () => {
-    if (!selectedCampaign) return;
-    if (!window.confirm('Execute rollback for all rollbackable campaign-caused changes?')) return;
-    await runAction('Rollback', () =>
-      fetchWithCsrf(`/api/admin/offboard-campaigns/${selectedCampaign.id}/rollback`, { method: 'POST' })
+    if (!selectedCampaign || !rollbackPreview) return;
+    const succeeded = await runAction('Rollback', () =>
+      fetchWithCsrf(`/api/admin/offboard-campaigns/${selectedCampaign.id}/rollback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': rollbackPreview.idempotencyKey },
+        body: JSON.stringify({ previewId: rollbackPreview.previewId, digest: rollbackPreview.digest }),
+      })
     );
-    setRollbackPreview(null);
+    if (succeeded) {
+      setRollbackDialogOpen(false);
+      setRollbackPreview(null);
+    }
   };
 
   const exportUrl = (type: 'recipients' | 'logs') =>
     selectedCampaign ? `/api/admin/offboard-campaigns/${selectedCampaign.id}/export?type=${type}` : '#';
 
+  return {
+    accounts,
+    accountsLoading,
+    activeTab,
+    setActiveTab,
+    canExecuteDirect,
+    isOpen,
+    setIsOpen,
+    isLoading,
+    isWorking,
+    message,
+    fetchCampaigns,
+    targetUsernames,
+    form,
+    setForm,
+    createDryRun,
+    selectableAccounts,
+    visibleSelectableAccounts,
+    clearSelectedAccounts,
+    selectVisibleAccounts,
+    deselectVisibleAccounts,
+    accountSearch,
+    setAccountSearch,
+    sortedTargetAccounts,
+    selectedUsernames,
+    targetSort,
+    setTargetSort,
+    allVisibleSelected,
+    toggleAccountSelection,
+    campaigns,
+    sortedCampaigns,
+    selectedCampaign,
+    campaignSort,
+    setCampaignSort,
+    deleteDryRun,
+    stats,
+    activateCampaign,
+    openProcessAll,
+    controlCampaign,
+    openExtension,
+    selectedRecipientIds,
+    sortedRecipients,
+    recipientSort,
+    setRecipientSort,
+    allExtendableRecipientsSelected,
+    extendableRecipientIds,
+    setSelectedRecipientIds,
+    retryExtensionNotification,
+    reconcileEnforcement,
+    reconcileFinalNotice,
+    exportUrl,
+    logs,
+    logPage,
+    setLogPage,
+    logPageSize,
+    setLogPageSize,
+    logTotalCount,
+    logTotalPages,
+    logSort,
+    setLogSort,
+    fetchLogs,
+    loadRollbackPreview,
+    rollbackPreview,
+    sortedRollbackItems,
+    rollbackSort,
+    setRollbackSort,
+    activationDialogOpen,
+    dispatchActivationDraft,
+    activationPreview,
+    directIrreversibleAcknowledgement,
+    directAcknowledgement,
+    executeActivation,
+    rollbackDialogOpen,
+    setRollbackDialogOpen,
+    executeRollback,
+    processAllOpen,
+    setProcessAllOpen,
+    processAllPreview,
+    processAllSelection,
+    setProcessAllSelection,
+    executeProcessAll,
+    extensionOpen,
+    setExtensionOpen,
+    extensionRecipientIds,
+    extensionForm,
+    setExtensionForm,
+    extensionMinimumDate,
+    minimumExtensionReminderDate,
+    addExtensionReminder,
+    extensionPreview,
+    setExtensionPreview,
+    previewExtension,
+    executeExtension,
+  };
+}
+
+type OffboardCampaignController = ReturnType<typeof useOffboardCampaignController>;
+
+function OffboardCampaignsWorkspace({ controller }: { controller: OffboardCampaignController }) {
+  return (
+    <>
+      <OffboardCampaignsCard controller={controller} />
+      <OffboardConfirmationDialogs controller={controller} />
+      <OffboardProcessAllDialog controller={controller} />
+      <OffboardExtensionDialog controller={controller} />
+    </>
+  );
+}
+
+function OffboardCampaignsCard({ controller }: { controller: OffboardCampaignController }) {
+  const { activeTab, setActiveTab, fetchCampaigns, isLoading, isOpen, setIsOpen, message } = controller;
   return (
     <>
     <Collapsible open={isOpen} onOpenChange={setIsOpen}>
-      <Card>
+      <Card id="offboard-campaigns" className="scroll-mt-20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
         <CollapsibleTrigger className="w-full text-left">
           <CardHeader className="flex flex-row items-center justify-between gap-4 rounded-t-lg transition-colors hover:bg-muted/50">
             <div>
@@ -777,9 +1298,16 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
         <CollapsibleContent>
           <CardContent className="space-y-6 border-t pt-5">
             {message && (
-              <Alert variant={message.type === 'error' ? 'destructive' : 'default'} className={message.type === 'success' ? 'border-green-200 bg-green-50 text-green-900' : ''}>
-                {message.type === 'error' ? <AlertTriangle className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />}
-                <AlertTitle>{message.type === 'error' ? 'Error' : 'Success'}</AlertTitle>
+              <Alert
+                variant={message.type === 'error' ? 'destructive' : 'default'}
+                className={message.type === 'success'
+                  ? 'border-green-200 bg-green-50 text-green-900 dark:border-green-900 dark:bg-green-950/40 dark:text-green-200'
+                  : message.type === 'warning'
+                    ? 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200'
+                    : ''}
+              >
+                {message.type === 'success' ? <CheckCircle2 className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
+                <AlertTitle>{message.type === 'error' ? 'Error' : message.type === 'warning' ? 'Needs review' : 'Success'}</AlertTitle>
                 <AlertDescription>{message.text}</AlertDescription>
               </Alert>
             )}
@@ -796,18 +1324,33 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                 </Button>
               </div>
 
+              <OffboardDryRunWorkspace controller={controller} />
+              <OffboardCampaignWorkspace controller={controller} />
+            </Tabs>
+          </CardContent>
+        </CollapsibleContent>
+      </Card>
+    </Collapsible>
+
+    </>
+  );
+}
+
+function OffboardDryRunWorkspace({ controller }: { controller: OffboardCampaignController }) {
+  const { accountsLoading, accountSearch, allVisibleSelected, canExecuteDirect, clearSelectedAccounts, createDryRun, deselectVisibleAccounts, form, isWorking, selectableAccounts, selectVisibleAccounts, selectedUsernames, setAccountSearch, setForm, setTargetSort, sortedTargetAccounts, targetSort, targetUsernames, toggleAccountSelection, visibleSelectableAccounts } = controller;
+  return (
               <TabsContent value="dry-run" className="space-y-5">
                 <div className="grid gap-4 xl:grid-cols-[minmax(280px,360px)_1fr]">
                   <div className="space-y-4 rounded-lg border p-4">
                     <div className="space-y-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
-                        <h3 className="text-sm font-semibold text-gray-900">Create Dry Run</h3>
+                        <h3 className="text-sm font-semibold text-foreground">Create Dry Run</h3>
                         <div className="flex flex-wrap gap-1.5">
                           <InfoTip label="Canary">
-                            Wave 0 is a small first send used to validate recipients, email wording, links, and timing.
+                            Wave 0 limits the first release. Verification sends email; direct mode performs the reviewed access changes.
                           </InfoTip>
                           <InfoTip label="Waves">
-                            Remaining recipients are grouped into batches. Each deadline begins only after that recipient&apos;s initial email succeeds.
+                            Remaining recipients are grouped into batches with an optional operator pause between each wave.
                           </InfoTip>
                           <InfoTip label="Re-enrollment">
                             Campaign offboarding removes access but does not block a future request. Use the email block list to prevent re-enrollment.
@@ -816,10 +1359,46 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                       </div>
                       <p className="mt-1 text-xs text-muted-foreground">{targetUsernames.length} target account{targetUsernames.length === 1 ? '' : 's'} selected.</p>
                     </div>
+                    <fieldset className="space-y-2">
+                      <legend className="text-sm font-medium">Offboarding route</legend>
+                      <div className="grid gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setForm(previous => ({ ...previous, workflowMode: 'verification' }))}
+                          className={`rounded-lg border p-3 text-left transition-colors ${form.workflowMode === 'verification' ? 'border-blue-400 bg-blue-50/70 dark:border-blue-800 dark:bg-blue-950/40' : 'hover:bg-muted/40'}`}
+                        >
+                          <span className="flex items-center gap-2 text-sm font-semibold"><Mail className="h-4 w-4" /> Verification campaign</span>
+                          <span className="mt-1 block text-xs leading-5 text-muted-foreground">Email each account holder, wait seven days, then enforce only when they do not verify.</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!canExecuteDirect}
+                          onClick={() => setForm(previous => ({ ...previous, workflowMode: 'direct' }))}
+                          className={`rounded-lg border p-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${form.workflowMode === 'direct' ? 'border-amber-400 bg-amber-50/70 dark:border-amber-800 dark:bg-amber-950/40' : 'hover:bg-muted/40'}`}
+                        >
+                          <span className="flex items-center gap-2 text-sm font-semibold"><ShieldAlert className="h-4 w-4" /> Direct offboarding</span>
+                          <span className="mt-1 block text-xs leading-5 text-muted-foreground">Skip verification. Disable AD, revoke linked VPN and sessions, mark the request offboarded, then send a completion notice.</span>
+                          {!canExecuteDirect && <span className="mt-1 block text-xs text-amber-700 dark:text-amber-300">Requires Direct Offboarding privilege.</span>}
+                        </button>
+                      </div>
+                    </fieldset>
                     <div className="space-y-2">
                       <Label htmlFor="offboard-name">Campaign name</Label>
                       <Input id="offboard-name" value={form.name} onChange={event => setForm({ ...form, name: event.target.value })} placeholder="Spring cleanup" />
                     </div>
+                    {form.workflowMode === 'direct' && (
+                      <div className="space-y-3 rounded-lg border border-amber-200 bg-amber-50/50 p-3 dark:border-amber-900 dark:bg-amber-950/30">
+                        <div className="space-y-2">
+                          <Label htmlFor="offboard-direct-reference">Ticket or change reference</Label>
+                          <Input id="offboard-direct-reference" value={form.directOffboardReference} onChange={event => setForm({ ...form, directOffboardReference: event.target.value })} placeholder="INC-1234 or CHG-1234" />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="offboard-direct-reason">Approved offboarding reason</Label>
+                          <Textarea id="offboard-direct-reason" value={form.directOffboardReason} onChange={event => setForm({ ...form, directOffboardReason: event.target.value })} rows={4} placeholder="Why these accounts are known to require immediate offboarding" />
+                        </div>
+                        <p className="text-xs leading-5 text-amber-900 dark:text-amber-200">This route does not delete AD objects or VPN records. Permanent deletion remains a separately reviewed manual action in Account Lifecycle.</p>
+                      </div>
+                    )}
                     <div className="grid grid-cols-2 gap-3">
                       <div className="space-y-2">
                         <Label htmlFor="offboard-wave-size">Wave size</Label>
@@ -834,7 +1413,11 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                       <Label htmlFor="offboard-pause-waves" className="text-sm">Pause after each wave</Label>
                       <Switch id="offboard-pause-waves" checked={form.pauseAfterEachWave} onCheckedChange={checked => setForm({ ...form, pauseAfterEachWave: checked })} />
                     </div>
-                    <Button onClick={createDryRun} disabled={isWorking || targetUsernames.length === 0} className="w-full gap-2">
+                    <Button
+                      onClick={createDryRun}
+                      disabled={isWorking || targetUsernames.length === 0 || (form.workflowMode === 'direct' && (!canExecuteDirect || form.directOffboardReason.trim().length < 10 || form.directOffboardReference.trim().length < 3))}
+                      className="w-full gap-2"
+                    >
                       <Send className="h-4 w-4" />
                       Create Dry Run
                     </Button>
@@ -843,7 +1426,7 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                   <div className="space-y-3 rounded-lg border p-4">
                     <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                       <div>
-                        <h3 className="text-sm font-semibold text-gray-900">Target Accounts</h3>
+                        <h3 className="text-sm font-semibold text-foreground">Target Accounts</h3>
                         <p className="mt-1 text-xs text-muted-foreground">{selectableAccounts.length} Active Directory account{selectableAccounts.length === 1 ? '' : 's'} available.</p>
                       </div>
                       <div className="flex flex-wrap gap-2">
@@ -865,65 +1448,18 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                       />
                     </div>
 
-                    <div className="max-h-[420px] overflow-auto rounded-lg border">
-                      <Table>
-                        <TableHeader>
-                          <TableRow>
-                            <TableHead className="w-11">
-                              <Checkbox
-                                checked={allVisibleSelected}
-                                onCheckedChange={checked => checked ? selectVisibleAccounts() : deselectVisibleAccounts()}
-                                aria-label="Select visible accounts"
-                              />
-                            </TableHead>
-                            <SortHead label="Account" sortKey="username" sort={targetSort} onSort={key => setTargetSort(nextSort(targetSort, key))} />
-                            <SortHead label="Email" sortKey="email" sort={targetSort} onSort={key => setTargetSort(nextSort(targetSort, key))} />
-                            <SortHead label="Last verified" sortKey="lastVerifiedAt" sort={targetSort} onSort={key => setTargetSort(nextSort(targetSort, key))} />
-                            <SortHead label="Status" sortKey="accountEnabled" sort={targetSort} onSort={key => setTargetSort(nextSort(targetSort, key))} />
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {sortedTargetAccounts.map(account => {
-                            const usernameKey = normalizeUsername(account.username);
-                            const isSelected = selectedUsernames.has(usernameKey);
-                            return (
-                              <TableRow key={account.dn || account.username} className={isSelected ? 'bg-blue-50/70' : ''}>
-                                <TableCell>
-                                  <Checkbox
-                                    checked={isSelected}
-                                    disabled={!account.accountEnabled}
-                                    onCheckedChange={checked => toggleAccountSelection(account.username, checked)}
-                                    aria-label={`Select ${account.username}`}
-                                  />
-                                </TableCell>
-                                <TableCell>
-                                  <div className="font-mono text-sm font-medium">{account.username}</div>
-                                  <div className="max-w-60 truncate text-xs text-muted-foreground">{account.displayName || '-'}</div>
-                                </TableCell>
-                                <TableCell className="max-w-[260px] truncate text-xs">{account.email || '-'}</TableCell>
-                                <TableCell className="text-xs">
-                                  <div>{formatLastVerified(account.lastVerifiedAt)}</div>
-                                  <div className="text-muted-foreground">{verificationSourceLabel(account.lastVerifiedSource)}</div>
-                                </TableCell>
-                                <TableCell>
-                                  {account.accountEnabled ? <Badge className="bg-green-100 text-green-800 hover:bg-green-100">enabled</Badge> : <Badge variant="secondary">disabled</Badge>}
-                                </TableCell>
-                              </TableRow>
-                            );
-                          })}
-                          {!accountsLoading && sortedTargetAccounts.length === 0 && (
-                            <TableRow>
-                              <TableCell colSpan={5} className="py-8 text-center text-muted-foreground">No accounts found.</TableCell>
-                            </TableRow>
-                          )}
-                          {accountsLoading && (
-                            <TableRow>
-                              <TableCell colSpan={5} className="py-8 text-center text-muted-foreground">Loading accounts...</TableCell>
-                            </TableRow>
-                          )}
-                        </TableBody>
-                      </Table>
-                    </div>
+                    <OffboardTargetAccountsTable
+                      accounts={sortedTargetAccounts}
+                      accountsLoading={accountsLoading}
+                      selectedUsernames={selectedUsernames}
+                      workflowMode={form.workflowMode}
+                      sort={targetSort}
+                      allVisibleSelected={allVisibleSelected}
+                      onSort={key => setTargetSort(nextSort(targetSort, key))}
+                      onToggleAccount={toggleAccountSelection}
+                      onSelectVisible={selectVisibleAccounts}
+                      onDeselectVisible={deselectVisibleAccounts}
+                    />
                   </div>
                 </div>
 
@@ -943,7 +1479,22 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                 </div>
               </TabsContent>
 
-              <TabsContent value="campaigns" className="space-y-5">
+
+  );
+}
+
+function OffboardCampaignWorkspace({ controller }: { controller: OffboardCampaignController }) {
+  return (
+    <TabsContent value="campaigns" className="space-y-5">
+      <OffboardCampaignList controller={controller} />
+      <OffboardCampaignDetail controller={controller} />
+    </TabsContent>
+  );
+}
+
+function OffboardCampaignList({ controller }: { controller: OffboardCampaignController }) {
+  const { campaigns, campaignSort, deleteDryRun, fetchCampaigns, isWorking, selectedCampaign, setCampaignSort, sortedCampaigns } = controller;
+  return (
                 <div className="rounded-lg border">
                   <Table>
                     <TableHeader>
@@ -964,11 +1515,14 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                           <TableCell>
                             <button type="button" onClick={() => fetchCampaigns(campaign.id)} className="text-left">
                               <div className="font-medium text-foreground">{campaign.name}</div>
-                              <div className="text-xs text-muted-foreground">by {campaign.createdBy}</div>
+                              <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+                                <span>by {campaign.createdBy}</span>
+                                <Badge variant={campaign.workflowMode === 'direct' ? 'destructive' : 'outline'}>{campaign.workflowMode === 'direct' ? 'direct' : 'verification'}</Badge>
+                              </div>
                             </button>
                           </TableCell>
-                          <TableCell><StatusBadge status={campaign.status} /></TableCell>
-                          <TableCell className="text-xs">{formatDate(campaign.createdAt)}</TableCell>
+                          <TableCell><OperationalStatusBadge status={campaign.status} /></TableCell>
+                          <TableCell className="text-xs"><CampaignDate value={campaign.createdAt} /></TableCell>
                           <TableCell>{campaign.eligibleRecipients}</TableCell>
                           <TableCell>{campaign.sentCount}</TableCell>
                           <TableCell>{campaign.verifiedCount}</TableCell>
@@ -995,95 +1549,121 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                     </TableBody>
                   </Table>
                 </div>
+  );
+}
 
-                {selectedCampaign && (
-                  <div className="space-y-4">
-                    <div className="rounded-lg border p-4">
-                      <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <h3 className="truncate text-lg font-semibold">{selectedCampaign.name}</h3>
-                            <StatusBadge status={selectedCampaign.status} />
-                            {selectedCampaign.sendingPaused && <Badge variant="outline">sending paused</Badge>}
-                            {selectedCampaign.remindersPaused && <Badge variant="outline">reminders paused</Badge>}
-                            {selectedCampaign.enforcementPaused && <Badge variant="outline">enforcement paused</Badge>}
-                          </div>
-                          <p className="mt-1 text-sm text-muted-foreground">
-                            Wave {selectedCampaign.currentWave} - size {selectedCampaign.waveSize} - canary {selectedCampaign.canarySize} - pause gates {selectedCampaign.pauseAfterEachWave ? 'on' : 'off'}
-                          </p>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            Enforced recipients are marked offboarded so they can submit a new request unless their email is on the block list.
-                          </p>
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          {selectedCampaign.status === 'dry_run' && (
-                            <>
-                              <Button size="sm" onClick={activateCampaign} disabled={isWorking} className="gap-2">
-                                <Play className="h-4 w-4" />
-                                Activate
-                              </Button>
-                              <Button size="sm" variant="outline" onClick={() => deleteDryRun(selectedCampaign)} disabled={isWorking} className="gap-2">
-                                <Trash2 className="h-4 w-4" />
-                                Delete Dry Run
-                              </Button>
-                            </>
-                          )}
-                          {selectedCampaign.status === 'active' && (
-                            <>
-                              <div className="flex items-center gap-1">
-                                <Button size="sm" onClick={openProcessAll} disabled={isWorking} className="gap-2">
-                                  <ListChecks className="h-4 w-4" />
-                                  Process All
-                                </Button>
-                                <InfoTip label="What runs">
-                                  Preview pending initial emails, reminders currently due, and expired accounts ready for AD/VPN enforcement. Reminder dates are evaluated only when Process All or the external scheduler runs.
-                                </InfoTip>
-                              </div>
-                              <Button size="sm" variant="outline" onClick={() => openExtension(null)} disabled={isWorking} className="gap-2">
-                                <CalendarClock className="h-4 w-4" />
-                                Extend Campaign
-                              </Button>
-                              <Button size="sm" variant="outline" onClick={() => controlCampaign(selectedCampaign.sendingPaused ? 'resume_wave' : 'pause_sending')} disabled={isWorking} className="gap-2">
-                                {selectedCampaign.sendingPaused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
-                                {selectedCampaign.sendingPaused ? 'Resume Wave' : 'Pause Sending'}
-                              </Button>
-                              <Button size="sm" variant="outline" onClick={() => controlCampaign(selectedCampaign.remindersPaused ? 'resume_reminders' : 'pause_reminders')} disabled={isWorking}>
-                                {selectedCampaign.remindersPaused ? 'Resume Reminders' : 'Pause Reminders'}
-                              </Button>
-                              <Button size="sm" variant="outline" onClick={() => controlCampaign(selectedCampaign.enforcementPaused ? 'resume_enforcement' : 'pause_enforcement')} disabled={isWorking}>
-                                {selectedCampaign.enforcementPaused ? 'Resume Enforcement' : 'Pause Enforcement'}
-                              </Button>
-                              <Button size="sm" variant="destructive" onClick={() => controlCampaign('emergency_stop')} disabled={isWorking} className="gap-2">
-                                <Ban className="h-4 w-4" />
-                                Emergency Stop
-                              </Button>
-                              <Button size="sm" variant="outline" onClick={() => controlCampaign('cancel')} disabled={isWorking}>
-                                Cancel
-                              </Button>
-                            </>
-                          )}
-                        </div>
-                      </div>
+function OffboardCampaignDetail({ controller }: { controller: OffboardCampaignController }) {
+  if (!controller.selectedCampaign) return null;
+  return (
+    <div className="space-y-4">
+      <OffboardCampaignSummary controller={controller} />
+      <OffboardCampaignDetailTabs controller={controller} />
+    </div>
+  );
+}
 
-                      <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
-                        {stats.map(([label, value]) => (
-                          <div key={label} className="rounded-md border bg-muted/20 p-3">
-                            <p className="text-xs text-muted-foreground">{label}</p>
-                            <p className="mt-1 text-xl font-semibold">{value}</p>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
+function OffboardCampaignSummary({ controller }: { controller: OffboardCampaignController }) {
+  const { selectedCampaign, stats } = controller;
+  if (!selectedCampaign) return null;
+  return (
+    <div className="rounded-lg border p-4">
+      <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+        <OffboardCampaignIdentity campaign={selectedCampaign} />
+        <OffboardCampaignControls controller={controller} campaign={selectedCampaign} />
+      </div>
+      <OffboardCampaignStats stats={stats} />
+    </div>
+  );
+}
 
+function OffboardCampaignIdentity({ campaign }: { campaign: CampaignDetail }) {
+  return (
+    <div className="min-w-0">
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="truncate text-lg font-semibold">{campaign.name}</h3>
+        <OperationalStatusBadge status={campaign.status} />
+        <Badge variant={campaign.workflowMode === 'direct' ? 'destructive' : 'outline'}>
+          {campaign.workflowMode === 'direct' ? 'direct offboarding' : 'verification campaign'}
+        </Badge>
+        {campaign.executionPaused && <Badge variant="outline">execution paused</Badge>}
+        {campaign.sendingPaused && <Badge variant="outline">sending paused</Badge>}
+        {campaign.remindersPaused && <Badge variant="outline">reminders paused</Badge>}
+        {campaign.enforcementPaused && <Badge variant="outline">enforcement paused</Badge>}
+      </div>
+      <p className="mt-1 text-sm text-muted-foreground">
+        Wave {campaign.currentWave} - size {campaign.waveSize} - canary {campaign.canarySize} - pause gates {campaign.pauseAfterEachWave ? 'on' : 'off'}
+      </p>
+      <p className="mt-1 text-xs text-muted-foreground">
+        {campaign.workflowMode === 'direct'
+          ? `Reference ${campaign.directOffboardReference || '-'} · ${campaign.directOffboardReason || 'No reason recorded'}`
+          : 'Enforced recipients are marked offboarded so they can submit a new request unless their email is on the block list.'}
+      </p>
+    </div>
+  );
+}
+
+function OffboardCampaignControls({ controller, campaign }: { controller: OffboardCampaignController; campaign: CampaignDetail }) {
+  if (campaign.status === 'dry_run') return <OffboardDryRunControls controller={controller} campaign={campaign} />;
+  if (campaign.status === 'active') return <OffboardActiveCampaignControls controller={controller} campaign={campaign} />;
+  return null;
+}
+
+function OffboardDryRunControls({ controller, campaign }: { controller: OffboardCampaignController; campaign: CampaignDetail }) {
+  const { activateCampaign, canExecuteDirect, deleteDryRun, isWorking } = controller;
+  return (
+    <div className="flex flex-wrap gap-2">
+      <Button size="sm" onClick={activateCampaign} disabled={isWorking || (campaign.workflowMode === 'direct' && !canExecuteDirect)} className="gap-2"><Play className="h-4 w-4" />Activate</Button>
+      <Button size="sm" variant="outline" onClick={() => deleteDryRun(campaign)} disabled={isWorking} className="gap-2"><Trash2 className="h-4 w-4" />Delete Dry Run</Button>
+    </div>
+  );
+}
+
+function OffboardActiveCampaignControls({ controller, campaign }: { controller: OffboardCampaignController; campaign: CampaignDetail }) {
+  const { canExecuteDirect, controlCampaign, isWorking, openProcessAll } = controller;
+  return (
+    <div className="flex flex-wrap gap-2">
+      <div className="flex items-center gap-1">
+        <Button size="sm" onClick={openProcessAll} disabled={isWorking || (campaign.workflowMode === 'direct' && !canExecuteDirect)} className="gap-2"><ListChecks className="h-4 w-4" />Process All</Button>
+        <InfoTip label="What runs">{campaign.workflowMode === 'direct' ? 'Preview the current reviewed wave before disabling AD, revoking VPN and sessions, and sending the completion notice.' : 'Preview pending initial emails, reminders currently due, and expired accounts ready for AD/VPN enforcement. Reminder dates are evaluated only when Process All or the external scheduler runs.'}</InfoTip>
+      </div>
+      {campaign.workflowMode === 'direct'
+        ? <Button size="sm" variant="outline" onClick={() => controlCampaign(campaign.executionPaused ? 'resume_execution' : 'pause_execution')} disabled={isWorking || !canExecuteDirect} className="gap-2">{campaign.executionPaused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}{campaign.executionPaused ? 'Resume Direct Wave' : 'Pause Direct Work'}</Button>
+        : <OffboardVerificationCampaignControls controller={controller} campaign={campaign} />}
+      <Button size="sm" variant="destructive" onClick={() => controlCampaign('emergency_stop')} disabled={isWorking} className="gap-2"><Ban className="h-4 w-4" />Emergency Stop</Button>
+      <Button size="sm" variant="outline" onClick={() => controlCampaign('cancel')} disabled={isWorking}>Cancel</Button>
+    </div>
+  );
+}
+
+function OffboardVerificationCampaignControls({ controller, campaign }: { controller: OffboardCampaignController; campaign: CampaignDetail }) {
+  const { controlCampaign, isWorking, openExtension } = controller;
+  return (
+    <>
+      <Button size="sm" variant="outline" onClick={() => openExtension(null)} disabled={isWorking} className="gap-2"><CalendarClock className="h-4 w-4" />Extend Campaign</Button>
+      <Button size="sm" variant="outline" onClick={() => controlCampaign(campaign.sendingPaused ? 'resume_wave' : 'pause_sending')} disabled={isWorking} className="gap-2">{campaign.sendingPaused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}{campaign.sendingPaused ? 'Resume Wave' : 'Pause Sending'}</Button>
+      <Button size="sm" variant="outline" onClick={() => controlCampaign(campaign.remindersPaused ? 'resume_reminders' : 'pause_reminders')} disabled={isWorking}>{campaign.remindersPaused ? 'Resume Reminders' : 'Pause Reminders'}</Button>
+      <Button size="sm" variant="outline" onClick={() => controlCampaign(campaign.enforcementPaused ? 'resume_enforcement' : 'pause_enforcement')} disabled={isWorking}>{campaign.enforcementPaused ? 'Resume Enforcement' : 'Pause Enforcement'}</Button>
+    </>
+  );
+}
+
+function OffboardCampaignStats({ stats }: { stats: Array<(string | number)[]> }) {
+  return <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-6">{stats.map(([label, value]) => <div key={label} className="rounded-md border bg-muted/20 p-3"><p className="text-xs text-muted-foreground">{label}</p><p className="mt-1 text-xl font-semibold">{value}</p></div>)}</div>;
+}
+
+function OffboardCampaignDetailTabs({ controller }: { controller: OffboardCampaignController }) {
+  const { allExtendableRecipientsSelected, canExecuteDirect, executeRollback, exportUrl, isWorking, loadRollbackPreview, logPage, logPageSize, logSort, logTotalCount, logTotalPages, logs, openExtension, recipientSort, reconcileEnforcement, reconcileFinalNotice, retryExtensionNotification, rollbackPreview, rollbackSort, selectedCampaign, selectedRecipientIds, setLogPage, setLogPageSize, setLogSort, setRecipientSort, setRollbackSort, setSelectedRecipientIds, sortedRecipients, sortedRollbackItems, extendableRecipientIds } = controller;
+  if (!selectedCampaign) return null;
+  return (
                     <Tabs defaultValue="recipients">
                       <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                         <TabsList>
                           <TabsTrigger value="recipients">Recipients</TabsTrigger>
                           <TabsTrigger value="logs">Logs</TabsTrigger>
-                          <TabsTrigger value="rollback">Rollback</TabsTrigger>
+                          {selectedCampaign.workflowMode !== 'direct' && <TabsTrigger value="rollback">Rollback</TabsTrigger>}
                         </TabsList>
                         <div className="flex flex-wrap gap-2">
-                          {selectedCampaign.status === 'active' && (
+                          {selectedCampaign.status === 'active' && selectedCampaign.workflowMode === 'verification' && (
                             <Button
                               variant="outline"
                               size="sm"
@@ -1110,95 +1690,21 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                         </div>
                       </div>
 
-                      <TabsContent value="recipients" className="rounded-lg border">
-                        <Table>
-                          <TableHeader>
-                            <TableRow>
-                              <TableHead className="w-11">
-                                <Checkbox
-                                  checked={
-                                    sortedRecipients.some(recipient => ['sent', 'enforced'].includes(recipient.status) && !recipient.verifiedAt) &&
-                                    sortedRecipients
-                                      .filter(recipient => ['sent', 'enforced'].includes(recipient.status) && !recipient.verifiedAt)
-                                      .every(recipient => selectedRecipientIds.has(recipient.id))
-                                  }
-                                  onCheckedChange={checked => {
-                                    const eligibleIds = sortedRecipients
-                                      .filter(recipient => ['sent', 'enforced'].includes(recipient.status) && !recipient.verifiedAt)
-                                      .map(recipient => recipient.id);
-                                    setSelectedRecipientIds(previous => {
-                                      const next = new Set(previous);
-                                      eligibleIds.forEach(id => checked ? next.add(id) : next.delete(id));
-                                      return next;
-                                    });
-                                  }}
-                                  aria-label="Select all extendable recipients"
-                                />
-                              </TableHead>
-                              <SortHead label="User" sortKey="adUsername" sort={recipientSort} onSort={key => setRecipientSort(nextSort(recipientSort, key))} />
-                              <SortHead label="Email" sortKey="email" sort={recipientSort} onSort={key => setRecipientSort(nextSort(recipientSort, key))} />
-                              <SortHead label="VPN" sortKey="linkedVpnUsername" sort={recipientSort} onSort={key => setRecipientSort(nextSort(recipientSort, key))} />
-                              <SortHead label="Last verified" sortKey="lastVerifiedAt" sort={recipientSort} onSort={key => setRecipientSort(nextSort(recipientSort, key))} />
-                              <SortHead label="Wave" sortKey="waveNumber" sort={recipientSort} onSort={key => setRecipientSort(nextSort(recipientSort, key))} />
-                              <SortHead label="Status" sortKey="status" sort={recipientSort} onSort={key => setRecipientSort(nextSort(recipientSort, key))} />
-                              <SortHead label="Deadline" sortKey="deadlineAt" sort={recipientSort} onSort={key => setRecipientSort(nextSort(recipientSort, key))} />
-                              <SortHead label="Issue" sortKey="issue" sort={recipientSort} onSort={key => setRecipientSort(nextSort(recipientSort, key))} />
-                            </TableRow>
-                          </TableHeader>
-                          <TableBody>
-                            {sortedRecipients.map(recipient => (
-                              <TableRow key={recipient.id}>
-                                <TableCell>
-                                  <Checkbox
-                                    checked={selectedRecipientIds.has(recipient.id)}
-                                    disabled={!['sent', 'enforced'].includes(recipient.status) || Boolean(recipient.verifiedAt)}
-                                    onCheckedChange={checked => {
-                                      setSelectedRecipientIds(previous => {
-                                        const next = new Set(previous);
-                                        if (checked) next.add(recipient.id);
-                                        else next.delete(recipient.id);
-                                        return next;
-                                      });
-                                    }}
-                                    aria-label={`Select ${recipient.adUsername} for extension`}
-                                  />
-                                </TableCell>
-                                <TableCell className="font-mono text-sm">{recipient.adUsername}</TableCell>
-                                <TableCell className="text-xs">{recipient.email}</TableCell>
-                                <TableCell className="font-mono text-xs">{recipient.linkedVpnUsername || '-'}</TableCell>
-                                <TableCell className="text-xs">
-                                  <div>{formatLastVerified(recipient.lastVerifiedAt)}</div>
-                                  <div className="text-muted-foreground">{verificationSourceLabel(recipient.lastVerifiedSource)}</div>
-                                </TableCell>
-                                <TableCell>{recipient.waveNumber >= 0 ? recipient.waveNumber : '-'}</TableCell>
-                                <TableCell><StatusBadge status={recipient.status} /></TableCell>
-                                <TableCell className="text-xs">{formatDate(recipient.deadlineAt)}</TableCell>
-                                <TableCell className="max-w-[320px] text-xs text-muted-foreground">
-                                  <div className="truncate">
-                                    {recipient.skipReason || recipient.lastError || recipient.projectedAction || '-'}
-                                  </div>
-                                  {recipient.latestExtension?.status === 'notification_failed' && (
-                                    <Button
-                                      size="sm"
-                                      variant="link"
-                                      className="mt-1 h-auto p-0 text-xs"
-                                      disabled={isWorking}
-                                      onClick={() => retryExtensionNotification(recipient.latestExtension!.id)}
-                                    >
-                                      Retry extension email
-                                    </Button>
-                                  )}
-                                </TableCell>
-                              </TableRow>
-                            ))}
-                            {selectedCampaign.recipients.length === 0 && (
-                              <TableRow>
-                                <TableCell colSpan={9} className="py-8 text-center text-muted-foreground">No recipients in preview.</TableCell>
-                              </TableRow>
-                            )}
-                          </TableBody>
-                        </Table>
-                      </TabsContent>
+                      <OffboardRecipientsTable
+                        campaign={selectedCampaign}
+                        recipients={sortedRecipients}
+                        sort={recipientSort}
+                        selectedIds={selectedRecipientIds}
+                        allExtendableSelected={allExtendableRecipientsSelected}
+                        extendableIds={extendableRecipientIds}
+                        working={isWorking}
+                        canExecuteDirect={canExecuteDirect}
+                        onSort={key => setRecipientSort(nextSort(recipientSort, key))}
+                        onSelectionChange={setSelectedRecipientIds}
+                        onRetryExtension={retryExtensionNotification}
+                        onReconcileEnforcement={reconcileEnforcement}
+                        onReconcileFinalNotice={reconcileFinalNotice}
+                      />
 
                       <TabsContent value="logs" className="rounded-lg border">
                         <Table>
@@ -1214,8 +1720,8 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                           <TableBody>
                             {logs.map(log => (
                               <TableRow key={log.id}>
-                                <TableCell className="text-xs">{formatDate(log.createdAt)}</TableCell>
-                                <TableCell><StatusBadge status={log.level} /></TableCell>
+                                <TableCell className="text-xs"><CampaignDate value={log.createdAt} /></TableCell>
+                                <TableCell><OperationalStatusBadge status={log.level} /></TableCell>
                                 <TableCell className="font-mono text-xs">{log.eventType}</TableCell>
                                 <TableCell className="text-xs">{log.actor || '-'}</TableCell>
                                 <TableCell className="max-w-[520px] whitespace-normal text-sm">{log.message}</TableCell>
@@ -1282,7 +1788,7 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                         </div>
                       </TabsContent>
 
-                      <TabsContent value="rollback" className="space-y-4 rounded-lg border p-4">
+                      {selectedCampaign.workflowMode !== 'direct' && <TabsContent value="rollback" className="space-y-4 rounded-lg border p-4">
                         <div className="flex flex-wrap items-center gap-2">
                           <Button variant="outline" size="sm" onClick={loadRollbackPreview} disabled={isWorking} className="gap-2">
                             <RotateCcw className="h-4 w-4" />
@@ -1314,69 +1820,143 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                                 <p className="text-xl font-semibold">{rollbackPreview.total}</p>
                               </div>
                             </div>
-                            <Table>
-                              <TableHeader>
-                                <TableRow>
-                                  <SortHead label="User" sortKey="adUsername" sort={rollbackSort} onSort={key => setRollbackSort(nextSort(rollbackSort, key))} />
-                                  <SortHead label="Actions" sortKey="actions" sort={rollbackSort} onSort={key => setRollbackSort(nextSort(rollbackSort, key))} />
-                                  <SortHead label="Conflicts" sortKey="conflicts" sort={rollbackSort} onSort={key => setRollbackSort(nextSort(rollbackSort, key))} />
-                                  <SortHead label="Ready" sortKey="rollbackable" sort={rollbackSort} onSort={key => setRollbackSort(nextSort(rollbackSort, key))} />
-                                </TableRow>
-                              </TableHeader>
-                              <TableBody>
-                                {sortedRollbackItems.slice(0, 50).map(item => (
-                                  <TableRow key={item.recipientId}>
-                                    <TableCell className="font-mono text-sm">{item.adUsername}</TableCell>
-                                    <TableCell className="text-xs">{item.actions.join(', ') || '-'}</TableCell>
-                                    <TableCell className="max-w-[420px] whitespace-normal text-xs text-muted-foreground">{item.conflicts.join('; ') || '-'}</TableCell>
-                                    <TableCell>{item.rollbackable ? <Badge className="bg-green-100 text-green-800 hover:bg-green-100">yes</Badge> : <Badge variant="secondary">no</Badge>}</TableCell>
-                                  </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
+                            <OffboardRollbackPreviewTable
+                              items={sortedRollbackItems}
+                              sort={rollbackSort}
+                              onSort={key => setRollbackSort(nextSort(rollbackSort, key))}
+                            />
                           </div>
                         ) : (
                           <p className="text-sm text-muted-foreground">Preview rollback before executing. Conflicts require manual review and are not changed.</p>
                         )}
-                      </TabsContent>
+                      </TabsContent>}
                     </Tabs>
-                  </div>
-                )}
-              </TabsContent>
-            </Tabs>
-          </CardContent>
-        </CollapsibleContent>
-      </Card>
-    </Collapsible>
+  );
+}
 
+function OffboardConfirmationDialogs({ controller }: { controller: OffboardCampaignController }) {
+  return (
+    <>
+      <OffboardActivationDialog controller={controller} />
+      <OffboardRollbackDialog controller={controller} />
+    </>
+  );
+}
+
+function OffboardActivationDialog({ controller }: { controller: OffboardCampaignController }) {
+  const { activationDialogOpen, dispatchActivationDraft } = controller;
+  return <OffboardActivationImpact controller={controller} open={activationDialogOpen} onOpenChange={open => { if (!open) dispatchActivationDraft({ type: 'close' }); }} />;
+}
+
+function OffboardActivationImpact({ controller, open, onOpenChange }: { controller: OffboardCampaignController; open: boolean; onOpenChange: (open: boolean) => void }) {
+  const { activationPreview, directAcknowledgement, directIrreversibleAcknowledgement, dispatchActivationDraft, executeActivation, isWorking, selectedCampaign } = controller;
+  const direct = selectedCampaign?.workflowMode === 'direct';
+  const executable = activationPreview?.summary.executable || 0;
+  const acknowledgement = `DIRECT OFFBOARD ${executable} ${executable === 1 ? 'ACCOUNT' : 'ACCOUNTS'}`;
+  return (
+    <ActionImpactDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={direct ? 'Activate reviewed direct offboarding' : 'Activate offboard campaign'}
+      description={direct ? 'This begins reviewed access removal in waves. It cannot be rolled back; future access requires a new request.' : 'This releases only the reviewed first wave. The server rechecks preview scope before it queues any delivery.'}
+      items={activationImpactItems(selectedCampaign, activationPreview)}
+      evidence={<OffboardActivationEvidence controller={controller} />}
+      input={direct ? { label: `Type ${acknowledgement}`, required: true } : undefined}
+      inputValue={directAcknowledgement}
+      onInputValueChange={value => dispatchActivationDraft({ type: 'setAcknowledgement', value })}
+      confirmDisabled={Boolean(direct && (!directIrreversibleAcknowledgement || directAcknowledgement !== acknowledgement))}
+      confirmLabel={direct ? 'Begin direct offboarding' : 'Activate and release first wave'}
+      working={isWorking}
+      destructive
+      onConfirm={executeActivation}
+    />
+  );
+}
+
+function activationImpactItems(campaign: CampaignDetail | null, preview: OperationPreview | null) {
+  const direct = campaign?.workflowMode === 'direct';
+  return [
+    { label: 'Campaign', value: campaign?.name || '-' },
+    { label: 'Scope', value: `${preview?.summary.executable || 0} executable recipient${preview?.summary.executable === 1 ? '' : 's'}` },
+    { label: 'External effects', value: direct ? 'Disable AD, revoke linked VPN and sessions, mark the request offboarded, then send the completed-offboarding notice.' : 'Sends initial verification email; enforcement remains scheduled by campaign deadline.' },
+    { label: 'Deletion', value: direct ? 'No AD object or VPN record is deleted. Permanent deletion remains manual in Account Lifecycle.' : 'Not part of campaign activation.' },
+    { label: 'Reversibility', value: direct ? 'Direct offboarding cannot be rolled back. Future access requires a new account request.' : 'Use exact rollback preview; live-state conflicts are not overwritten.' },
+  ];
+}
+
+function OffboardActivationEvidence({ controller }: { controller: OffboardCampaignController }) {
+  const { activationPreview, directIrreversibleAcknowledgement, dispatchActivationDraft, selectedCampaign } = controller;
+  if (!activationPreview) return null;
+  return (
+    <div className="space-y-3">
+      <p>Exact preview {activationPreview.previewId} expires <CampaignDate value={activationPreview.expiresAt} />. The server rechecks live LDAP/VPN/request state before claiming execution.{activationPreview.downloadUrl && <> <a className="underline" href={activationPreview.downloadUrl}>Download exact set</a>.</>}</p>
+      {selectedCampaign?.workflowMode === 'direct' && <label className="flex items-start gap-2 text-foreground"><Checkbox checked={directIrreversibleAcknowledgement} onCheckedChange={checked => dispatchActivationDraft({ type: 'setIrreversibleAcknowledgement', value: Boolean(checked) })} /><span>I understand this immediately removes access and sends the account holder a completed-offboarding notice.</span></label>}
+    </div>
+  );
+}
+
+function OffboardRollbackDialog({ controller }: { controller: OffboardCampaignController }) {
+  const { executeRollback, isWorking, rollbackDialogOpen, rollbackPreview, selectedCampaign, setRollbackDialogOpen } = controller;
+  return (
+    <ActionImpactDialog
+      open={rollbackDialogOpen}
+      onOpenChange={setRollbackDialogOpen}
+      title="Execute exact rollback scope"
+      description="Rollback only performs the actions from this reviewed snapshot. It preserves live safety checks; rows that changed after enforcement are marked for reconciliation instead of being replayed."
+      items={[
+        { label: 'Campaign', value: selectedCampaign?.name || '-' },
+        { label: 'Rollback scope', value: `${rollbackPreview?.rollbackable || 0} recipient${rollbackPreview?.rollbackable === 1 ? '' : 's'}` },
+        { label: 'Conflicts', value: `${rollbackPreview?.conflicts || 0} unchanged`, tone: rollbackPreview?.conflicts ? 'warning' : 'default' },
+        { label: 'External effects', value: 'May enable AD accounts and restore VPN access where the live state proves this campaign made the change.' },
+        { label: 'Evidence', value: 'Per-recipient outcomes and lifecycle action idempotency keys are retained.' },
+      ]}
+      evidence={rollbackPreview ? <span>Exact preview {rollbackPreview.previewId} expires <CampaignDate value={rollbackPreview.expiresAt} />. Stale or expired previews cannot execute.{rollbackPreview.downloadUrl && <> <a className="underline" href={rollbackPreview.downloadUrl}>Download exact set</a>.</>}</span> : null}
+      confirmLabel="Execute rollback"
+      working={isWorking}
+      destructive
+      onConfirm={executeRollback}
+    />
+
+  );
+}
+
+function OffboardProcessAllDialog({ controller }: { controller: OffboardCampaignController }) {
+  const { executeProcessAll, isWorking, processAllOpen, processAllPreview, processAllSelection, setProcessAllOpen, setProcessAllSelection } = controller;
+  return (
     <Dialog open={processAllOpen} onOpenChange={setProcessAllOpen}>
       <DialogContent className="max-h-[90vh] max-w-3xl overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Process All Due Campaign Work</DialogTitle>
           <DialogDescription>
-            Review the live counts, choose the work categories to run, and explicitly override paused sections only for this operation.
+            {processAllPreview?.workflowMode === 'direct'
+              ? 'Review the current direct-offboarding wave. Pauses stop new recipient claims; they cannot interrupt an external call already in progress.'
+              : 'Review the live counts, choose the work categories to run, and explicitly override paused sections only for this operation. Initial sending still stops at configured wave approval gates.'}
           </DialogDescription>
         </DialogHeader>
         {processAllPreview && (
           <div className="space-y-4">
             <div className="grid gap-3 md:grid-cols-3">
-              {([
-                ['initialEmails', 'Initial Emails', Mail],
-                ['reminders', 'Due Reminders', RefreshCw],
-                ['enforcement', 'Expired Enforcement', ShieldAlert],
-              ] as const).map(([key, label, Icon]) => {
+              {(processAllPreview.workflowMode === 'direct'
+                ? [['directOffboarding', 'Direct Offboarding', ShieldAlert] as const]
+                : [
+                    ['initialEmails', 'Initial Emails', Mail] as const,
+                    ['reminders', 'Due Reminders', RefreshCw] as const,
+                    ['enforcement', 'Expired Enforcement', ShieldAlert] as const,
+                  ]).map(([key, label, Icon]) => {
                 const section = processAllPreview.sections[key];
                 const selected = processAllSelection[key];
                 const overrideKey = key === 'initialEmails'
                   ? 'overrideSendingPause'
                   : key === 'reminders'
                     ? 'overrideRemindersPause'
-                    : 'overrideEnforcementPause';
+                    : key === 'directOffboarding'
+                      ? 'overrideExecutionPause'
+                      : 'overrideEnforcementPause';
                 return (
-                  <div key={key} className={`rounded-xl border p-4 ${selected ? 'border-blue-300 bg-blue-50/50' : 'bg-muted/20'}`}>
+                  <div key={key} className={`rounded-xl border p-4 ${selected ? 'border-blue-300 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/40' : 'bg-muted/20'}`}>
                     <div className="flex items-start justify-between gap-3">
                       <div className="flex items-center gap-2">
-                        <Icon className="h-4 w-4 text-blue-700" />
+                        <Icon className="h-4 w-4 text-blue-700 dark:text-blue-200" />
                         <span className="text-sm font-semibold">{label}</span>
                       </div>
                       <Checkbox
@@ -1394,7 +1974,7 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                           Day 3: {processAllPreview.sections.reminders.day3} · Day 6: {processAllPreview.sections.reminders.day6} · Extended: {processAllPreview.sections.reminders.extension}
                         </p>
                         {processAllPreview.sections.reminders.suppressedExtension > 0 && (
-                          <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs leading-5 text-amber-900">
+                          <p className="mt-2 rounded-md border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 p-2 text-xs leading-5 text-amber-900 dark:text-amber-200">
                             Suppressed unsafe extension reminders: {processAllPreview.sections.reminders.suppressedExtension}
                           </p>
                         )}
@@ -1405,8 +1985,13 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                         AD disables: {processAllPreview.sections.enforcement.adDisables} · VPN revocations: {processAllPreview.sections.enforcement.vpnRevocations}
                       </p>
                     )}
+                    {key === 'directOffboarding' && (
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        AD state checks: {processAllPreview.sections.directOffboarding.adDisables} · Reviewed VPN links: {processAllPreview.sections.directOffboarding.vpnRevocations} · Session revocations: {processAllPreview.sections.directOffboarding.sessionRevocations} · Final notices after convergence: {processAllPreview.sections.directOffboarding.finalNotices}
+                      </p>
+                    )}
                     {section.paused && (
-                      <label className="mt-3 flex items-center justify-between gap-3 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                      <label className="mt-3 flex items-center justify-between gap-3 rounded-md border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 p-2 text-xs text-amber-900 dark:text-amber-200">
                         Override pause once
                         <Switch
                           checked={Boolean(processAllSelection[overrideKey])}
@@ -1438,6 +2023,7 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
               isWorking ||
               !processAllPreview?.runnable ||
               (!processAllSelection.initialEmails && !processAllSelection.reminders && !processAllSelection.enforcement)
+              && !processAllSelection.directOffboarding
             }
             className="gap-2"
           >
@@ -1448,6 +2034,12 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
       </DialogContent>
     </Dialog>
 
+  );
+}
+
+function OffboardExtensionDialog({ controller }: { controller: OffboardCampaignController }) {
+  const { addExtensionReminder, executeExtension, extensionForm, extensionMinimumDate, extensionOpen, extensionPreview, extensionRecipientIds, isWorking, minimumExtensionReminderDate, previewExtension, setExtensionOpen, setExtensionForm, setExtensionPreview } = controller;
+  return (
     <Dialog open={extensionOpen} onOpenChange={setExtensionOpen}>
       <DialogContent className="flex max-h-[calc(100dvh-1.5rem)] w-[calc(100vw-1.5rem)] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-6xl xl:max-w-7xl">
         <DialogHeader className="shrink-0 border-b px-5 py-5 pr-12 sm:px-6">
@@ -1465,7 +2057,7 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                 label="New deadline"
                 required
                 value={extensionForm.newDeadline}
-                minDate={new Date()}
+                minDate={extensionMinimumDate ?? undefined}
                 placeholder="Choose the new deadline"
                 onChange={value => {
                   setExtensionPreview(null);
@@ -1480,10 +2072,7 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                     size="sm"
                     variant="outline"
                     disabled={extensionForm.reminderDates.length >= 5}
-                    onClick={() => {
-                      setExtensionPreview(null);
-                      setExtensionForm(previous => ({ ...previous, reminderDates: [...previous.reminderDates, ''] }));
-                    }}
+                    onClick={addExtensionReminder}
                     className="h-8 gap-1"
                   >
                     <Plus className="h-3.5 w-3.5" />
@@ -1496,10 +2085,10 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                 <p className="text-xs leading-5 text-muted-foreground">
                   Custom reminders must be at least {OFFBOARD_EXTENSION_REMINDER_MIN_LEAD_HOURS} hours after this extension is created and before the new deadline. They send only when Process All or the scheduler processes them.
                 </p>
-                {extensionForm.reminderDates.map((value, index) => (
-                  <div key={index} className="flex min-w-0 items-start gap-2">
+                {extensionForm.reminderDates.map((reminder, index) => (
+                  <div key={reminder.id} className="flex min-w-0 items-start gap-2">
                     <DateTimePicker
-                      value={value}
+                      value={reminder.value}
                       ariaLabel={`Reminder ${index + 1} date and time`}
                       minDate={minimumExtensionReminderDate}
                       maxDate={extensionForm.newDeadline ? new Date(extensionForm.newDeadline) : undefined}
@@ -1509,7 +2098,7 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                         setExtensionPreview(null);
                         setExtensionForm(previous => ({
                           ...previous,
-                          reminderDates: previous.reminderDates.map((item, itemIndex) => itemIndex === index ? nextValue : item),
+                          reminderDates: previous.reminderDates.map(item => item.id === reminder.id ? { ...item, value: nextValue } : item),
                         }));
                       }}
                     />
@@ -1521,7 +2110,7 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                         setExtensionPreview(null);
                         setExtensionForm(previous => ({
                           ...previous,
-                          reminderDates: previous.reminderDates.filter((_, itemIndex) => itemIndex !== index),
+                          reminderDates: previous.reminderDates.filter(item => item.id !== reminder.id),
                         }));
                       }}
                       aria-label={`Remove reminder ${index + 1}`}
@@ -1588,10 +2177,10 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
                         {extensionPreview.items.map(item => (
                           <TableRow key={item.recipientId}>
                             <TableCell className="font-mono text-xs">{item.adUsername}</TableCell>
-                            <TableCell><StatusBadge status={item.status} /></TableCell>
+                            <TableCell><OperationalStatusBadge status={item.status} /></TableCell>
                             <TableCell>
                               {item.eligible
-                                ? <Badge className="bg-green-100 text-green-800 hover:bg-green-100">ready</Badge>
+                                ? <Badge className="bg-green-100 dark:bg-green-950/60 text-green-800 dark:text-green-200 hover:bg-green-100 dark:bg-green-950/60">ready</Badge>
                                 : <Badge variant="secondary">{item.excludedReason?.replaceAll('_', ' ')}</Badge>}
                             </TableCell>
                             <TableCell className="max-w-[340px] whitespace-normal text-xs text-muted-foreground">
@@ -1616,6 +2205,10 @@ export default function OffboardCampaignsPanel({ accounts = [], accountsLoading 
         </DialogFooter>
       </DialogContent>
     </Dialog>
-    </>
   );
+}
+
+export default function OffboardCampaignsPanel(props: OffboardCampaignsPanelProps) {
+  const controller = useOffboardCampaignController(props);
+  return <OffboardCampaignsWorkspace controller={controller} />;
 }

@@ -1,14 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
 import { parseAdminJson, isJsonBodyError, MAX_REQUEST_BODY_SIZE } from '@/lib/admin-json-parser';
 import { secureErrorResponse, secureJsonResponse } from '@/lib/apiResponse';
 import { AuditActions, AuditCategories, getIpAddress, getUserAgent, logAuditAction } from '@/lib/audit-log';
+import { requireModuleEnabled } from '@/lib/modules/guards';
 import { createMassEmailDraft, listMassEmailCampaigns, type CreateMassEmailInput } from '@/lib/mass-email';
 
 export async function GET(request: NextRequest) {
   try {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    if (!actorHasPermission(admin, 'communications.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
     const campaignId = request.nextUrl.searchParams.get('id');
     const result = await listMassEmailCampaigns(campaignId);
@@ -34,6 +39,12 @@ export async function POST(request: NextRequest) {
   try {
     const { admin, response } = await checkAdminAuthWithRateLimit(request);
     if (!admin || response) return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    if (!actorHasPermission(admin, 'communications.manage')) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    const moduleGuard = await requireModuleEnabled('communications');
+    if (moduleGuard) return moduleGuard;
 
     const body = await parseAdminJson<Record<string, unknown>>(request, MAX_REQUEST_BODY_SIZE.LARGE);
     const campaign = await createMassEmailDraft(body as unknown as CreateMassEmailInput, admin.username);

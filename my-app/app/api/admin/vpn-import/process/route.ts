@@ -1,11 +1,50 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { requireModuleEnabled } from '@/lib/modules/guards';
+
 import { getIpAddress, logAuditAction } from '@/lib/audit-log';
 import { encryptPassword } from '@/lib/encryption';
 import { generateStrongPassword } from '@/lib/password';
 import { appLogger } from '@/lib/logger';
 import { isJsonBodyError, MAX_REQUEST_BODY_SIZE, parseJsonWithLimit } from '@/lib/validation';
+import { searchLDAPUser } from '@/lib/ldap';
+import {
+  acquireDirectoryOwnershipFence,
+  findBatchDirectoryOwnershipClaims,
+} from '@/lib/directory-ownership-fence';
+import { acquireVpnOwnershipFence } from '@/lib/vpn-ownership-fence';
+
+const REVIEW_REQUIRED_ERROR = 'Review required before importing this account';
+const GENERIC_RECORD_PROCESSING_ERROR = 'Unable to process this import record';
+
+type ExistingRequestOwnership = {
+  ldapUsername: string | null;
+  linkedAdUsername: string | null;
+  vpnUsername: string | null;
+  linkedVpnUsername: string | null;
+};
+
+function requestOwnsImportedAccount(
+  request: ExistingRequestOwnership,
+  adUsername: string,
+  vpnUsername: string
+): boolean {
+  const canonicalAdUsername = adUsername.trim().toLowerCase();
+  const canonicalVpnUsername = vpnUsername.trim().toLowerCase();
+  const canonicalAliases = (aliases: Array<string | null>) => aliases
+    .filter((alias): alias is string => Boolean(alias?.trim()))
+    .map((alias) => alias.trim().toLowerCase());
+  const adAliases = canonicalAliases([request.ldapUsername, request.linkedAdUsername]);
+  const vpnAliases = canonicalAliases([request.vpnUsername, request.linkedVpnUsername]);
+
+  return (
+    !adAliases.some((alias) => alias !== canonicalAdUsername)
+    && !vpnAliases.some((alias) => alias !== canonicalVpnUsername)
+    && (adAliases.includes(canonicalAdUsername) || vpnAliases.includes(canonicalVpnUsername))
+  );
+}
 
 /**
  * Process a VPN import by creating VPN accounts for all matched records
@@ -24,7 +63,12 @@ export async function POST(request: NextRequest) {
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
+    const vpnModuleGuard = await requireModuleEnabled('vpn.management');
+    if (vpnModuleGuard) return vpnModuleGuard;
     const body = await parseJsonWithLimit<{ importId?: unknown }>(request, MAX_REQUEST_BODY_SIZE.SMALL);
     const { importId: reqImportId } = body;
 
@@ -59,7 +103,7 @@ export async function POST(request: NextRequest) {
 
     // Use a transaction to create all VPN accounts
     // Increase timeout for large batch imports
-    const result = await prisma.$transaction(async (tx: any) => {
+    const result = await prisma.$transaction(async (tx) => {
       let createdCount = 0;
       let errorCount = 0;
       const errors: string[] = [];
@@ -70,6 +114,32 @@ export async function POST(request: NextRequest) {
           if (!record.adUsername) {
             errorCount++;
             errors.push(`${record.vpnUsername}: No AD username found`);
+            continue;
+          }
+
+          // Match established reservation order: AD identity first, then the distinct
+          // VPN identity. The namespaces intentionally remain separate even if their
+          // usernames happen to be identical.
+          await acquireDirectoryOwnershipFence(tx, record.adUsername);
+          await acquireVpnOwnershipFence(tx, record.vpnUsername);
+
+          const currentAdUser = await searchLDAPUser(record.adUsername);
+          if (!currentAdUser) {
+            errorCount++;
+            errors.push(`${record.vpnUsername}: Matched AD account no longer exists`);
+            appLogger.warn(`Skipping VPN import record ${record.vpnUsername} - matched AD account disappeared`);
+            continue;
+          }
+
+          // A standalone batch account is already a governed portal owner. Do not create
+          // a synthetic AccessRequest/VPNAccount for it; the operator must review the
+          // existing batch lifecycle instead.
+          const batchAdOwners = await findBatchDirectoryOwnershipClaims(tx, record.adUsername, 'AD');
+          const batchVpnOwners = await findBatchDirectoryOwnershipClaims(tx, record.vpnUsername, 'VPN');
+          if (batchAdOwners.length > 0 || batchVpnOwners.length > 0) {
+            errorCount++;
+            errors.push(`${record.vpnUsername}: ${REVIEW_REQUIRED_ERROR}`);
+            appLogger.warn(`Skipping VPN import record ${record.vpnUsername} - standalone batch ownership requires review`);
             continue;
           }
 
@@ -107,18 +177,42 @@ export async function POST(request: NextRequest) {
             continue;
           }
 
-          // Check if AccessRequest already exists for this user
-          const existingAccessRequest = await tx.accessRequest.findFirst({
+          // Email can surface a candidate, but only the four identity aliases can prove
+          // portal ownership. Read a bounded set under both ownership fences so split
+          // aliases cannot be attached to an arbitrary request.
+          const existingAccessRequests = await tx.accessRequest.findMany({
             where: {
               OR: [
-                { email: userEmail.toLowerCase() },
-                { ldapUsername: record.adUsername },
-                { vpnUsername: record.vpnUsername },
-                { linkedAdUsername: record.adUsername },
+                { email: { equals: userEmail.toLowerCase(), mode: 'insensitive' } },
+                { ldapUsername: { equals: record.adUsername, mode: 'insensitive' } },
+                { linkedAdUsername: { equals: record.adUsername, mode: 'insensitive' } },
+                { vpnUsername: { equals: record.vpnUsername, mode: 'insensitive' } },
+                { linkedVpnUsername: { equals: record.vpnUsername, mode: 'insensitive' } },
               ],
               status: { notIn: ['rejected', 'offboarded'] },
             },
+            select: {
+              id: true,
+              ldapUsername: true,
+              linkedAdUsername: true,
+              vpnUsername: true,
+              linkedVpnUsername: true,
+            },
+            take: 2,
           });
+          const existingAccessRequest = existingAccessRequests[0];
+
+          // An email match alone is not portal ownership evidence. Under both
+          // ownership fences, attach exactly one request whose nonblank aliases agree
+          // with this record's AD/VPN identities; otherwise leave it for review.
+          if (existingAccessRequests.length > 1 || (existingAccessRequest && !requestOwnsImportedAccount(
+            existingAccessRequest, record.adUsername, record.vpnUsername
+          ))) {
+            errorCount++;
+            errors.push(`${record.vpnUsername}: ${REVIEW_REQUIRED_ERROR}`);
+            appLogger.warn(`Skipping VPN import record ${record.vpnUsername} - existing portal ownership does not match`);
+            continue;
+          }
 
           // Create AccessRequest if it doesn't exist (similar to infrastructure sync)
           let accessRequestId = existingAccessRequest?.id || null;
@@ -175,6 +269,7 @@ export async function POST(request: NextRequest) {
           await tx.vPNAccountStatusLog.create({
             data: {
               accountId: vpnAccount.id,
+              liveAccountId: vpnAccount.id,
               oldStatus: null,
               newStatus: 'active',
               changedBy: admin.username,
@@ -236,11 +331,13 @@ export async function POST(request: NextRequest) {
           });
 
           createdCount++;
-        } catch (error) {
+        } catch {
           errorCount++;
-          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-          errors.push(`${record.vpnUsername}: ${errorMessage}`);
-          console.error(`Failed to create VPN account for ${record.vpnUsername}:`, error);
+          errors.push(`${record.vpnUsername}: ${GENERIC_RECORD_PROCESSING_ERROR}`);
+          console.error('Failed to process VPN import record', {
+            importId: vpnImport.id,
+            recordId: record.id,
+          });
         }
       }
 

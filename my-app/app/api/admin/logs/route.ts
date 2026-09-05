@@ -1,8 +1,11 @@
+import { findAccountUsernamesByName, resolveAccountDisplayNames } from '@/lib/account-display-names';
 import { NextRequest, NextResponse } from 'next/server';
 import type { Prisma } from '@prisma/client';
-import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { checkAdminAuthWithRateLimit, checkAuditAccessWithRateLimit } from '@/lib/adminAuth';
 import { prisma } from '@/lib/prisma';
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent, sanitizeAuditDetails } from '@/lib/audit-log';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { generateCsvContent } from '@/lib/csv-security';
 import { isJsonBodyError, parseAdminJson } from '@/lib/admin-json-parser';
 
 type AuditStatsBody = {
@@ -25,16 +28,22 @@ function parseDetails(details: string | null): Record<string, unknown> | null {
 
 export async function GET(request: NextRequest) {
   try {
-    // Verify admin session with rate limiting
-    const { admin, response } = await checkAdminAuthWithRateLimit(request);
+    // Evidence surfaces accept the read-only Auditor role (audit.read) in
+    // addition to full administrators; resolution is live-directory backed
+    // and fail-closed.
+    const { admin, response } = await checkAuditAccessWithRateLimit(request);
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     // Parse query parameters
     const searchParams = request.nextUrl.searchParams;
-    const page = parseInt(searchParams.get('page') || '1');
-    const limit = parseInt(searchParams.get('limit') || '50');
+    const format = searchParams.get('format')?.trim().toLowerCase() || undefined;
+    const page = Number(searchParams.get('page') || '1');
+    const limit = Number(searchParams.get('limit') || '50');
+    if (!Number.isSafeInteger(page) || page < 1 || page > 1_000_000 || !Number.isInteger(limit) || limit < 1 || limit > 200) {
+      return NextResponse.json({ error: 'Page must be positive and rows per page must be between 1 and 200.' }, { status: 400 });
+    }
     const action = getFilterValue(searchParams, 'action');
     const category = getFilterValue(searchParams, 'category');
     const username = getFilterValue(searchParams, 'username');
@@ -50,14 +59,26 @@ export async function GET(request: NextRequest) {
     const success = getFilterValue(searchParams, 'success');
     const startDate = searchParams.get('startDate');
     const endDate = searchParams.get('endDate');
-    const search = searchParams.get('search') || undefined;
+    const search = getFilterValue(searchParams, 'search')?.slice(0, 120);
+    if ((startDate && Number.isNaN(Date.parse(startDate))) || (endDate && Number.isNaN(Date.parse(endDate)))
+      || (startDate && endDate && new Date(startDate) > new Date(endDate))) {
+      return NextResponse.json({ error: 'Choose a valid date range with the start before the end.' }, { status: 400 });
+    }
+    if (success !== undefined && success !== 'true' && success !== 'false') {
+      return NextResponse.json({ error: 'Success must be true or false.' }, { status: 400 });
+    }
 
     // Build where clause
     const where: Prisma.AuditLogWhereInput = {};
     
     if (action) where.action = action;
     if (category) where.category = category;
-    if (username) where.username = { contains: username, mode: 'insensitive' };
+    if (username) {
+      const matchingUsers = await findAccountUsernamesByName(username);
+      where.AND = [{ OR: [{ username: { contains: username, mode: 'insensitive' } },
+        ...(matchingUsers.length ? [{ username: { in: matchingUsers, mode: 'insensitive' as const } }] : []),
+      ] }];
+    }
     if (actorType) where.actorType = actorType;
     if (targetType) where.targetType = targetType;
     if (subjectUsername) where.subjectUsername = { contains: subjectUsername, mode: 'insensitive' };
@@ -80,7 +101,9 @@ export async function GET(request: NextRequest) {
 
     // Search across multiple fields
     if (search) {
+      const matchingUsers = await findAccountUsernamesByName(search);
       where.OR = [
+        ...(matchingUsers.length ? [{ username: { in: matchingUsers, mode: 'insensitive' as const } }, { subjectUsername: { in: matchingUsers, mode: 'insensitive' as const } }] : []),
         { action: { contains: search, mode: 'insensitive' } },
         { category: { contains: search, mode: 'insensitive' } },
         { username: { contains: search, mode: 'insensitive' } },
@@ -97,6 +120,61 @@ export async function GET(request: NextRequest) {
       ];
     }
 
+    // CSV evidence export requires the dedicated export permission; the
+    // row cap keeps a single export from unbounded table scans.
+    if (format === 'csv') {
+      if (!actorHasPermission(admin, 'audit.export')) {
+        return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+      }
+      const EXPORT_ROW_CAP = 5000;
+      const exportRows = await prisma.auditLog.findMany({
+        where,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: EXPORT_ROW_CAP,
+      });
+
+      const csv = generateCsvContent(
+        ['id', 'createdAt', 'action', 'category', 'eventKind', 'outcome', 'username', 'actorType', 'targetType', 'targetId', 'subjectUsername', 'subjectEmail', 'relatedRequestId', 'correlationId', 'success'],
+        exportRows.map((log: Record<string, unknown>) => [
+          String(log.id ?? ''),
+          log.createdAt instanceof Date ? log.createdAt.toISOString() : String(log.createdAt ?? ''),
+          String(log.action ?? ''),
+          String(log.category ?? ''),
+          String(log.eventKind ?? ''),
+          String(log.outcome ?? ''),
+          String(log.username ?? ''),
+          String(log.actorType ?? ''),
+          String(log.targetType ?? ''),
+          log.targetId == null ? '' : String(log.targetId),
+          log.subjectUsername == null ? '' : String(log.subjectUsername),
+          log.subjectEmail == null ? '' : String(log.subjectEmail),
+          log.relatedRequestId == null ? '' : String(log.relatedRequestId),
+          log.correlationId == null ? '' : String(log.correlationId),
+          log.success === null || log.success === undefined ? '' : String(log.success),
+        ])
+      );
+
+      await logAuditAction({
+        action: AuditActions.EXPORT_AUDIT_LOGS,
+        category: AuditCategories.LOGS,
+        username: admin.username,
+        eventKind: 'read',
+        outcome: 'success',
+        details: { format: 'csv', exportedRows: exportRows.length, filters: { ...where } },
+        ipAddress: getIpAddress(request),
+        userAgent: getUserAgent(request),
+      }).catch(() => {});
+
+      return new NextResponse(csv, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': `attachment; filename="audit-log-export-${new Date().toISOString().slice(0, 10)}.csv"`,
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
+
     // Calculate offset
     const skip = (page - 1) * limit;
 
@@ -104,16 +182,19 @@ export async function GET(request: NextRequest) {
     const [logs, total] = await Promise.all([
       prisma.auditLog.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         skip,
         take: limit,
       }),
       prisma.auditLog.count({ where }),
     ]);
 
-    // Parse details JSON for each log
+    const displayNames = await resolveAccountDisplayNames(logs.flatMap((log) => [log.username, log.subjectUsername]));
+    // Display labels augment immutable audit identities; stored evidence is unchanged.
     const logsWithParsedDetails = logs.map((log: { id: string; details: string | null; [key: string]: unknown }) => ({
       ...log,
+      actorDisplayName: typeof log.username === 'string' ? displayNames.get(log.username.toLowerCase()) ?? null : null,
+      subjectDisplayName: typeof log.subjectUsername === 'string' ? displayNames.get(log.subjectUsername.toLowerCase()) ?? null : null,
       details: parseDetails(log.details),
     }));
 

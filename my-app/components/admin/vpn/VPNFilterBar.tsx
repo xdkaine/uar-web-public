@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Search, Download, Filter, RefreshCw, X } from "lucide-react";
+import { ClientLocalDate } from "@/components/admin/ClientLocalDate";
 
 export type StatusFilter = 'all' | 'active' | 'pending_faculty' | 'disabled' | 'revoked';
 export type PortalFilter = 'all' | 'Management' | 'Limited' | 'External';
@@ -88,8 +89,10 @@ export default function VPNFilterBar({
     <div className="space-y-4 mb-6">
       <div className="flex flex-wrap items-center gap-3">
         <div className="relative flex-1 min-w-[200px] max-w-md">
-          <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+          <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+          <label htmlFor="vpn-account-search" className="sr-only">Search VPN accounts</label>
           <Input
+            id="vpn-account-search"
             placeholder="Search username, name, email..."
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
@@ -97,8 +100,10 @@ export default function VPNFilterBar({
           />
           {searchQuery && (
             <button
+              type="button"
+              aria-label="Clear search"
               onClick={() => onSearchChange('')}
-              className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
+              className="absolute right-3 top-1/2 transform -translate-y-1/2 text-muted-foreground hover:text-muted-foreground"
             >
               <X className="h-4 w-4" />
             </button>
@@ -106,7 +111,7 @@ export default function VPNFilterBar({
         </div>
 
         <Select value={filterStatus} onValueChange={(v) => onStatusChange(v as StatusFilter)}>
-          <SelectTrigger className="w-[140px]">
+          <SelectTrigger className="w-[140px]" aria-label="VPN account status">
             <SelectValue placeholder="Status" />
           </SelectTrigger>
           <SelectContent>
@@ -119,7 +124,7 @@ export default function VPNFilterBar({
         </Select>
 
         <Select value={filterPortal} onValueChange={(v) => onPortalChange(v as PortalFilter)}>
-          <SelectTrigger className="w-[140px]">
+          <SelectTrigger className="w-[140px]" aria-label="VPN portal">
             <SelectValue placeholder="Portal" />
           </SelectTrigger>
           <SelectContent>
@@ -131,45 +136,50 @@ export default function VPNFilterBar({
         </Select>
 
         <Button
+          type="button"
           variant={showAdvancedFilters ? "default" : "outline"}
           size="sm"
           onClick={onToggleAdvancedFilters}
+          aria-expanded={showAdvancedFilters}
+          aria-controls="vpn-advanced-filters"
         >
           <Filter className="h-4 w-4 mr-2" />
           Filters
           {hasActiveFilters && (
-            <Badge variant="secondary" className="ml-2 bg-blue-100 text-blue-800">!</Badge>
+            <Badge variant="secondary" className="ml-2 bg-blue-100 dark:bg-blue-950/60 text-blue-800">!</Badge>
           )}
         </Button>
 
         <div className="flex-grow" />
 
         <Button
+          type="button"
           variant={isPolling ? "default" : "outline"}
           size="sm"
           onClick={onTogglePolling}
+          aria-pressed={isPolling}
           className={isPolling ? "bg-green-600 hover:bg-green-700" : ""}
         >
-          <span className={`inline-block w-2 h-2 rounded-full mr-2 ${isPolling ? 'bg-green-300 animate-pulse' : 'bg-gray-400'}`} />
+          <span className={`inline-block w-2 h-2 rounded-full mr-2 ${isPolling ? 'bg-green-300 animate-pulse' : 'bg-muted-foreground'}`} />
           {isPolling ? 'Live' : 'Off'}
         </Button>
 
-        <Button variant="outline" size="sm" onClick={onRefresh}>
+        <Button type="button" variant="outline" size="sm" onClick={onRefresh} aria-label="Refresh VPN accounts">
           <RefreshCw className="h-4 w-4" />
         </Button>
 
-        <Button variant="outline" size="sm" onClick={onExportCSV}>
+        <Button type="button" variant="outline" size="sm" onClick={onExportCSV}>
           <Download className="h-4 w-4 mr-2" />
           Export
         </Button>
       </div>
 
       {showAdvancedFilters && (
-        <div className="flex flex-wrap items-center gap-3 p-4 bg-gray-50 rounded-lg border">
+        <div id="vpn-advanced-filters" className="flex flex-wrap items-center gap-3 p-4 bg-muted/50 rounded-lg border">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-gray-600">Faculty:</span>
+            <span className="text-sm font-medium text-muted-foreground">Faculty:</span>
             <Select value={filterFaculty} onValueChange={(v) => onFacultyChange(v as FacultyFilter)}>
-              <SelectTrigger className="w-[140px]">
+              <SelectTrigger className="w-[140px]" aria-label="Faculty approval">
                 <SelectValue placeholder="Faculty" />
               </SelectTrigger>
               <SelectContent>
@@ -181,9 +191,9 @@ export default function VPNFilterBar({
           </div>
 
           <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-gray-600">View:</span>
+            <span className="text-sm font-medium text-muted-foreground">View:</span>
             <Select value={viewMode} onValueChange={(v) => onViewModeChange(v as ViewMode)}>
-              <SelectTrigger className="w-[120px]">
+              <SelectTrigger className="w-[120px]" aria-label="VPN results view">
                 <SelectValue placeholder="View" />
               </SelectTrigger>
               <SelectContent>
@@ -194,18 +204,18 @@ export default function VPNFilterBar({
           </div>
 
           {hasActiveFilters && (
-            <Button variant="ghost" size="sm" onClick={clearAllFilters} className="text-red-600">
+            <Button type="button" variant="ghost" size="sm" onClick={clearAllFilters} className="text-red-600 dark:text-red-400">
               <X className="h-4 w-4 mr-1" />
               Clear Filters
             </Button>
           )}
 
           <div className="flex-grow" />
-          <span className="text-sm text-gray-500">
+          <span className="text-sm text-muted-foreground">
             Showing {filteredCount} of {totalCount} accounts
             {lastUpdated && (
-              <span className="ml-2 text-gray-400">
-                • Updated {lastUpdated.toLocaleTimeString()}
+              <span className="ml-2 text-muted-foreground">
+                • Updated <ClientLocalDate value={lastUpdated} format="time" />
               </span>
             )}
           </span>

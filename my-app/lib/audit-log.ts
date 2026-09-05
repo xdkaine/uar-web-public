@@ -1,4 +1,5 @@
 import { prisma } from '@/lib/prisma';
+import type { Prisma } from '@prisma/client';
 import logger from '@/lib/logger';
 import { getClientIp } from '@/lib/ratelimit';
 
@@ -92,16 +93,12 @@ function normalizeNullable(value: string | null | undefined): string | undefined
   return normalized || undefined;
 }
 
-/**
- * Logs an admin action to the audit log
- * @param entry The audit log entry data
- */
-export async function logAuditAction(entry: AuditLogEntry): Promise<void> {
+function normalizeAuditEntry(entry: AuditLogEntry): AuditLogEntry {
   const safeDetails = entry.details
     ? sanitizeAuditDetails(entry.details) as Record<string, unknown>
     : undefined;
 
-  const normalizedEntry = {
+  return {
     ...entry,
     action: sanitizeDatabaseText(entry.action),
     category: sanitizeDatabaseText(entry.category),
@@ -121,17 +118,36 @@ export async function logAuditAction(entry: AuditLogEntry): Promise<void> {
     outcome: entry.outcome || (entry.success === false ? 'failure' : 'success'),
     details: safeDetails,
   } satisfies AuditLogEntry;
+}
 
-  // Log to stdout/Splunk first
+/** Emit the operational audit event after its associated transaction commits. */
+export function emitAuditActionLog(entry: AuditLogEntry): void {
+  const normalizedEntry = normalizeAuditEntry(entry);
   logger.info(normalizedEntry.action, {
     type: 'audit_log',
     ...normalizedEntry,
-    details: normalizedEntry.details // Pass object directly for JSON logging
+    details: normalizedEntry.details,
   });
+}
+
+/**
+ * Logs an admin action to the audit log
+ * @param entry The audit log entry data
+ */
+export async function logAuditAction(
+  entry: AuditLogEntry,
+  database: Pick<Prisma.TransactionClient, 'auditLog'> = prisma,
+  options: { emitOperationalLog?: boolean } = {},
+): Promise<void> {
+  const normalizedEntry = normalizeAuditEntry(entry);
+
+  if (options.emitOperationalLog !== false) {
+    emitAuditActionLog(normalizedEntry);
+  }
 
   try {
     // Log to database
-    await prisma.auditLog.create({
+    await database.auditLog.create({
       data: {
         action: normalizedEntry.action,
         category: normalizedEntry.category,
@@ -179,6 +195,12 @@ export function getUserAgent(request: Request): string | undefined {
 
 // Action types for consistency
 export const AuditActions = {
+  // Auth Manager client registry
+  AUTH_CLIENT_REGISTERED: 'auth_client_registered',
+  AUTH_CLIENT_UPDATED: 'auth_client_updated',
+  AUTH_CLIENT_SECRET_ROTATED: 'auth_client_secret_rotated',
+  AUTH_CLIENT_DELETED: 'auth_client_deleted',
+
   // Navigation
   VIEW_PAGE: 'view_page',
   SWITCH_TAB: 'switch_tab',
@@ -190,7 +212,12 @@ export const AuditActions = {
   REJECT_REQUEST: 'reject_request',
   ACKNOWLEDGE_REQUEST: 'acknowledge_request',
   CREATE_ACCOUNT: 'create_account',
+  SAVE_REQUEST_CREDENTIALS: 'save_request_credentials',
   UPDATE_ACCOUNT: 'update_account',
+  RECONCILE_ACCOUNT_UPDATE: 'reconcile_account_update',
+  RECONCILE_FACULTY_DELIVERY: 'reconcile_faculty_delivery',
+  RECONCILE_STAGE_NOTIFICATION: 'reconcile_stage_notification',
+  RECONCILE_REQUEST_WORKFLOW: 'reconcile_request_workflow',
   MOVE_BACK_REQUEST: 'move_back_request',
   UNDO_FACULTY_NOTIFICATION: 'undo_faculty_notification',
   SEND_TO_FACULTY: 'send_to_faculty',
@@ -225,6 +252,7 @@ export const AuditActions = {
 
   // Batch Accounts
   CREATE_BATCH: 'create_batch',
+  CANCEL_BATCH: 'cancel_batch',
   VIEW_BATCH: 'view_batch',
   VIEW_BATCH_DETAILS: 'view_batch_details',
 
@@ -245,6 +273,11 @@ export const AuditActions = {
   UPDATE_TICKET_STATUS: 'update_ticket_status',
   CLOSE_TICKET: 'close_ticket',
   REOPEN_TICKET: 'reopen_ticket',
+  ASSIGN_TICKET: 'assign_ticket',
+  UNASSIGN_TICKET: 'unassign_ticket',
+  VIEW_TICKET_ASSIGNMENTS: 'view_ticket_assignments',
+  SYNC_TICKET_GROUPS: 'sync_ticket_groups',
+  MANAGE_TICKET_GROUPS: 'manage_ticket_groups',
 
   // Blocklist
   ADD_BLOCKLIST: 'add_blocklist',
@@ -321,6 +354,7 @@ export const AuditActions = {
   OFFBOARD_ENFORCEMENT_FAILURE: 'offboard_enforcement_failure',
   OFFBOARD_ENFORCEMENT_COMPLETED: 'offboard_enforcement_completed',
   OFFBOARD_ENFORCEMENT_SKIPPED: 'offboard_enforcement_skipped',
+  OFFBOARD_ENFORCEMENT_RECONCILED: 'offboard_enforcement_reconciled',
   OFFBOARD_RECIPIENT_VERIFIED: 'offboard_recipient_verified',
   OFFBOARD_CAMPAIGN_COMPLETED: 'offboard_campaign_completed',
   OFFBOARD_CAMPAIGN_EVENT: 'offboard_campaign_event',
@@ -346,6 +380,7 @@ export const AuditActions = {
   CANCEL_MASS_EMAIL_CAMPAIGN: 'cancel_mass_email_campaign',
   MASS_EMAIL_SENT: 'mass_email_sent',
   MASS_EMAIL_FAILURE: 'mass_email_failure',
+  RECONCILE_WORKFLOW_OPERATION: 'reconcile_workflow_operation',
   MASS_EMAIL_COMPLETED: 'mass_email_completed',
 
   // AD Account Comments
@@ -365,7 +400,17 @@ export const AuditActions = {
 
   // Authentication
   LOGIN_SUCCESS: 'login_success',
+  LOGIN_FAILURE: 'login_failure',
+  LOCAL_BREAK_GLASS_LOGIN: 'local_break_glass_login',
+  OIDC_OUTAGE_FALLBACK_OPEN_AUTHORIZED: 'oidc_outage_fallback_open_authorized',
+  OIDC_OUTAGE_FALLBACK_OPENED: 'oidc_outage_fallback_opened',
+  OIDC_OUTAGE_FALLBACK_ACTIVATION_FAILED: 'oidc_outage_fallback_activation_failed',
+  OIDC_OUTAGE_FALLBACK_RECOVERED: 'oidc_outage_fallback_recovered',
+  OIDC_OUTAGE_FALLBACK_CLOSED_FAIL_CLOSED: 'oidc_outage_fallback_closed_fail_closed',
+  OIDC_OUTAGE_FALLBACK_DENIED: 'oidc_outage_fallback_denied',
+  OIDC_ALTERNATE_SIGNIN_DENIED: 'oidc_alternate_signin_denied',
   PASSWORD_CHANGE_REQUIRED: 'password_change_required',
+  PASSWORD_CHANGE_DIRECTORY_MUTATION_COMPLETED: 'password_change_directory_mutation_completed',
   PASSWORD_CHANGE_SUCCESS: 'password_change_success',
   PASSWORD_CHANGE_FAILURE: 'password_change_failure',
   PASSWORD_RESET_REQUESTED: 'password_reset_requested',
@@ -403,6 +448,7 @@ export const AuditCategories = {
   RATE_LIMIT: 'rate_limit',
   SEARCH: 'search',
   AUTH: 'auth',
+  CONFIGURATION: 'configuration',
 } as const;
 
 /**

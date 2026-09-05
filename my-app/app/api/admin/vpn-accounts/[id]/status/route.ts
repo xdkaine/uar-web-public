@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 
 import { checkAdminAuthWithRateLimit } from '@/lib/adminAuth';
+import { actorHasPermission } from '@/lib/rbac/core';
+import { requireModuleEnabled } from '@/lib/modules/guards';
+
 import { logAuditAction, AuditActions, AuditCategories, getIpAddress, getUserAgent } from '@/lib/audit-log';
 
 function sanitizeAccount<T extends { password?: string | null }>(
@@ -21,9 +24,14 @@ export async function PATCH(
     if (!admin || response) {
       return response || NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (!actorHasPermission(admin, 'vpn.manage')) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
 
+    const vpnModuleGuard = await requireModuleEnabled('vpn.management');
+    if (vpnModuleGuard) return vpnModuleGuard;
     const body = await request.json();
-    const { status, reason, changedBy } = body;
+    const { status, reason } = body;
 
     if (!status) {
       return NextResponse.json(
@@ -60,7 +68,7 @@ export async function PATCH(
     // Handle status-specific updates
     if (status === 'disabled') {
       updateData.disabledAt = new Date();
-      updateData.disabledBy = changedBy || 'System';
+      updateData.disabledBy = admin.username;
       updateData.disabledReason = reason;
     } else if (status === 'active' && oldStatus === 'pending_faculty') {
       updateData.createdByFaculty = true;
@@ -77,9 +85,10 @@ export async function PATCH(
     await prisma.vPNAccountStatusLog.create({
       data: {
         accountId: account.id,
+        liveAccountId: account.id,
         oldStatus,
         newStatus: status,
-        changedBy: changedBy || 'System',
+        changedBy: admin.username,
         reason: reason || `Status changed from ${oldStatus} to ${status}`,
       },
     });
