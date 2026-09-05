@@ -53,6 +53,18 @@ jobs:
           else
             docker run --rm --network none uar-check:auth npm test
           fi
+      - name: Verify final runtime packaging
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: runner
+          load: true
+          tags: uar-runtime-check:${{ matrix.service }}
+          cache-from: type=gha,scope=check-${{ matrix.service }}
+      - name: Migration orchestration checks
+        if: matrix.service == 'portal'
+        run: node --test deploy/k8s/migrations/run-release.test.cjs
   images:
     name: Publish ${{ matrix.image }}
     needs: checks
