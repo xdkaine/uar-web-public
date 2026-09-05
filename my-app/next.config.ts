@@ -76,6 +76,17 @@ const securityHeaders = [
 
 const nextConfig: NextConfig = {
   output: 'standalone',
+  // Keep database adapters external so standalone tracing retains their runtime entrypoints.
+  serverExternalPackages: ['pg', '@prisma/client', '@prisma/adapter-pg'],
+  outputFileTracingIncludes: {
+    '/*': [
+      './node_modules/pg*/**/*', './node_modules/postgres-*/**/*',
+      './node_modules/split2/**/*', './node_modules/xtend/**/*',
+      './node_modules/@prisma/client/**/*', './node_modules/@prisma/adapter-pg/**/*',
+      './node_modules/@prisma/client-runtime-utils/**/*',
+      './node_modules/@prisma/driver-adapter-utils/**/*', './node_modules/@prisma/debug/**/*',
+    ],
+  },
   // Dynamic asset storage paths must not pull the source checkout into runners.
   // Anchor project exclusions so dependency runtime files remain traceable.
   outputFileTracingExcludes: {
