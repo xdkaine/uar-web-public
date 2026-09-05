@@ -1,8 +1,0 @@
-import TicketEvidence from '@/components/support/TicketEvidence';
-import TicketAccessSection from './TicketAccessSection';
-import { ClientLocalDate } from './ClientLocalDate';
-import { formatTicketStatus, type SupportTicket } from './TicketDetailTypes';
-
-export function TicketDetailSidebar({ ticket }: { ticket: SupportTicket }) {
-  return <aside className="min-w-0 space-y-6 border-t bg-muted/15 p-5 pb-8 sm:p-6 lg:overflow-y-auto lg:border-l lg:border-t-0"><section className="bg-background p-4"><TicketAccessSection ticketId={ticket.id} requesterName={ticket.displayName} requesterUsername={ticket.username} /></section><section><h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-3">Evidence</h3><TicketEvidence ticketId={ticket.id} canMutate /></section><details className="rounded-lg border border-border p-4"><summary className="cursor-pointer text-xs font-semibold uppercase tracking-wider text-muted-foreground">Status History ({ticket.statusLogs.length})</summary><div className="mt-3 space-y-3">{ticket.statusLogs.length === 0 ? <p className="text-muted-foreground text-sm">No status changes yet.</p> : ticket.statusLogs.map((log) => <div key={log.id} className="border-l-2 border-l-border pl-3 py-0.5"><p className="text-sm text-foreground"><span className="font-semibold">{log.changedBy}</span>{log.oldStatus ? <> moved <span className="font-medium">{formatTicketStatus(log.oldStatus)}</span> → <span className="font-medium">{formatTicketStatus(log.newStatus)}</span></> : <> created as <span className="font-medium">{formatTicketStatus(log.newStatus)}</span></>}</p><p className="text-xs text-muted-foreground"><ClientLocalDate value={log.createdAt} /></p></div>)}</div></details></aside>;
-}

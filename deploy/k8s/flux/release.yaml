@@ -4,11 +4,11 @@ metadata:
   name: uar-dev-infra
   namespace: flux-system
   labels:
-    uar.dev/release: RELEASE_ID
+    uar.dev/release: 69d8ead7925231195d4bbc54f9e1272930a4b698
 spec:
   interval: 1m
   retryInterval: 30s
-  path: ./release/RELEASE_ID/infra
+  path: ./release/69d8ead7925231195d4bbc54f9e1272930a4b698/infra
   prune: true
   sourceRef:
     kind: GitRepository
@@ -18,7 +18,7 @@ spec:
   wait: true
   commonMetadata:
     labels:
-      uar.dev/release: RELEASE_ID
+      uar.dev/release: 69d8ead7925231195d4bbc54f9e1272930a4b698
 ---
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
@@ -26,11 +26,11 @@ metadata:
   name: uar-dev-migrations
   namespace: flux-system
   labels:
-    uar.dev/release: RELEASE_ID
+    uar.dev/release: 69d8ead7925231195d4bbc54f9e1272930a4b698
 spec:
   interval: 1m
   retryInterval: 30s
-  path: ./release/RELEASE_ID/migrations
+  path: ./release/69d8ead7925231195d4bbc54f9e1272930a4b698/migrations
   prune: false
   sourceRef:
     kind: GitRepository
@@ -40,7 +40,7 @@ spec:
   wait: true
   commonMetadata:
     labels:
-      uar.dev/release: RELEASE_ID
+      uar.dev/release: 69d8ead7925231195d4bbc54f9e1272930a4b698
   dependsOn:
   - name: uar-dev-infra
     readyExpr: has(dep.status) && has(dep.status.conditions) && dep.metadata.labels['uar.dev/release']
@@ -53,11 +53,11 @@ metadata:
   name: uar-dev-apps
   namespace: flux-system
   labels:
-    uar.dev/release: RELEASE_ID
+    uar.dev/release: 69d8ead7925231195d4bbc54f9e1272930a4b698
 spec:
   interval: 1m
   retryInterval: 30s
-  path: ./release/RELEASE_ID/apps
+  path: ./release/69d8ead7925231195d4bbc54f9e1272930a4b698/apps
   prune: true
   sourceRef:
     kind: GitRepository
@@ -67,7 +67,7 @@ spec:
   wait: true
   commonMetadata:
     labels:
-      uar.dev/release: RELEASE_ID
+      uar.dev/release: 69d8ead7925231195d4bbc54f9e1272930a4b698
   dependsOn:
   - name: uar-dev-migrations
     readyExpr: has(dep.status) && has(dep.status.conditions) && dep.metadata.labels['uar.dev/release']
