@@ -38,6 +38,8 @@ const required = kind === 'portal'
   : ['dist/index.js'];
 for (const item of required) await access(path.join(root, item));
 const require = createRequire(path.join(root, 'package.json'));
+// Match Next's startup order before loading a route's async request context.
+if (kind === 'portal') require('next/dist/server/node-environment');
 for (const dependency of kind === 'portal'
   ? ['next', 'react', 'pg', '@prisma/client', '@prisma/adapter-pg']
   : ['pg', '@prisma/client', '@prisma/adapter-pg', 'ldapts', 'oidc-provider', 'redis', 'sanitize-html']) {
