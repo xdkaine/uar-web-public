@@ -4,7 +4,7 @@ import { checkReviewAccessWithRateLimit } from '@/lib/adminAuth';
 import { actorHasPermission } from '@/lib/rbac/core';
 import { generateCsvContent } from '@/lib/csv-security';
 import { CollectionQueryError } from '@/lib/admin/collections';
-import { accessRequestWhere, parseAccessRequestCollectionQuery } from '../route';
+import { accessRequestWhere, parseAccessRequestCollectionQuery } from '../access-request-collection';
 
 const EXPORT_LIMIT = 5_000;
 

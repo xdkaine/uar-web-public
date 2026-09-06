@@ -55,7 +55,7 @@ function mergeContent(
  * copy. Read-only, no auth (the data is what every anonymous visitor sees
  * anyway), and fails open to the built-in defaults.
  */
-export async function GET(request?: NextRequest) {
+export async function GET(request: NextRequest) {
   try {
     const [themeRaw, navRaw, publishedRegions, ...pageRawValues] = await Promise.all([
       getConfigValue<string>('appearance.theme').catch(() => ''),

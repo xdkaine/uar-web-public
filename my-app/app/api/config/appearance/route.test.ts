@@ -1,3 +1,4 @@
+import { NextRequest } from 'next/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -67,7 +68,7 @@ describe('public appearance resolution', () => {
   it('fails open to the built-in defaults when the config store is unreadable', async () => {
     mocks.getConfigValue.mockRejectedValue(new Error('config store down'));
 
-    const response = await GET();
+    const response = await GET(new NextRequest('https://portal.example.test/api/config/appearance'));
 
     expect(response.status).toBe(200);
     const body = await response.json();
@@ -89,7 +90,7 @@ describe('public appearance resolution', () => {
       'pages.requestExternal': JSON.stringify({ subtitle: 'External override only' }),
     });
 
-    const response = await GET();
+    const response = await GET(new NextRequest('https://portal.example.test/api/config/appearance'));
     const body = await response.json();
 
     expect(response.status).toBe(200);
@@ -124,7 +125,7 @@ describe('public appearance resolution', () => {
       }),
     });
 
-    const response = await GET();
+    const response = await GET(new NextRequest('https://portal.example.test/api/config/appearance'));
     const body = await response.json();
 
     expect(response.status).toBe(200);
@@ -138,7 +139,7 @@ describe('public appearance resolution', () => {
       'pages.requestExternal': JSON.stringify({}),
     });
 
-    const response = await GET();
+    const response = await GET(new NextRequest('https://portal.example.test/api/config/appearance'));
     const body = await response.json();
 
     expect(body.navLinks).toEqual(DEFAULT_NAV_LINKS);
@@ -154,7 +155,7 @@ describe('public appearance resolution', () => {
       // pages.requestExternal deliberately missing -> rejected -> '' sentinel.
     });
 
-    const response = await GET();
+    const response = await GET(new NextRequest('https://portal.example.test/api/config/appearance'));
     const body = await response.json();
 
     expect(response.status).toBe(200);
@@ -189,7 +190,7 @@ describe('public appearance resilience to malformed rows', () => {
       throw new Error(`config key ${key} unavailable`);
     });
 
-    const response = await GET();
+    const response = await GET(new NextRequest('https://portal.example.test/api/config/appearance'));
     const body = await response.json();
 
     expect(response.status).toBe(200);

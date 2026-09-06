@@ -14,8 +14,8 @@ import { isModuleEnabledStrict } from '@/lib/modules/core';
 import { prisma } from '@/lib/prisma';
 import { actorHasPermission } from '@/lib/rbac/core';
 import { DIRECTORY_DELETE_METHOD, DIRECTORY_DELETE_METHOD_EVIDENCE_KEY, hasCurrentDirectoryDeleteMethod, planContainsDirectoryDeletion } from '@/lib/lifecycle-directory-deletion-policy';
+import { MAX_DELETION_PLAN_TARGETS } from './deletion-plan-policy';
 
-export const MAX_DELETION_PLAN_TARGETS = 25;
 const PLAN_POLICY_VERSION = 'reviewed-lifecycle-deletion-plan-v1';
 const PLAN_TTL_MS = 15 * 60 * 1000;
 const BATCH_OWNERSHIP_STATUSES = ['processing', 'completed', 'reconciliation_required'];

@@ -1,0 +1,1 @@
+export const MAX_DELETION_PLAN_TARGETS = 25;

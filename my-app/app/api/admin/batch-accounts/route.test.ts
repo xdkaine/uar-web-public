@@ -90,7 +90,8 @@ vi.mock('@/lib/batch-account-rollback', () => ({ rollbackBatchAccounts: mocks.ro
 vi.mock('@/lib/batch-vpn-rollback', () => ({ rollbackBatchVpnAccounts: mocks.vpnRollback }));
 vi.mock('@/lib/batch-vpn-provisioning', () => ({ createBatchVpnAccountRecord: mocks.createVpnRecord }));
 
-import { batchSubmissionFingerprint, POST } from './route';
+import { POST } from './route';
+import { batchSubmissionFingerprint } from './batch-submission';
 
 function request(adAccount: Record<string, unknown>) {
   return new NextRequest('https://portal.example.test/api/admin/batch-accounts', {
