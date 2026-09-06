@@ -74,7 +74,8 @@ def main():
     if os.environ.get('GITHUB_REPOSITORY') != REPOSITORY:
         raise ValueError('Unexpected repository; configure a separate deployment for forks.')
     source = os.environ['GITHUB_SHA']
-    images = load_digests('digests', source)
+    from plan_images import validate_receipts
+    images, input_hashes, built_from = validate_receipts('digests', source)
     if api('git/ref/heads/dev')['object']['sha'] != source:
         print('A newer dev commit exists; stale release skipped.')
         return
@@ -82,6 +83,7 @@ def main():
     files = render_release(Path('deploy/k8s'), source, images)
     files[f'release/{source}/release.json'] = json.dumps({
         'source': source, 'workflow_run': os.environ['GITHUB_RUN_ID'], 'images': images,
+        'inputHashes': input_hashes, 'builtFrom': built_from,
         'portal_origin': os.environ['DEV_PORTAL_URL'], 'auth_origin': os.environ['DEV_AUTH_URL']
     }, indent=2) + '\n'
     previous = api('git/ref/heads/deploy/dev', missing_ok=True)

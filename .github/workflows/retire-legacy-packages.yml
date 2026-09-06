@@ -1,0 +1,28 @@
+name: Retire superseded Auth packages
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths: [.github/workflows/retire-legacy-packages.yml]
+permissions:
+  contents: read
+concurrency:
+  group: retire-legacy-auth-packages
+  cancel-in-progress: false
+jobs:
+  retire:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s deploy/scripts -p 'retire_legacy_packages_test.py'
+      - name: Retire only the two superseded packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 deploy/scripts/retire_legacy_packages.py

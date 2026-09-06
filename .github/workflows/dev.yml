@@ -101,8 +101,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Plan image build or verified reuse
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEV_PORTAL_URL: ${{ vars.DEV_PORTAL_URL }}
+          DEV_TURNSTILE_SITE_KEY: ${{ vars.DEV_TURNSTILE_SITE_KEY }}
+        run: python3 deploy/scripts/plan_images.py '${{ matrix.image }}'
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         id: build
+        if: steps.plan.outputs.build == 'true'
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -123,15 +131,7 @@ jobs:
         env:
           IMAGE_KIND: ${{ matrix.image }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          mkdir -p digests
-          python3 - <<'PY'
-          import json, os, pathlib
-          kind = os.environ['IMAGE_KIND']
-          pathlib.Path('digests', kind + '.json').write_text(json.dumps({
-              'kind': kind, 'digest': os.environ['IMAGE_DIGEST'], 'source': os.environ['GITHUB_SHA']
-          }))
-          PY
+        run: python3 deploy/scripts/plan_images.py "$IMAGE_KIND" --record
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: digest-${{ matrix.image }}
@@ -162,6 +162,7 @@ jobs:
       - name: Publish digest-pinned manifests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEV_TURNSTILE_SITE_KEY: ${{ vars.DEV_TURNSTILE_SITE_KEY }}
           DEV_PORTAL_URL: ${{ vars.DEV_PORTAL_URL }}
           DEV_AUTH_URL: ${{ vars.DEV_AUTH_URL }}
         run: python3 deploy/scripts/publish_release.py --publish
