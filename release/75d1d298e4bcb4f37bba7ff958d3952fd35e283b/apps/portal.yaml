@@ -1,0 +1,207 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: portal
+spec:
+  type: ClusterIP
+  selector:
+    app: portal
+  ports:
+  - name: tcp
+    port: 3002
+    targetPort: 3002
+  clusterIP: 10.43.10.2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portal
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: portal
+  template:
+    metadata:
+      labels:
+        app: portal
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+        runAsUser: 1001
+        runAsGroup: 1001
+      containers:
+      - name: portal
+        image: ghcr.io/xdkaine/uar-web-public-portal@sha256:1a31abbb07693d430655a9d30f6c8259ccc05e37da637876d8ee88fad828963d
+        ports:
+        - containerPort: 3002
+        envFrom:
+        - secretRef:
+            name: uar-portal-runtime
+        env:
+        - name: NODE_ENV
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: NODE_ENV
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: REDIS_URL
+        - name: DATABASE_SSL_ALLOW_INSECURE
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: DATABASE_SSL_ALLOW_INSECURE
+        - name: LDAP_ALLOW_INVALID_CERTS
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: LDAP_ALLOW_INVALID_CERTS
+        - name: SESSION_COOKIE_ALLOW_INSECURE
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: SESSION_COOKIE_ALLOW_INSECURE
+        - name: NODE_EXTRA_CA_CERTS
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: NODE_EXTRA_CA_CERTS
+        - name: PORT
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: PORT
+        - name: ASSET_SERVICE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: ASSET_SERVICE_URL
+        - name: CLAMAV_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: CLAMAV_HOST
+        - name: CLAMAV_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: CLAMAV_PORT
+        - name: MONITOR_PROBE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: MONITOR_PROBE_URL
+        - name: LIFECYCLE_QUEUE_SCHEDULER_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: LIFECYCLE_QUEUE_SCHEDULER_ENABLED
+        - name: MASS_EMAIL_SCHEDULER_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: MASS_EMAIL_SCHEDULER_ENABLED
+        - name: OFFBOARD_SCHEDULER_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: OFFBOARD_SCHEDULER_ENABLED
+        - name: PASSWORD_EXPIRATION_SCHEDULER_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: PASSWORD_EXPIRATION_SCHEDULER_ENABLED
+        - name: PASSWORD_CLEANUP_SCHEDULER_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: PASSWORD_CLEANUP_SCHEDULER_ENABLED
+        - name: TICKET_GROUP_SYNC_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: TICKET_GROUP_SYNC_ENABLED
+        - name: DIRECTORY_PROBE_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: DIRECTORY_PROBE_ENABLED
+        - name: WORKFLOW_TICK_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: WORKFLOW_TICK_ENABLED
+        - name: OPERATIONAL_DETECTOR_SCHEDULER_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: OPERATIONAL_DETECTOR_SCHEDULER_ENABLED
+        - name: MONITORED_ENDPOINTS_SCHEDULER_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: MONITORED_ENDPOINTS_SCHEDULER_ENABLED
+        - name: ATTACHMENT_QUARANTINE_PURGE_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: ATTACHMENT_QUARANTINE_PURGE_ENABLED
+        - name: FLOW_OUTBOX_SCHEDULER_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: FLOW_OUTBOX_SCHEDULER_ENABLED
+        - name: AUTH_DEVICE_EVIDENCE_MAINTENANCE_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: AUTH_DEVICE_EVIDENCE_MAINTENANCE_ENABLED
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: 1500m
+            memory: 1536Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: database-ca
+          mountPath: /etc/uar/database-tls
+          readOnly: true
+        startupProbe:
+          tcpSocket:
+            port: 3002
+          failureThreshold: 60
+          periodSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /login
+            port: 3002
+          periodSeconds: 10
+          failureThreshold: 3
+        livenessProbe:
+          tcpSocket:
+            port: 3002
+          periodSeconds: 15
+          failureThreshold: 3
+      volumes:
+      - name: database-ca
+        secret:
+          secretName: uar-database-ca
+      terminationGracePeriodSeconds: 45

@@ -1,0 +1,207 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flow-outbox-scheduler
+spec:
+  replicas: 0
+  revisionHistoryLimit: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: flow-outbox-scheduler
+  template:
+    metadata:
+      labels:
+        app: flow-outbox-scheduler
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 102
+        fsGroup: 102
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: flow-outbox-scheduler
+        image: curlimages/curl@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          if [ "${FLOW_OUTBOX_SCHEDULER_ENABLED}" != "true" ]; then
+            while true; do sleep 86400; done
+          fi
+          if [ -z "${CRON_SECRET}" ]; then exit 1; fi
+          sleep 20
+          while true; do
+            if curl --fail --silent --show-error --max-time 60 \
+              --header "Authorization: Bearer ${CRON_SECRET}" \
+              --request POST http://portal:3002/api/cron/drain-flow-outbox > /dev/null; then
+              date +%s > /tmp/flow-outbox-last-run
+            fi
+            sleep "${FLOW_OUTBOX_INTERVAL_SECONDS}"
+          done
+        env:
+        - name: CRON_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: uar-portal-runtime
+              key: CRON_SECRET
+        - name: FLOW_OUTBOX_SCHEDULER_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: FLOW_OUTBOX_SCHEDULER_ENABLED
+        - name: FLOW_OUTBOX_INTERVAL_SECONDS
+          valueFrom:
+            secretKeyRef:
+              name: uar-portal-runtime
+              key: FLOW_OUTBOX_INTERVAL_SECONDS
+        - name: FLOW_OUTBOX_HEALTH_MAX_AGE_SECONDS
+          valueFrom:
+            secretKeyRef:
+              name: uar-portal-runtime
+              key: FLOW_OUTBOX_HEALTH_MAX_AGE_SECONDS
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: state
+          mountPath: /tmp
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - >-
+              if [ "${FLOW_OUTBOX_SCHEDULER_ENABLED}" != "true" ]; then exit 0; fi;
+              test -s /tmp/flow-outbox-last-run || exit 1;
+              now=$(date +%s);
+              last=$(cat /tmp/flow-outbox-last-run);
+              [ "$((now - last))" -le "${FLOW_OUTBOX_HEALTH_MAX_AGE_SECONDS}" ]
+          initialDelaySeconds: 300
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 2
+      volumes:
+      - name: state
+        emptyDir: {}
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: attachment-quarantine-purge-scheduler
+spec:
+  replicas: 0
+  revisionHistoryLimit: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: attachment-quarantine-purge-scheduler
+  template:
+    metadata:
+      labels:
+        app: attachment-quarantine-purge-scheduler
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 102
+        fsGroup: 102
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: attachment-quarantine-purge-scheduler
+        image: curlimages/curl@sha256:94e9e444bcba979c2ea12e27ae39bee4cd10bc7041a472c4727a558e213744e6
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          if [ "${ATTACHMENT_QUARANTINE_PURGE_ENABLED}" != "true" ]; then
+            echo "Attachment quarantine purge disabled."
+            while true; do sleep 86400; done
+          fi
+          if [ -z "${CRON_SECRET}" ]; then
+            echo "Attachment quarantine purge cannot start because CRON_SECRET is empty."
+            exit 1
+          fi
+          sleep 90
+          while true; do
+            if curl --fail --silent --show-error --max-time 300 \
+              --header "Authorization: Bearer ${CRON_SECRET}" \
+              --request POST http://portal:3002/api/cron/purge-attachment-quarantine > /dev/null; then
+              date +%s > /tmp/attachment-quarantine-purge-last-run
+            else
+              printf 'Attachment quarantine purge failed at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+            fi
+            sleep "${ATTACHMENT_QUARANTINE_PURGE_INTERVAL_SECONDS}"
+          done
+        env:
+        - name: CRON_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: uar-portal-runtime
+              key: CRON_SECRET
+        - name: ATTACHMENT_QUARANTINE_PURGE_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: ATTACHMENT_QUARANTINE_PURGE_ENABLED
+        - name: ATTACHMENT_QUARANTINE_PURGE_INTERVAL_SECONDS
+          valueFrom:
+            secretKeyRef:
+              name: uar-portal-runtime
+              key: ATTACHMENT_QUARANTINE_PURGE_INTERVAL_SECONDS
+        - name: ATTACHMENT_QUARANTINE_PURGE_HEALTH_MAX_AGE_SECONDS
+          valueFrom:
+            secretKeyRef:
+              name: uar-portal-runtime
+              key: ATTACHMENT_QUARANTINE_PURGE_HEALTH_MAX_AGE_SECONDS
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: state
+          mountPath: /tmp
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - >-
+              if [ "${ATTACHMENT_QUARANTINE_PURGE_ENABLED}" != "true" ]; then exit 0; fi;
+              test -s /tmp/attachment-quarantine-purge-last-run || exit 1;
+              now=$(date +%s);
+              last=$(cat /tmp/attachment-quarantine-purge-last-run);
+              [ "$((now - last))" -le "${ATTACHMENT_QUARANTINE_PURGE_HEALTH_MAX_AGE_SECONDS}" ]
+          initialDelaySeconds: 600
+          periodSeconds: 300
+          timeoutSeconds: 5
+          failureThreshold: 2
+      volumes:
+      - name: state
+        emptyDir: {}
+      terminationGracePeriodSeconds: 30
