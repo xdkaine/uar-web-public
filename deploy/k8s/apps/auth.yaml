@@ -39,7 +39,7 @@ spec:
           type: RuntimeDefault
       containers:
       - name: auth
-        image: uar-auth:UNRELEASED
+        image: ghcr.io/xdkaine/auth-service@sha256:a6c3410e984ae1044be30b97c456210f96ada217c26d1ba506e57a6e6a66d6c5
         ports:
         - containerPort: 3003
         envFrom:

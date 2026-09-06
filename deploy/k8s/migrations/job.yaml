@@ -18,7 +18,7 @@ spec:
           type: RuntimeDefault
       initContainers:
       - name: auth-migration-artifacts
-        image: uar-auth-migrate:UNRELEASED
+        image: ghcr.io/xdkaine/auth-service-migrate@sha256:38dbdc3dcf3c5c253354d04ffee45dae9b92e5d9486d7a6a1ae84a19ab4a64a5
         command:
         - sh
         - -ec
