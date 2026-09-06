@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply tested application image receipts
+After=network-online.target k3s.service
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /var/lib/application-delivery/poller.py --config /etc/application-delivery/config.json
+User=root
+UMask=0077
+TimeoutStartSec=30min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only

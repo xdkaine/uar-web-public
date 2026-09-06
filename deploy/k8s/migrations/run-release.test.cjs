@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { runRelease, LOCK_SQL, HELD_SQL } = require('./run-release.cjs');
+const { runRelease, connectInitially, LOCK_SQL, HELD_SQL } = require('./run-release.cjs');
 function database() {
   const db = new EventEmitter();
   db.calls = [];
@@ -55,4 +55,73 @@ test('heartbeat detects lost advisory ownership during a command', async () => {
     await new Promise((resolve) => { const fallback = setTimeout(resolve, 1000); signal.addEventListener('abort', () => { clearTimeout(fallback); resolve(); }, { once: true }); });
   }}));
   assert.equal(calls, 1);
+});
+
+test('transient initial connection failures use fresh clients then run migrations once', async () => {
+  const clients = []; let clock = 0;
+  const db = await connectInitially({
+    now: () => clock, sleep: async (ms) => { clock += ms; },
+    createClient: ({ connectionTimeoutMillis }) => {
+      assert.ok(connectionTimeoutMillis <= 3000);
+      const client = database(); const index = clients.length; clients.push(client);
+      client.connect = async () => { client.calls.push('connect'); if (index < 2) throw Object.assign(new Error('not ready'), { code: 'ECONNREFUSED' }); };
+      return client;
+    },
+  });
+  assert.equal(clients.length, 3);
+  assert.deepEqual(clients[0].calls, ['connect', 'end']);
+  assert.deepEqual(clients[1].calls, ['connect', 'end']);
+  let migrations = 0;
+  await runRelease({ db, connected: true, log() {}, run: async () => { migrations++; } });
+  assert.equal(migrations, 3);
+  assert.equal(db.calls.filter(call => call === 'connect').length, 1);
+  assert.equal(db.calls.filter(call => call === LOCK_SQL).length, 1);
+});
+
+test('authentication and TLS failures are never retried', async () => {
+  for (const code of ['28P01', '28000', 'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT']) {
+    let attempts = 0; const db = database();
+    db.connect = async () => { throw Object.assign(new Error('denied'), { code }); };
+    await assert.rejects(connectInitially({ createClient: () => { attempts++; return db; }, sleep: async () => assert.fail('must not retry') }));
+    assert.equal(attempts, 1); assert.deepEqual(db.calls, ['end']);
+  }
+});
+
+test('initial connection attempts are exhausted without any SQL or migration work', async () => {
+  const clients = []; let clock = 0;
+  await assert.rejects(connectInitially({ now: () => clock, sleep: async ms => { clock += ms; }, createClient: () => {
+    const db = database(); clients.push(db);
+    db.connect = async () => { throw Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }); };
+    return db;
+  }}));
+  assert.equal(clients.length, 10);
+  assert.ok(clock <= 30000);
+  assert.ok(clients.every(db => db.calls.length === 1 && db.calls[0] === 'end'));
+});
+
+test('elapsed retry budget prevents another attempt', async () => {
+  let attempts = 0; let clock = 0;
+  await assert.rejects(connectInitially({ maxElapsedMs: 20, now: () => clock, sleep: async ms => { clock += ms; }, createClient: () => {
+    attempts++; const db = database();
+    db.connect = async () => { throw Object.assign(new Error('refused'), { code: 'EHOSTUNREACH' }); };
+    return db;
+  }}));
+  assert.equal(attempts, 1); assert.equal(clock, 20);
+});
+
+test('aborting an initial connection closes it and starts no later attempt', async () => {
+  const controller = new AbortController(); let attempts = 0; const db = database();
+  db.connect = () => new Promise(() => {});
+  const pending = connectInitially({ signal: controller.signal, createClient: () => { attempts++; return db; } });
+  controller.abort();
+  await assert.rejects(pending);
+  assert.equal(attempts, 1); assert.deepEqual(db.calls, ['end']);
+});
+
+test('migration failure after initial connection succeeds never reconnects or replays work', async () => {
+  let attempts = 0; let steps = 0; const client = database();
+  const db = await connectInitially({ createClient: () => { attempts++; return client; } });
+  await assert.rejects(runRelease({ db, connected: true, log() {}, run: async () => { steps++; throw Object.assign(new Error('connection failed during SQL'), { code: 'ECONNREFUSED' }); } }));
+  assert.equal(attempts, 1); assert.equal(steps, 1);
+  assert.equal(db.calls.filter(call => call === LOCK_SQL).length, 1);
 });

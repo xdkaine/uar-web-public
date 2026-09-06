@@ -2,8 +2,47 @@
 
 const { spawn } = require('node:child_process');
 const { createRequire } = require('node:module');
+const { setTimeout: delay } = require('node:timers/promises');
 const LOCK_SQL = "SELECT pg_advisory_lock(hashtextextended('uar-dev-release-migrations', 0))";
 const HELD_SQL = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory' AND granted AND classid = ((hashtextextended('uar-dev-release-migrations', 0) >> 32) & 4294967295)::oid AND objid = (hashtextextended('uar-dev-release-migrations', 0) & 4294967295)::oid AND objsubid = 1) AS held";
+
+async function connectInitially({ createClient, signal, maxElapsedMs = 30000, maxAttempts = 10, retryDelayMs = 3000, now = Date.now, sleep = delay }) {
+  const deadline = now() + maxElapsedMs;
+  const retryable = new Set(['ECONNREFUSED', 'ETIMEDOUT', 'EHOSTUNREACH', 'EAI_AGAIN']);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (signal?.aborted) throw new Error('Migration connection aborted');
+    const remaining = deadline - now();
+    if (remaining <= 0) throw new Error('Migration connection retry budget exhausted');
+    const connectionTimeoutMillis = Math.min(3000, remaining);
+    const client = createClient({ connectionTimeoutMillis });
+    // A failed initial connection owns no lease and has executed no SQL.
+    // Consume connection error events while connect() supplies the rejection.
+    const initialError = () => {};
+    client.on('error', initialError);
+    let timer;
+    let stop;
+    try {
+      const bounded = new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error('Initial connection timed out'), { code: 'ETIMEDOUT' })), connectionTimeoutMillis);
+        stop = () => reject(new Error('Migration connection aborted'));
+        signal?.addEventListener('abort', stop, { once: true });
+        if (signal?.aborted) stop();
+      });
+      await Promise.race([client.connect(), bounded]);
+      if (signal?.aborted) throw new Error('Migration connection aborted');
+      return client;
+    } catch (error) {
+      await client.end().catch(() => {});
+      if (signal?.aborted || !retryable.has(error.code) || attempt === maxAttempts || now() >= deadline) throw error;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', stop);
+      client.removeListener('error', initialError);
+    }
+    await sleep(Math.min(retryDelayMs, Math.max(0, deadline - now())), undefined, { signal });
+  }
+  throw new Error('Migration connection retry budget exhausted');
+}
 
 function runChild(command, args, { env, signal }) {
   return new Promise((resolve, reject) => {
@@ -32,7 +71,7 @@ function runChild(command, args, { env, signal }) {
   });
 }
 
-async function runRelease({ db, run = runChild, env = process.env, log = console.log, signal, heartbeatMs = 1000 }) {
+async function runRelease({ db, connected = false, run = runChild, env = process.env, log = console.log, signal, heartbeatMs = 1000 }) {
   const abort = new AbortController();
   let leaseLost = false;
   let finished = false;
@@ -51,7 +90,9 @@ async function runRelease({ db, run = runChild, env = process.env, log = console
     if (leaseLost || abort.signal.aborted) throw new Error('Migration lease unavailable');
   };
   try {
-    await db.connect();
+    if (abort.signal.aborted) throw new Error('Migration lease unavailable');
+    if (!connected) await db.connect();
+    if (abort.signal.aborted) throw new Error('Migration lease unavailable');
     await db.query("SET statement_timeout = '12min'");
     await db.query(LOCK_SQL);
     await db.query("SET statement_timeout = '5s'");
@@ -101,11 +142,12 @@ async function main() {
   const runtimeRequire = createRequire('/app/package.json');
   const { Client } = runtimeRequire('pg');
   const fs = require('node:fs');
-  const client = new Client({ host: process.env.PGHOST, port: 5432, database: process.env.PGDATABASE, user: process.env.PGUSER, password: process.env.PGPASSWORD, ssl: { rejectUnauthorized: true, ca: fs.readFileSync('/etc/uar/database-tls/ca.crt', 'utf8') }, connectionTimeoutMillis: 10000, keepAlive: true, keepAliveInitialDelayMillis: 1000 });
+  const options = { host: process.env.PGHOST, port: 5432, database: process.env.PGDATABASE, user: process.env.PGUSER, password: process.env.PGPASSWORD, ssl: { rejectUnauthorized: true, ca: fs.readFileSync('/etc/uar/database-tls/ca.crt', 'utf8') }, keepAlive: true, keepAliveInitialDelayMillis: 1000 };
   const signal = new AbortController();
   process.once('SIGTERM', () => signal.abort());
   process.once('SIGINT', () => signal.abort());
-  await runRelease({ db: client, signal: signal.signal });
+  const client = await connectInitially({ createClient: (timing) => new Client({ ...options, ...timing }), signal: signal.signal });
+  await runRelease({ db: client, connected: true, signal: signal.signal });
 }
 if (require.main === module) main().catch(() => { console.error('Release migration failed. No subsequent migration or rollout step was authorized by this job. Inspect the failed step and reconcile database state before retrying.'); process.exitCode = 1; });
-module.exports = { runRelease, runChild, LOCK_SQL, HELD_SQL };
+module.exports = { runRelease, runChild, connectInitially, LOCK_SQL, HELD_SQL };
