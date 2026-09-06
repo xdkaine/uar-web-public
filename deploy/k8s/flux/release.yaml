@@ -4,11 +4,11 @@ metadata:
   name: uar-dev-infra
   namespace: flux-system
   labels:
-    uar.dev/release: 0fb232c94a43b1d4ccd41c8bce496665b913c6e5
+    uar.dev/release: b64c73dbd7686f0401c4ce94501ebe3903f22bf4
 spec:
   interval: 1m
   retryInterval: 30s
-  path: ./release/0fb232c94a43b1d4ccd41c8bce496665b913c6e5/infra
+  path: ./release/b64c73dbd7686f0401c4ce94501ebe3903f22bf4/infra
   prune: true
   sourceRef:
     kind: GitRepository
@@ -18,7 +18,7 @@ spec:
   wait: true
   commonMetadata:
     labels:
-      uar.dev/release: 0fb232c94a43b1d4ccd41c8bce496665b913c6e5
+      uar.dev/release: b64c73dbd7686f0401c4ce94501ebe3903f22bf4
 ---
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
@@ -26,11 +26,11 @@ metadata:
   name: uar-dev-migrations
   namespace: flux-system
   labels:
-    uar.dev/release: 0fb232c94a43b1d4ccd41c8bce496665b913c6e5
+    uar.dev/release: b64c73dbd7686f0401c4ce94501ebe3903f22bf4
 spec:
   interval: 1m
   retryInterval: 30s
-  path: ./release/0fb232c94a43b1d4ccd41c8bce496665b913c6e5/migrations
+  path: ./release/b64c73dbd7686f0401c4ce94501ebe3903f22bf4/migrations
   prune: false
   sourceRef:
     kind: GitRepository
@@ -40,7 +40,7 @@ spec:
   wait: true
   commonMetadata:
     labels:
-      uar.dev/release: 0fb232c94a43b1d4ccd41c8bce496665b913c6e5
+      uar.dev/release: b64c73dbd7686f0401c4ce94501ebe3903f22bf4
   dependsOn:
   - name: uar-dev-infra
     readyExpr: has(dep.status) && has(dep.status.conditions) && dep.metadata.labels['uar.dev/release']
@@ -53,11 +53,11 @@ metadata:
   name: uar-dev-apps
   namespace: flux-system
   labels:
-    uar.dev/release: 0fb232c94a43b1d4ccd41c8bce496665b913c6e5
+    uar.dev/release: b64c73dbd7686f0401c4ce94501ebe3903f22bf4
 spec:
   interval: 1m
   retryInterval: 30s
-  path: ./release/0fb232c94a43b1d4ccd41c8bce496665b913c6e5/apps
+  path: ./release/b64c73dbd7686f0401c4ce94501ebe3903f22bf4/apps
   prune: true
   sourceRef:
     kind: GitRepository
@@ -67,7 +67,7 @@ spec:
   wait: true
   commonMetadata:
     labels:
-      uar.dev/release: 0fb232c94a43b1d4ccd41c8bce496665b913c6e5
+      uar.dev/release: b64c73dbd7686f0401c4ce94501ebe3903f22bf4
   dependsOn:
   - name: uar-dev-migrations
     readyExpr: has(dep.status) && has(dep.status.conditions) && dep.metadata.labels['uar.dev/release']
