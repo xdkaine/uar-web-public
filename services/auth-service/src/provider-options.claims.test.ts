@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import Provider from 'oidc-provider';
 import {
   buildProviderOptions,
   claimsKey,
@@ -84,6 +85,28 @@ describe('widened claims contract (ADR-0012 amendment)', () => {
     expect(claims.openid).toContain('provider_session_expires_at');
     // Roles stay out of the contract.
     expect(JSON.stringify(claims)).not.toContain('roles');
+  });
+
+  it('retains code-bound AD authority in an OpenID-only ID token mask', async () => {
+    const config = configFixture();
+    const options = buildProviderOptions(config, depsWithCached(null));
+    // Exercise the real library mask used by the authorization-code grant
+    // when conformIdTokenClaims and userinfo are enabled (the defaults).
+    delete options.adapter;
+    const provider = new Provider(config.issuer, options) as unknown as {
+      Client: { find(id: string): Promise<unknown> };
+      IdToken: new (claims: Record<string, unknown>, options: { client: unknown }) => {
+        scope: string;
+        payload(): Promise<Record<string, unknown>>;
+      };
+    };
+    const client = await provider.Client.find(config.clientId);
+    for (const amr of [['ad'], ['ad', 'pwd_changed'], undefined]) {
+      const token = new provider.IdToken({ sub: 'alice', amr }, { client });
+      token.scope = 'openid';
+      const payload = await token.payload();
+      expect(payload.amr).toEqual(amr);
+    }
   });
 
   it('carries the signed provider-session expiry in the OpenID claims', async () => {

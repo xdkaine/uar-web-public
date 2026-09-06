@@ -113,7 +113,9 @@ export function buildProviderOptions(
       },
     ],
     claims: {
-      openid: ['sub', 'provider_session_expires_at'],
+      // Authorization-code ID tokens use the OpenID-only mask when userinfo
+      // is enabled. Keep code-bound authentication evidence in that mask.
+      openid: ['sub', 'provider_session_expires_at', 'amr'],
       email: ['email'],
       profile: ['name', 'preferred_username'],
       // amr is emitted by oidc-provider from the exact authenticated Session.
