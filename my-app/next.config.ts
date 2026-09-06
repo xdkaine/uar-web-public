@@ -88,9 +88,10 @@ const nextConfig: NextConfig = {
     ],
   },
   // Dynamic asset storage paths must not pull the source checkout into runners.
-  // Anchor project exclusions so dependency runtime files remain traceable.
+  // Match routes only: '*' also applies these patterns to Next's own server
+  // trace, where relative lib globs would remove framework runtime files.
   outputFileTracingExcludes: {
-    '*': [
+    '/*': [
       './.env*', './**/.env*',
       './app/**/*', './components/**/*', './hooks/**/*', './lib/**/*',
       './scripts/**/*', './types/**/*', './e2e/**/*', './tests/**/*',

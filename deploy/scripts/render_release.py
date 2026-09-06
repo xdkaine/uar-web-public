@@ -10,7 +10,7 @@ IMAGE_TOKENS = {
     'uar-auth-migrate:UNRELEASED': 'auth-migrate',
     'uar-monitor:UNRELEASED': 'monitor',
 }
-UPSTREAM_IMAGES = ('postgres:16-alpine', 'redis:7-alpine', 'nginx:1.27-alpine', 'clamav/clamav:stable')
+UPSTREAM_IMAGES = ('postgres:16-alpine', 'redis:7-alpine', 'nginx:1.27-alpine', 'clamav/clamav:stable', 'curlimages/curl:8.12.1')
 DIGEST = re.compile(r'^sha256:[0-9a-f]{64}$')
 
 
