@@ -88,15 +88,19 @@ class ApplyTests(unittest.TestCase):
         self.state = Path(self.temporary.name)
         self.recheck = patch("poller.recheck_source")
         self.recheck_mock = self.recheck.start()
+        self.pull = patch("poller.run")
+        self.pull_mock = self.pull.start()
 
     def tearDown(self):
         self.recheck.stop()
+        self.pull.stop()
         self.temporary.cleanup()
 
     @patch("poller.kubectl")
     def test_dry_run_never_touches_cluster(self, command):
         self.assertEqual(poller.apply_receipt(app(), receipt(), "f" * 40, self.state, dry_run=True), "validated-dry-run")
         command.assert_not_called()
+        self.pull_mock.assert_not_called()
         self.assertEqual(list(self.state.iterdir()), [])
 
     def command(self, target, *args):
@@ -139,7 +143,44 @@ class ApplyTests(unittest.TestCase):
         with patch("poller.kubectl", side_effect=self.command) as command, self.assertRaises(poller.DeliveryError):
             poller.apply_receipt(app(), receipt(), "f" * 40, self.state)
         self.assertTrue(all(call.args[1] == "get" for call in command.call_args_list))
+        self.pull_mock.assert_called_once_with(["k3s", "crictl", "pull", receipt()["images"]["api"]], timeout=600)
         self.assertEqual(json.loads((self.state / "test-dev.json").read_text())["status"], "failed")
+
+    @patch("poller.kubectl")
+    def test_prefetch_failure_prevents_snapshot_and_all_deployment_mutations(self, command):
+        self.pull_mock.side_effect = poller.DeliveryError("pull failed")
+        with self.assertRaises(poller.DeliveryError):
+            poller.apply_receipt(app(), receipt(), "f" * 40, self.state)
+        command.assert_not_called()
+        self.recheck_mock.assert_not_called()
+        self.assertEqual(list(self.state.iterdir()), [])
+
+    def test_prefetch_uses_fixed_argv_and_skips_migration_artifact(self):
+        target = app()
+        target["artifactRepositories"] = {"migrate": "ghcr.io/example/application-migrate"}
+        item = receipt()
+        item["images"]["migrate"] = "ghcr.io/example/application-migrate@sha256:" + DIGEST
+        poller.prefetch_images(target, item)
+        self.pull_mock.assert_called_once_with(["k3s", "crictl", "pull", item["images"]["api"]], timeout=600)
+
+    def test_invalid_image_is_rejected_before_prefetch(self):
+        item = receipt()
+        item["images"]["api"] = "ghcr.io/attacker/app@sha256:" + DIGEST
+        with self.assertRaises(poller.DeliveryError):
+            poller.prefetch_images(app(), item)
+        self.pull_mock.assert_not_called()
+
+    @patch("poller.probe_revision")
+    def test_prefetch_finishes_before_snapshot_and_source_recheck_before_patch(self, probe):
+        sequence = []
+        self.pull_mock.side_effect = lambda *args, **kwargs: sequence.append("pull")
+        self.recheck_mock.side_effect = lambda *args: sequence.append("source-check")
+        def command(target, *args):
+            sequence.append(args[0])
+            return self.command(target, *args)
+        with patch("poller.kubectl", side_effect=command):
+            poller.apply_receipt(app(), receipt(), "f" * 40, self.state)
+        self.assertEqual(sequence[:4], ["pull", "get", "source-check", "patch"])
 
 
 if __name__ == "__main__":

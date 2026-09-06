@@ -162,6 +162,15 @@ def kubectl(target, *args):
     return run(["kubectl", "--namespace", target["namespace"], *args], timeout=360)
 
 
+def prefetch_images(app, receipt):
+    # Pull only runtime targets. Operator migration artifacts remain metadata;
+    # this poller never runs or preloads them. CRI pull completes unpacking on
+    # this single-node K3s host before any Recreate deployment can lose its pod.
+    validate_receipt(receipt, app, receipt["source"])
+    for image in dict.fromkeys(receipt["images"][kind] for kind in app["targets"]):
+        run(["k3s", "crictl", "pull", image], timeout=600)
+
+
 def probe_revision(probe, expected):
     request = urllib.request.Request(probe["url"], headers={"Cache-Control": "no-cache"})
     with urllib.request.urlopen(request, timeout=10) as response:
@@ -179,6 +188,7 @@ def apply_receipt(app, receipt, receipt_commit, state_dir, *, dry_run=False):
         return "unchanged"
     if dry_run:
         return "validated-dry-run"
+    prefetch_images(app, receipt)
     previous = {}
     for component, target in app["targets"].items():
         deployment = json.loads(kubectl(target, "get", "deployment", target["deployment"], "-o", "json"))
