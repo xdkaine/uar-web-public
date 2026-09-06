@@ -4,3 +4,4 @@ resources:
 - access.yaml
 - budget.yaml
 - network-policies.yaml
+- auth-dev-network-policies.yaml

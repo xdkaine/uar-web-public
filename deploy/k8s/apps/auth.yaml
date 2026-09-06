@@ -1,13 +1,12 @@
+# Compatibility DNS for Portal; the Auth workload is owned by auth-service.
 apiVersion: v1
 kind: Service
 metadata:
   name: auth
 spec:
-  type: ClusterIP
-  selector:
-    app: auth
+  type: ExternalName
+  externalName: auth.auth-dev.svc.cluster.local
   ports:
   - name: tcp
     port: 3003
     targetPort: 3003
-  clusterIP: 10.43.10.3
