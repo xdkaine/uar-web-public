@@ -57,7 +57,7 @@ metadata:
 spec:
   interval: 1m
   retryInterval: 30s
-  path: ./release/b64c73dbd7686f0401c4ce94501ebe3903f22bf4/apps
+  path: ./release/b64c73dbd7686f0401c4ce94501ebe3903f22bf4-auth-3d87e619/apps
   prune: true
   sourceRef:
     kind: GitRepository
