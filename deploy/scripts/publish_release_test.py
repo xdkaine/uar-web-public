@@ -70,7 +70,9 @@ class ReleaseContractTests(unittest.TestCase):
         rendered = render_release(root, SHA, images, upstreams)
         service = rendered[f'release/{SHA}/apps/auth.yaml']
         self.assertIn('kind: Service', service)
-        self.assertIn('clusterIP: 10.43.10.3', service)
+        self.assertIn('type: ExternalName', service)
+        self.assertIn('externalName: auth.auth-dev.svc.cluster.local', service)
+        self.assertNotIn('selector:', service)
         self.assertNotIn('kind: Deployment', service)
         job = rendered[f'release/{SHA}/migrations/job.yaml']
         self.assertNotIn('auth-migration', job)
