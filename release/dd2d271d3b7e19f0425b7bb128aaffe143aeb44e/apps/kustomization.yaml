@@ -1,0 +1,46 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: uar-dev
+resources:
+- asset-data.yaml
+- clamav-data.yaml
+- asset-store.yaml
+- auth.yaml
+- clamav.yaml
+- monitor-probe.yaml
+- portal.yaml
+- schedulers.yaml
+configMapGenerator:
+- name: asset-store-config
+  files:
+  - nginx.conf
+- name: uar-runtime-policy
+  literals:
+  - NODE_ENV=production
+  - PORT=3002
+  - AUTH_PORT=3003
+  - REDIS_URL=redis://redis:6379
+  - ASSET_SERVICE_URL=http://asset-store:8090
+  - CLAMAV_HOST=clamav
+  - CLAMAV_PORT=3310
+  - MONITOR_PROBE_URL=http://monitor-probe:8091
+  - DATABASE_SSL_ALLOW_INSECURE=false
+  # Development LDAP exception approved by the operator; do not reuse for production.
+  - LDAP_ALLOW_INVALID_CERTS=true
+  - SESSION_COOKIE_ALLOW_INSECURE=false
+  - NODE_EXTRA_CA_CERTS=/etc/uar/database-tls/ca.crt
+  - LIFECYCLE_QUEUE_SCHEDULER_ENABLED=false
+  - MASS_EMAIL_SCHEDULER_ENABLED=false
+  - OFFBOARD_SCHEDULER_ENABLED=false
+  - PASSWORD_EXPIRATION_SCHEDULER_ENABLED=false
+  - PASSWORD_CLEANUP_SCHEDULER_ENABLED=false
+  - TICKET_GROUP_SYNC_ENABLED=false
+  - DIRECTORY_PROBE_ENABLED=false
+  - WORKFLOW_TICK_ENABLED=false
+  - OPERATIONAL_DETECTOR_SCHEDULER_ENABLED=false
+  - MONITORED_ENDPOINTS_SCHEDULER_ENABLED=false
+  - ATTACHMENT_QUARANTINE_PURGE_ENABLED=true
+  - FLOW_OUTBOX_SCHEDULER_ENABLED=true
+  - AUTH_DEVICE_EVIDENCE_MAINTENANCE_ENABLED=false
+generatorOptions:
+  disableNameSuffixHash: false
