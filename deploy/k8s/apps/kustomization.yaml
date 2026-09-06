@@ -25,7 +25,8 @@ configMapGenerator:
   - CLAMAV_PORT=3310
   - MONITOR_PROBE_URL=http://monitor-probe:8091
   - DATABASE_SSL_ALLOW_INSECURE=false
-  - LDAP_ALLOW_INVALID_CERTS=false
+  # Development LDAP exception approved by the operator; do not reuse for production.
+  - LDAP_ALLOW_INVALID_CERTS=true
   - SESSION_COOKIE_ALLOW_INSECURE=false
   - NODE_EXTRA_CA_CERTS=/etc/uar/database-tls/ca.crt
   - LIFECYCLE_QUEUE_SCHEDULER_ENABLED=false
