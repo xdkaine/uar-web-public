@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth
+spec:
+  type: ClusterIP
+  selector:
+    app: auth
+  ports:
+  - name: tcp
+    port: 3003
+    targetPort: 3003
+  clusterIP: 10.43.10.3
