@@ -53,6 +53,7 @@ jobs:
             docker run --rm --network none uar-check:auth npm test
           fi
       - name: Verify final runtime packaging
+        if: github.event_name == 'pull_request'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -65,7 +66,7 @@ jobs:
         if: matrix.service == 'portal'
         run: node --test deploy/k8s/migrations/run-release.test.cjs
   images:
-    name: Publish ${{ matrix.image }}
+    name: Build or reuse ${{ matrix.image }}
     needs: checks
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/dev' && vars.DEV_PORTAL_URL != '' && vars.DEV_AUTH_URL != '' && vars.DEV_TURNSTILE_SITE_KEY != ''
     runs-on: ubuntu-24.04
@@ -125,7 +126,9 @@ jobs:
             APP_REVISION=${{ github.sha }}
             NEXT_PUBLIC_APP_URL=${{ vars.DEV_PORTAL_URL }}
             NEXT_PUBLIC_TURNSTILE_SITE_KEY=${{ vars.DEV_TURNSTILE_SITE_KEY }}
-          cache-from: type=gha,scope=image-${{ matrix.image }}
+          cache-from: |
+            type=gha,scope=image-${{ matrix.image }}
+            type=gha,scope=check-portal
           cache-to: type=gha,scope=image-${{ matrix.image }},mode=max
       - name: Record immutable image
         env:
@@ -138,7 +141,7 @@ jobs:
           path: digests/*.json
           retention-days: 7
   release:
-    name: Publish tested development deployment
+    name: Publish deployment instructions
     needs: images
     if: github.ref == 'refs/heads/dev' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
