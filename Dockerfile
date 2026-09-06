@@ -84,8 +84,8 @@ ENV DATABASE_URL=$DATABASE_URL \
     TURNSTILE_SECRET_KEY=$TURNSTILE_SECRET_KEY \
     MONITOR_PROBE_SHARED_SECRET=$MONITOR_PROBE_SHARED_SECRET
 
-# Build Next.js application
-RUN npm run build
+# Use stable external module names in the standalone runner (Next.js #87737).
+RUN npm run build -- --webpack
 RUN ./node_modules/.bin/tsc \
     --target ES2022 \
     --module CommonJS \

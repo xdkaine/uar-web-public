@@ -49,4 +49,7 @@ for (const dependency of kind === 'portal'
 if (typeof require('@prisma/client').PrismaClient !== 'function') {
   throw new Error('Generated Prisma client is missing');
 }
+// Import a compiled route, not only package entrypoints: bundler aliases can be
+// missing even when direct dependency imports succeed. This does not serve a request.
+if (kind === 'portal') require(path.join(root, '.next/server/app/login/page.js'));
 console.log(`${kind} runtime packaging passed: ${inspected} project files; required assets and dependency imports present`);
