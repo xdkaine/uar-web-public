@@ -1,0 +1,21 @@
+{
+  "source": "c71ede579398eb11e675a854dc7da208539b3f5f",
+  "workflow_run": "34026016773",
+  "images": {
+    "portal": "ghcr.io/xdkaine/uar-web-public-portal@sha256:ed0c261c8f7dcb54f25e19bde2d65581d913976169db1856a8caa50c9139f0e1",
+    "portal-migrate": "ghcr.io/xdkaine/uar-web-public-portal-migrate@sha256:b5410e30b88b4684f09f831c1890c940df40c5f8a4818c0881bcd55eb25bdcc3",
+    "monitor": "ghcr.io/xdkaine/uar-web-public-monitor@sha256:7f3dc2f1d8bde49c72dc8fd1b1f9f4dbfa10f30022d5bc1dcbf24e8a50c2b0ef"
+  },
+  "inputHashes": {
+    "portal": "d010f1a6a1c1aaf73733133619b7ffb18887863d72fe195318b81031f87aa35e",
+    "portal-migrate": "5394d4c2c2731eae127cbb12da94f5e597cd1fdd7325f768fd89d2c6ec9721e3",
+    "monitor": "faeac2d5cb11060dff1929c503b8bbc40c7fa9b172028db1c1454ce7c0ccecd6"
+  },
+  "builtFrom": {
+    "portal": "c71ede579398eb11e675a854dc7da208539b3f5f",
+    "portal-migrate": "c71ede579398eb11e675a854dc7da208539b3f5f",
+    "monitor": "c71ede579398eb11e675a854dc7da208539b3f5f"
+  },
+  "portal_origin": "https://portal-dev.calpolysoc.org",
+  "auth_origin": "https://auth-dev.calpolysoc.org"
+}
