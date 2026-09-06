@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-KINDS = frozenset({'portal', 'auth', 'portal-migrate', 'auth-migrate', 'monitor'})
+KINDS = frozenset({'portal', 'portal-migrate', 'monitor'})
 REPOSITORY = 'xdkaine/uar-web-public'
 SHA_PATTERN = re.compile(r'^[0-9a-f]{40}$')
 DIGEST_PATTERN = re.compile(r'^sha256:[0-9a-f]{64}$')
@@ -40,7 +40,7 @@ def load_digests(directory, source):
             raise ValueError('Expected an immutable SHA-256 image digest.')
         result[kind] = f'ghcr.io/{REPOSITORY}-{kind}@{digest}'
     if set(result) != KINDS:
-        raise ValueError('All five tested image receipts are required.')
+        raise ValueError('All three tested Portal image receipts are required.')
     return result
 
 

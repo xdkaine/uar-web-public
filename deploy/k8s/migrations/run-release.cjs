@@ -68,7 +68,6 @@ async function runRelease({ db, run = runChild, env = process.env, log = console
     const steps = [
       ['bootstrap database roles', 'psql', ['-X', '-q', '-v', 'ON_ERROR_STOP=1', '-f', '/release/bootstrap-roles.sql'], env],
       ['apply portal migrations', '/app/node_modules/.bin/prisma', ['migrate', 'deploy', '--config', '/app/prisma.config.ts'], migrationEnv],
-      ['apply auth migrations', '/app/node_modules/.bin/prisma', ['migrate', 'deploy', '--config', '/app/auth-migration/prisma.config.ts'], migrationEnv],
       ['apply and verify runtime grants', 'sh', ['/opt/uar/database-role-separation/apply.sh'], env],
     ];
     for (const [label, command, args, childEnv] of steps) {
@@ -100,8 +99,6 @@ async function main() {
     throw new Error('Migration URL does not satisfy the isolated dev contract');
   }
   const runtimeRequire = createRequire('/app/package.json');
-  const fsVersion = require('node:fs');
-  if (fsVersion.readFileSync('/app/auth-migration/prisma-version', 'utf8').trim() !== runtimeRequire('prisma/package.json').version) throw new Error('Migration CLI versions differ');
   const { Client } = runtimeRequire('pg');
   const fs = require('node:fs');
   const client = new Client({ host: process.env.PGHOST, port: 5432, database: process.env.PGDATABASE, user: process.env.PGUSER, password: process.env.PGPASSWORD, ssl: { rejectUnauthorized: true, ca: fs.readFileSync('/etc/uar/database-tls/ca.crt', 'utf8') }, connectionTimeoutMillis: 10000, keepAlive: true, keepAliveInitialDelayMillis: 1000 });

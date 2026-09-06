@@ -111,6 +111,8 @@ ENTRYPOINT ["./node_modules/.bin/prisma"]
 CMD ["--help"]
 
 FROM base AS runner
+ARG APP_REVISION=local
+ENV APP_REVISION=$APP_REVISION
 WORKDIR /app
 
 ENV NODE_ENV=production

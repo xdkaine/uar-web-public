@@ -21,8 +21,6 @@ jobs:
         include:
           - service: portal
             dockerfile: Dockerfile
-          - service: auth
-            dockerfile: services/auth-service/Dockerfile
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -81,15 +79,9 @@ jobs:
           - image: portal
             dockerfile: Dockerfile
             target: runner
-          - image: auth
-            dockerfile: services/auth-service/Dockerfile
-            target: runner
           - image: portal-migrate
             dockerfile: Dockerfile
             target: prisma-tool
-          - image: auth-migrate
-            dockerfile: services/auth-service/Dockerfile
-            target: migration-tool
           - image: monitor
             dockerfile: services/monitor-probe/Dockerfile
             target: ''
@@ -121,6 +113,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
           build-args: |
+            APP_REVISION=${{ github.sha }}
             NEXT_PUBLIC_APP_URL=${{ vars.DEV_PORTAL_URL }}
             NEXT_PUBLIC_TURNSTILE_SITE_KEY=${{ vars.DEV_TURNSTILE_SITE_KEY }}
           cache-from: type=gha,scope=image-${{ matrix.image }}

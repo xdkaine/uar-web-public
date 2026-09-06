@@ -19,13 +19,14 @@ test('holds one database lease across ordered migrations and grants and removes 
     commands.push([cmd, args]);
     if (cmd.endsWith('prisma')) { assert.equal(options.env.PGPASSWORD, undefined); assert.equal(options.env.PGUSER, undefined); assert.equal(options.env.DATABASE_URL, 'migration-url'); }
   }});
-  assert.deepEqual(commands.map(c => c[0]), ['psql', '/app/node_modules/.bin/prisma', '/app/node_modules/.bin/prisma', 'sh']);
+  assert.deepEqual(commands.map(c => c[0]), ['psql', '/app/node_modules/.bin/prisma', 'sh']);
   assert.equal(commands[1][1].at(-1), '/app/prisma.config.ts');
-  assert.equal(commands[2][1].at(-1), '/app/auth-migration/prisma.config.ts');
+  assert.equal(commands[2][1].at(-1), '/opt/uar/database-role-separation/apply.sh');
+  assert.ok(commands.every(([, args]) => args.every(arg => !arg.includes('/app/auth-migration'))));
   assert.equal(db.calls.filter(c => c === LOCK_SQL).length, 1);
   assert.equal(db.calls.at(-1), 'end');
 });
-test('failed portal migration aborts auth and grants', async () => {
+test('failed portal migration aborts grants', async () => {
   const db = database(); let calls = 0;
   await assert.rejects(runRelease({ db, log() {}, run: async () => { if (++calls === 2) throw Error('failed'); } }));
   assert.equal(calls, 2); assert.equal(db.calls.at(-1), 'end');

@@ -18,23 +18,23 @@ class ReleaseContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             self.receipts(root)
             images = load_digests(root, SHA)
-            self.assertEqual(len(images), 5)
-            Path(root, 'auth.json').unlink()
+            self.assertEqual(len(images), 3)
+            Path(root, 'portal.json').unlink()
             with self.assertRaises(ValueError):
                 load_digests(root, SHA)
             self.receipts(root)
-            Path(root, 'auth.json').write_text(json.dumps({'kind': 'auth', 'digest': DIGEST, 'source': 'c' * 40}))
+            Path(root, 'portal.json').write_text(json.dumps({'kind': 'portal', 'digest': DIGEST, 'source': 'c' * 40}))
             with self.assertRaises(ValueError):
                 load_digests(root, SHA)
 
     def test_rejects_mutable_tags_unknown_and_duplicate_receipts(self):
         with tempfile.TemporaryDirectory() as root:
             self.receipts(root)
-            Path(root, 'auth.json').write_text(json.dumps({'kind': 'auth', 'digest': 'latest', 'source': SHA}))
+            Path(root, 'portal.json').write_text(json.dumps({'kind': 'portal', 'digest': 'latest', 'source': SHA}))
             with self.assertRaises(ValueError):
                 load_digests(root, SHA)
             self.receipts(root)
-            Path(root, 'duplicate.json').write_text(Path(root, 'auth.json').read_text())
+            Path(root, 'duplicate.json').write_text(Path(root, 'portal.json').read_text())
             with self.assertRaises(ValueError):
                 load_digests(root, SHA)
 
@@ -61,6 +61,23 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn('./release/' + SHA + '/migrations', release)
         self.assertIn('observedGeneration', release)
         self.assertIn("dep.metadata.labels['uar.dev/release']", release)
+
+
+    def test_portal_release_does_not_own_standalone_auth(self):
+        root = Path(__file__).resolve().parents[1] / 'k8s'
+        images = {kind: 'ghcr.io/xdkaine/uar-web-public-' + kind + '@' + DIGEST for kind in KINDS}
+        upstreams = {image: image.split(':')[0] + '@' + DIGEST for image in UPSTREAM_IMAGES}
+        rendered = render_release(root, SHA, images, upstreams)
+        service = rendered[f'release/{SHA}/apps/auth.yaml']
+        self.assertIn('kind: Service', service)
+        self.assertIn('clusterIP: 10.43.10.3', service)
+        self.assertNotIn('kind: Deployment', service)
+        job = rendered[f'release/{SHA}/migrations/job.yaml']
+        self.assertNotIn('auth-migration', job)
+        self.assertIn('AUTH_DATABASE_PASSWORD', job)
+        runner = rendered[f'release/{SHA}/migrations/run-release.cjs']
+        self.assertNotIn('/app/auth-migration/', runner)
+        self.assertIn('apply and verify runtime grants', runner)
 
 
 if __name__ == '__main__':

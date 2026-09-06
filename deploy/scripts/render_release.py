@@ -5,9 +5,7 @@ import subprocess
 
 IMAGE_TOKENS = {
     'uar-portal:UNRELEASED': 'portal',
-    'uar-auth:UNRELEASED': 'auth',
     'uar-portal-migrate:UNRELEASED': 'portal-migrate',
-    'uar-auth-migrate:UNRELEASED': 'auth-migrate',
     'uar-monitor:UNRELEASED': 'monitor',
 }
 UPSTREAM_IMAGES = ('postgres:16-alpine', 'redis:7-alpine', 'nginx:1.27-alpine', 'clamav/clamav:stable', 'curlimages/curl:8.12.1')
