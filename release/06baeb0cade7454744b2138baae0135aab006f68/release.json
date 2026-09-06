@@ -1,0 +1,13 @@
+{
+  "source": "06baeb0cade7454744b2138baae0135aab006f68",
+  "workflow_run": "34002337654",
+  "images": {
+    "auth-migrate": "ghcr.io/xdkaine/uar-web-public-auth-migrate@sha256:94071f764c9cd279c4f46218aad17f76235e94977fb7327ac46ddc2535ebeeba",
+    "portal": "ghcr.io/xdkaine/uar-web-public-portal@sha256:9945868c20e4305f46d8972df48ebdc7eeb250a2f4185b2ccfc23393447dc3a5",
+    "portal-migrate": "ghcr.io/xdkaine/uar-web-public-portal-migrate@sha256:2a6dfafd93445a38ac15604b6a85ec8654f451ddb627be817d81517274f47545",
+    "auth": "ghcr.io/xdkaine/uar-web-public-auth@sha256:f325f75eea5ee0d6f67b7c6e86a388f344a767c8f56e2530021f47605562a005",
+    "monitor": "ghcr.io/xdkaine/uar-web-public-monitor@sha256:5a572929e0502c14177ca708606b21140d9adc21209423aa427016009ac27ec0"
+  },
+  "portal_origin": "https://portal-dev.calpolysoc.org",
+  "auth_origin": "https://auth-dev.calpolysoc.org"
+}

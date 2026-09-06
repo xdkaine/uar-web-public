@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth
+spec:
+  type: ClusterIP
+  selector:
+    app: auth
+  ports:
+  - name: tcp
+    port: 3003
+    targetPort: 3003
+  clusterIP: 10.43.10.3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: auth
+  template:
+    metadata:
+      labels:
+        app: auth
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: auth
+        image: ghcr.io/xdkaine/uar-web-public-auth@sha256:f325f75eea5ee0d6f67b7c6e86a388f344a767c8f56e2530021f47605562a005
+        ports:
+        - containerPort: 3003
+        envFrom:
+        - secretRef:
+            name: uar-auth-runtime
+        env:
+        - name: NODE_ENV
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: NODE_ENV
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: REDIS_URL
+        - name: DATABASE_SSL_ALLOW_INSECURE
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: DATABASE_SSL_ALLOW_INSECURE
+        - name: LDAP_ALLOW_INVALID_CERTS
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: LDAP_ALLOW_INVALID_CERTS
+        - name: SESSION_COOKIE_ALLOW_INSECURE
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: SESSION_COOKIE_ALLOW_INSECURE
+        - name: NODE_EXTRA_CA_CERTS
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: NODE_EXTRA_CA_CERTS
+        - name: AUTH_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: AUTH_PORT
+        - name: AUTH_DEVICE_EVIDENCE_MAINTENANCE_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: uar-runtime-policy
+              key: AUTH_DEVICE_EVIDENCE_MAINTENANCE_ENABLED
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: 1500m
+            memory: 768Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: database-ca
+          mountPath: /etc/uar/database-tls
+          readOnly: true
+        startupProbe:
+          tcpSocket:
+            port: 3003
+          failureThreshold: 60
+          periodSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 3003
+          periodSeconds: 10
+          failureThreshold: 3
+        livenessProbe:
+          tcpSocket:
+            port: 3003
+          periodSeconds: 15
+          failureThreshold: 3
+      volumes:
+      - name: database-ca
+        secret:
+          secretName: uar-database-ca
+      terminationGracePeriodSeconds: 45
