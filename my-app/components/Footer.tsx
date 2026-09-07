@@ -3,6 +3,7 @@
 import React from 'react';
 import Image from 'next/image';
 import Link from "next/link";
+import BuildVersion from '@/components/BuildVersion';
 
 const Footer: React.FC = () => {
   return (
@@ -44,6 +45,7 @@ const Footer: React.FC = () => {
           <a href="https://www.linkedin.com/in/thomasphao" target="_blank" rel="noopener noreferrer" className="hover:text-blue-400 transition-colors">Tommy</a>
           <Image src="/love_sticker.gif" unoptimized alt="Love" width={24} height={24} className="object-contain" />
         </div>
+        <BuildVersion />
       </div>
     </footer>
   );
