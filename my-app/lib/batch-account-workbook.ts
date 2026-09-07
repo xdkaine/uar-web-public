@@ -47,6 +47,11 @@ export interface ImportedBatchAccounts {
 }
 
 function cellText(value: unknown): string | null {
+  // Excel automatically turns typed email addresses into hyperlink cells.
+  // Read only their displayed text; never follow or use the link destination.
+  if (value && typeof value === "object" && "hyperlink" in value && "text" in value && !("formula" in value) && !("sharedFormula" in value)) {
+    value = typeof value.text === "string" ? value.text : value;
+  }
   if (value === null || value === undefined || value === "") return "";
   return typeof value === "string" ? value.trim() : null;
 }

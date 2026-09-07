@@ -25,6 +25,28 @@ function workbook(adRows: unknown[][], vpnRows: unknown[][]): BatchWorkbook {
   return { getWorksheet: (name) => sheets.find((item) => item.name === name) } as BatchWorkbook;
 }
 describe("parseBatchAccountWorkbook", () => {
+  it('imports displayed AD and VPN email text from real XLSX hyperlink cells', async () => {
+    const book = new ExcelJS.Workbook();
+    const ad = book.addWorksheet(BATCH_AD_SHEET);
+    const vpn = book.addWorksheet(BATCH_VPN_SHEET);
+    ad.addRow([...BATCH_AD_COLUMNS]);
+    vpn.addRow([...BATCH_VPN_COLUMNS]);
+    for (let index = 0; index < 4; index++) {
+      ad.addRow(['Person', { text: `person${index}@example.test`, hyperlink: 'mailto:different@example.test' }, `person${index}`, 'Example-Pass42!', '', true]);
+    }
+    vpn.addRow(['VPN person', { text: 'vpn@example.test', hyperlink: 'mailto:vpn@example.test' }, 'vpn', 'Example-Pass42!', '2030-01-01', 'External']);
+    const bytes = await book.xlsx.writeBuffer();
+    const parsed = await readBatchAccountWorkbook(new File([bytes], 'hyperlinks.xlsx'));
+    expect(parsed.adAccounts.map(account => account.email)).toEqual(Array.from({ length: 4 }, (_, index) => `person${index}@example.test`));
+    expect(parsed.vpnAccounts[0].email).toBe('vpn@example.test');
+  });
+  it('continues to reject email formulas and malformed hyperlink objects', () => {
+    for (const email of [{ formula: 'HYPERLINK("mailto:a@b.test")', result: 'a@b.test' }, { hyperlink: 'mailto:a@b.test', text: 42 }]) {
+      expect(() => parseBatchAccountWorkbook(workbook(
+        [[...BATCH_AD_COLUMNS], ['Person', email, 'person', 'Example-Pass42!', '', true]], [[...BATCH_VPN_COLUMNS]],
+      ))).toThrow(/Email/);
+    }
+  });
   it("returns typed AD and VPN drafts from the defined sheets", () => {
     const result = parseBatchAccountWorkbook(workbook(
       [BATCH_AD_COLUMNS as unknown as unknown[], ["Ada Lovelace", "ada@example.test", "ada", " literal-password ", new Date("2030-01-01T00:00:00Z"), true]],
