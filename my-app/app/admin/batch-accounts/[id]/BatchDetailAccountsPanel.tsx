@@ -90,24 +90,41 @@ function AccountFilters({
 }
 
 function AccountTracking({ account }: { account: BatchAccount }) {
-  if (account.accountSystem === "AD" && account.accessRequestId) {
+  if (
+    account.lifecycleOwnerKind === "access_request_legacy" &&
+    account.accessRequestId
+  ) {
     return (
       <Link
         href={`/admin/requests/${account.accessRequestId}`}
         className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
       >
-        Request <ExternalLink className="h-3 w-3" />
+        Legacy request <ExternalLink className="h-3 w-3" />
       </Link>
     );
   }
-  if (account.accountSystem === "AD") {
+  if (account.lifecycleOwnerKind === "batch_item") {
     return (
-      <span className="text-xs text-amber-700 dark:text-amber-300">
-        Request missing
+      <span
+        className="text-xs text-muted-foreground"
+        title={`Batch run ${account.batchId}; batch item ${account.id}`}
+      >
+        Batch item
       </span>
     );
   }
-  return <span className="text-xs text-muted-foreground">Batch record</span>;
+  if (account.lifecycleOwnerKind === "access_request_legacy") {
+    return (
+      <span className="text-xs text-amber-700 dark:text-amber-300">
+        Request link missing
+      </span>
+    );
+  }
+  return (
+    <span className="text-xs text-amber-700 dark:text-amber-300">
+      Owner review needed
+    </span>
+  );
 }
 
 function AccountChecks({ account }: { account: BatchAccount }) {
@@ -171,6 +188,12 @@ function BatchAccountDetails({ account }: { account: BatchAccount }) {
             <div>
               <dt className="text-xs text-muted-foreground">Item ID</dt>
               <dd className="mt-1 break-all font-mono text-xs">{account.id}</dd>
+            </div>
+            <div className="sm:col-span-2">
+              <dt className="text-xs text-muted-foreground">Batch run ID</dt>
+              <dd className="mt-1 break-all font-mono text-xs">
+                {account.batchId}
+              </dd>
             </div>
             {account.directoryDn && (
               <div className="sm:col-span-2">

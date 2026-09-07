@@ -5,6 +5,7 @@ import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
 
 import AdminPageHeader from "@/components/admin/AdminPageHeader";
+import { BatchAccountExportButton } from "@/components/admin/BatchAccountExportButton";
 import { AdminRoutePage } from "@/components/admin/AdminRoutePage";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -33,7 +34,7 @@ function getAccountCounts(accounts: BatchAccount[]): BatchAccountCounts {
       0,
     ),
     linkedRequests: accounts.filter(
-      (account) => account.accountSystem === "AD" && account.accessRequestId,
+      (account) => account.lifecycleOwnerKind === "access_request_legacy" && account.accessRequestId,
     ).length,
     completed: accounts.filter((account) => account.status === "completed")
       .length,
@@ -79,6 +80,8 @@ function filterAccounts(
         account.email ?? "",
         account.username,
         account.accessRequestId ?? "",
+        account.id,
+        account.batchId,
       ].some((value) => value.toLowerCase().includes(normalizedQuery));
     return matchesFilter && matchesQuery;
   });
@@ -129,6 +132,7 @@ export default function BatchDetailClient({ batch }: BatchDetailClientProps) {
         }
       />
       <div className="space-y-5">
+        {batch.canExport && <BatchAccountExportButton batchId={batch.id} status={batch.status} />}
         <BatchDetailOverview batch={batch} accountCounts={accountCounts} />
         <BatchDetailIntegrityNotice
           batch={batch}

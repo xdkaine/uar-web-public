@@ -47,7 +47,9 @@ export async function GET(
             email: true,
             ldapUsername: true,
             vpnUsername: true,
+            batchId: true,
             accessRequestId: true,
+            lifecycleOwnerKind: true,
             accountExpiresAt: true,
             isInternal: true,
             status: true,
@@ -88,12 +90,17 @@ export async function GET(
       return NextResponse.json({ error: 'Batch not found' }, { status: 404 });
     }
 
-    const accounts = batch.accounts.map(account => projectBatchAccountDetail(account, { batchStatus: batch.status }));
+    const accounts = batch.accounts.map(account => projectBatchAccountDetail(account, {
+      batchId: batch.id,
+      batchStatus: batch.status,
+    }));
     const batchView = {
       id: batch.id,
       createdAt: batch.createdAt,
       updatedAt: batch.updatedAt,
       createdBy: batch.createdBy,
+      canExport: batch.createdBy.trim().toLowerCase() === admin.username.trim().toLowerCase()
+        && ['completed', 'failed'].includes(batch.status),
       description: batch.description,
       totalAccounts: batch.totalAccounts,
       successfulAccounts: batch.successfulAccounts,

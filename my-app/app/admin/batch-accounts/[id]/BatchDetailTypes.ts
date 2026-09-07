@@ -1,5 +1,6 @@
 import type {
   BatchAccountDetailIssue,
+  BatchAccountLifecycleOwnerKind,
   BatchAccountSystem,
 } from "@/lib/batch-account-detail";
 
@@ -12,7 +13,9 @@ export interface BatchAccount {
   username: string;
   name: string;
   email: string | null;
+  batchId: string;
   accessRequestId: string | null;
+  lifecycleOwnerKind: BatchAccountLifecycleOwnerKind;
   accountExpiresAt: string | null;
   isInternal: boolean;
   status: string;
@@ -41,6 +44,7 @@ export interface BatchDetail {
   createdAt: string;
   updatedAt: string;
   createdBy: string;
+  canExport: boolean;
   description: string;
   totalAccounts: number;
   successfulAccounts: number;

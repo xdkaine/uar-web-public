@@ -13,9 +13,10 @@ import {
   ArrowLeft,
   ArrowRight,
   Check,
+  Download,
   Plus,
-  RefreshCw,
   Trash2,
+  Upload,
 } from "lucide-react";
 import { requestActionImpact } from "@/components/admin/actionImpactRequest";
 import { BATCH_OWNERSHIP_CONFIRMATION } from "@/components/admin/batchAccountConfirmation";
@@ -47,8 +48,14 @@ import {
   type BatchVpnAccountDraft,
 } from "@/lib/batch-account-plan";
 import { fetchWithCsrf } from "@/lib/csrf";
+import {
+  BatchAccountWorkbookError,
+  downloadBatchAccountWorkbookTemplate,
+  readBatchAccountWorkbook,
+} from "@/lib/batch-account-workbook";
 import { useToast } from "@/hooks/useToast";
 import { BatchHistory } from "./BatchHistory";
+import { BatchAccountField as Field } from "./BatchAccountField";
 
 export interface BatchCreation {
   id: string;
@@ -112,8 +119,11 @@ export default function BatchAccountsTab({
   const [adAccounts, setAdAccounts] = useState<AdEntry[]>([]);
   const [vpnAccounts, setVpnAccounts] = useState<VpnEntry[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const [workbookErrors, setWorkbookErrors] = useState<string[]>([]);
   const keyRef = useRef("");
   const submittedRef = useRef(false);
+  const importVersionRef = useRef(0);
   const requested = searchParams.get("action") === "new";
   const visible = open || requested;
   const review = useMemo(
@@ -121,12 +131,15 @@ export default function BatchAccountsTab({
     [description, adAccounts, vpnAccounts],
   );
   const reset = () => {
+    importVersionRef.current += 1;
+    setIsImporting(false);
     setOpen(false);
     setStep(1);
     setDescription("");
     setLinkedTicketId("");
     setAdAccounts([]);
     setVpnAccounts([]);
+    setWorkbookErrors([]);
     keyRef.current = "";
     submittedRef.current = false;
     if (requested) {
@@ -145,6 +158,7 @@ export default function BatchAccountsTab({
     }
   };
   const addAd = () => {
+    if (isImporting) return;
     if (adAccounts.length + vpnAccounts.length >= 100)
       return showToast("Maximum 100 total accounts per batch", "error");
     edit();
@@ -162,6 +176,7 @@ export default function BatchAccountsTab({
     ]);
   };
   const addVpn = () => {
+    if (isImporting) return;
     if (adAccounts.length + vpnAccounts.length >= 100)
       return showToast("Maximum 100 total accounts per batch", "error");
     edit();
@@ -177,6 +192,30 @@ export default function BatchAccountsTab({
         portalType: "External",
       },
     ]);
+  };
+  const importWorkbook = async (file: File) => {
+    if (isImporting || isSubmitting) return;
+    const version = ++importVersionRef.current;
+    setIsImporting(true);
+    try {
+      const imported = await readBatchAccountWorkbook(file);
+      if (version !== importVersionRef.current) return;
+      if (adAccounts.length + vpnAccounts.length + imported.adAccounts.length + imported.vpnAccounts.length > 100) {
+        throw new BatchAccountWorkbookError(["This import would exceed the 100-account batch limit."]);
+      }
+      edit();
+      setAdAccounts((items) => [...items, ...imported.adAccounts.map((account) => ({ ...account, draftKey: crypto.randomUUID() }))]);
+      setVpnAccounts((items) => [...items, ...imported.vpnAccounts.map((account) => ({ ...account, draftKey: crypto.randomUUID() }))]);
+      setWorkbookErrors([]);
+      showToast(`Added ${imported.adAccounts.length} AD and ${imported.vpnAccounts.length} VPN account(s) for review.`, "success");
+    } catch (error) {
+      if (version !== importVersionRef.current) return;
+      const errors = error instanceof BatchAccountWorkbookError ? error.errors : ["The workbook could not be read. Download a fresh template and try again."];
+      setWorkbookErrors(errors);
+      showToast(errors[0], "error");
+    } finally {
+      if (version === importVersionRef.current) setIsImporting(false);
+    }
   };
   const cancel = async (batch: BatchCreation) => {
     const decision = await requestActionImpact({
@@ -218,7 +257,8 @@ export default function BatchAccountsTab({
     }
   };
   const submit = async () => {
-    if (!review.isReady || isSubmitting) return;
+    if (!review.isReady || isSubmitting || isImporting) return;
+    if (!keyRef.current) keyRef.current = crypto.randomUUID();
     const ticket = supportTickets.find((item) => item.id === linkedTicketId);
     const decision = await requestActionImpact({
       title: "Start reviewed account batch",
@@ -320,6 +360,7 @@ export default function BatchAccountsTab({
           vpnAccounts={vpnAccounts}
           review={review}
           isSubmitting={isSubmitting}
+          isImporting={isImporting}
           onDescription={(value) => {
             edit();
             setDescription(value);
@@ -332,6 +373,9 @@ export default function BatchAccountsTab({
           onVpnChange={setVpnAccounts}
           onAddAd={addAd}
           onAddVpn={addVpn}
+          workbookErrors={workbookErrors}
+          onDownloadTemplate={() => void downloadBatchAccountWorkbookTemplate()}
+          onImportWorkbook={(file) => void importWorkbook(file)}
           onClose={reset}
           onStep={setStep}
           onSubmit={() => void submit()}
@@ -355,12 +399,16 @@ function BatchWizard({
   vpnAccounts,
   review,
   isSubmitting,
+  isImporting,
   onDescription,
   onTicket,
   onAdChange,
   onVpnChange,
   onAddAd,
   onAddVpn,
+  workbookErrors,
+  onDownloadTemplate,
+  onImportWorkbook,
   onClose,
   onStep,
   onSubmit,
@@ -373,12 +421,16 @@ function BatchWizard({
   vpnAccounts: VpnEntry[];
   review: Review;
   isSubmitting: boolean;
+  isImporting: boolean;
   onDescription: (value: string) => void;
   onTicket: (value: string) => void;
   onAdChange: SetEntries<AdEntry>;
   onVpnChange: SetEntries<VpnEntry>;
   onAddAd: () => void;
   onAddVpn: () => void;
+  workbookErrors: string[];
+  onDownloadTemplate: () => void;
+  onImportWorkbook: (file: File) => void;
   onClose: () => void;
   onStep: (step: 1 | 2 | 3) => void;
   onSubmit: () => void;
@@ -433,6 +485,10 @@ function BatchWizard({
             onVpnChange={onVpnChange}
             onAddAd={onAddAd}
             onAddVpn={onAddVpn}
+            workbookErrors={workbookErrors}
+            onDownloadTemplate={onDownloadTemplate}
+            onImportWorkbook={onImportWorkbook}
+            isImporting={isImporting}
           />
         ) : (
           <BatchReview
@@ -464,7 +520,7 @@ function BatchWizard({
           ) : (
             <Button
               onClick={onSubmit}
-              disabled={!review.isReady || isSubmitting}
+              disabled={!review.isReady || isSubmitting || isImporting}
             >
               {isSubmitting
                 ? "Starting batch…"
@@ -532,6 +588,10 @@ function BatchAccountsEditor({
   onVpnChange,
   onAddAd,
   onAddVpn,
+  workbookErrors,
+  onDownloadTemplate,
+  onImportWorkbook,
+  isImporting,
 }: {
   adAccounts: AdEntry[];
   vpnAccounts: VpnEntry[];
@@ -539,7 +599,12 @@ function BatchAccountsEditor({
   onVpnChange: SetEntries<VpnEntry>;
   onAddAd: () => void;
   onAddVpn: () => void;
+  workbookErrors: string[];
+  onDownloadTemplate: () => void;
+  onImportWorkbook: (file: File) => void;
+  isImporting: boolean;
 }) {
+  const inputRef = useRef<HTMLInputElement>(null);
   const update = (
     kind: "ad" | "vpn",
     index: number,
@@ -563,6 +628,20 @@ function BatchAccountsEditor({
     )((items) => items.filter((item) => item.draftKey !== key));
   return (
     <div className="space-y-7">
+      <section className="rounded-md border bg-muted/20 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="font-semibold">Import batch workbook</h3>
+            <p className="text-sm text-muted-foreground">Sheet 1 is AD accounts and Sheet 2 is VPN accounts. Imported rows are added below for review before anything is started.</p>
+          </div>
+          <div className="flex gap-2">
+            <Button type="button" variant="outline" size="sm" onClick={onDownloadTemplate}><Download className="h-4 w-4" /> Download template</Button>
+            <Button type="button" variant="outline" size="sm" disabled={isImporting} onClick={() => inputRef.current?.click()}><Upload className="h-4 w-4" /> {isImporting ? "Importing…" : "Import .xlsx"}</Button>
+            <input ref={inputRef} type="file" disabled={isImporting} accept="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx" className="sr-only" onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; if (file) onImportWorkbook(file); }} />
+          </div>
+        </div>
+        {workbookErrors.length > 0 && <Alert variant="destructive" className="mt-3"><AlertTriangle /><AlertTitle>Workbook needs correction</AlertTitle><AlertDescription><ul className="list-disc pl-4">{workbookErrors.map((error) => <li key={error}>{error}</li>)}</ul></AlertDescription></Alert>}
+      </section>
       <AccountSection
         title="AD accounts"
         accounts={adAccounts}
@@ -745,49 +824,6 @@ function AccountFields({
     </div>
   );
 }
-function Field({
-  id,
-  label,
-  value,
-  onChange,
-  type = "text",
-  password: isPassword,
-  onGenerate,
-}: {
-  id: string;
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  type?: string;
-  password?: boolean;
-  onGenerate?: () => void;
-}) {
-  return (
-    <div className="space-y-1.5">
-      <Label htmlFor={id}>{label}</Label>
-      <div className="flex gap-2">
-        <Input
-          id={id}
-          type={isPassword ? "password" : type}
-          autoComplete={isPassword ? "new-password" : undefined}
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-        />
-        {isPassword && (
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            title="Generate password"
-            onClick={onGenerate}
-          >
-            <RefreshCw className="h-4 w-4" />
-          </Button>
-        )}
-      </div>
-    </div>
-  );
-}
 function BatchReview({
   review,
   description,
@@ -859,7 +895,7 @@ function BatchReview({
         <div>
           Tracking
           <p className="font-medium">
-            One batch ID + one request ID per AD account
+            One batch run ID + one batch item ID per account
           </p>
         </div>
       </div>

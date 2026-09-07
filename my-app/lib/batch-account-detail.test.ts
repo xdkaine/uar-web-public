@@ -16,7 +16,9 @@ function source(overrides: Partial<BatchAccountDetailSource> = {}): BatchAccount
     email: 'account.person@example.test',
     ldapUsername: 'accountperson',
     vpnUsername: null,
+    batchId: 'batch-1',
     accessRequestId: 'request-1',
+    lifecycleOwnerKind: 'access_request_legacy',
     accountExpiresAt: null,
     isInternal: true,
     status: 'completed',
@@ -32,6 +34,10 @@ function source(overrides: Partial<BatchAccountDetailSource> = {}): BatchAccount
 }
 
 describe('batch account detail projection', () => {
+  it('flags a standalone item that also claims request ownership', () => {
+    const account = projectBatchAccountDetail(source({ lifecycleOwnerKind: 'batch_item', accessRequestId: 'request-1' }));
+    expect(account.issues.map(issue => issue.code)).toContain('conflicting_lifecycle_owner');
+  });
   it('uses AD terminology and request tracking for directory accounts', () => {
     const account = projectBatchAccountDetail(source());
 
@@ -51,6 +57,7 @@ describe('batch account detail projection', () => {
       ldapUsername: 'storage-alias',
       vpnUsername: 'vpn-person',
       accessRequestId: null,
+      lifecycleOwnerKind: 'batch_item',
       ldapCreatedAt: null,
       vpnCreatedAt: '2026-08-31T01:03:00.000Z',
       targetDirectoryDn: null,
@@ -66,19 +73,41 @@ describe('batch account detail projection', () => {
     expect(account).not.toHaveProperty('ldapUsername');
   });
 
-  it('flags legacy VPN fallback and missing AD governance evidence', () => {
+  it('uses a completed standalone batch item as the AD tracking owner', () => {
+    const account = projectBatchAccountDetail(source({
+      accessRequestId: null,
+      lifecycleOwnerKind: 'batch_item',
+    }), { batchId: 'batch-1' });
+
+    expect(account).toMatchObject({
+      batchId: 'batch-1',
+      lifecycleOwnerKind: 'batch_item',
+      accessRequestId: null,
+    });
+    expect(account.issues.map(issue => issue.code)).not.toContain('missing_access_request');
+    expect(account.issues.map(issue => issue.code)).not.toContain('unresolved_lifecycle_owner');
+  });
+
+  it('keeps legacy and unresolved ownership findings distinct', () => {
     const legacyVpn = projectBatchAccountDetail(source({
       accountType: 'VPN',
       vpnUsername: null,
       ldapUsername: 'legacy-vpn',
       accessRequestId: null,
+      lifecycleOwnerKind: 'batch_item',
       ldapCreatedAt: null,
       vpnCreatedAt: null,
       targetDirectoryDn: null,
       targetDirectoryObjectGuid: null,
     }));
-    const untrackedAd = projectBatchAccountDetail(source({
+    const legacyAdWithoutRequest = projectBatchAccountDetail(source({
       accessRequestId: null,
+      lifecycleOwnerKind: 'access_request_legacy',
+      targetDirectoryObjectGuid: null,
+    }));
+    const unresolvedAd = projectBatchAccountDetail(source({
+      accessRequestId: null,
+      lifecycleOwnerKind: 'unresolved',
       targetDirectoryObjectGuid: null,
     }));
 
@@ -87,8 +116,12 @@ describe('batch account detail projection', () => {
       'legacy_vpn_username_fallback',
       'missing_vpn_completion_time',
     ]));
-    expect(untrackedAd.issues.map(issue => issue.code)).toEqual(expect.arrayContaining([
-      'missing_access_request',
+    expect(legacyAdWithoutRequest.issues.map(issue => issue.code)).toEqual(expect.arrayContaining([
+      'missing_legacy_access_request',
+      'missing_directory_identity',
+    ]));
+    expect(unresolvedAd.issues.map(issue => issue.code)).toEqual(expect.arrayContaining([
+      'unresolved_lifecycle_owner',
       'missing_directory_identity',
     ]));
   });

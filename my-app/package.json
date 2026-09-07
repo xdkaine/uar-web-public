@@ -61,6 +61,7 @@
     "cmdk": "^1.1.1",
     "csrf-csrf": "^4.0.3",
     "dotenv": "^17.2.3",
+    "exceljs": "4.4.0",
     "framer-motion": "^12.23.24",
     "geist": "^1.5.1",
     "html-to-text": "^10.0.0",

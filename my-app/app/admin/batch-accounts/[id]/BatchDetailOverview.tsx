@@ -46,6 +46,16 @@ export function BatchDetailOverview({
   batch,
   accountCounts,
 }: BatchDetailOverviewProps) {
+  const directBatchItems = batch.accounts.filter(
+    (account) => account.lifecycleOwnerKind === "batch_item",
+  ).length;
+  const legacyRequestItems = batch.accounts.filter(
+    (account) => account.lifecycleOwnerKind === "access_request_legacy",
+  ).length;
+  const unresolvedOwnerItems = batch.accounts.filter(
+    (account) => account.lifecycleOwnerKind === "unresolved",
+  ).length;
+
   return (
     <section
       aria-labelledby="batch-overview-heading"
@@ -93,9 +103,15 @@ export function BatchDetailOverview({
         </div>
         <CurrentItemStates accountCounts={accountCounts} />
         <div className="px-4 py-3 sm:px-5">
-          <dt className="text-xs text-muted-foreground">AD request tracking</dt>
+          <dt className="text-xs text-muted-foreground">Lifecycle tracking</dt>
           <dd className="mt-1 text-sm font-medium tabular-nums">
-            {accountCounts.linkedRequests} of {accountCounts.ad} linked
+            {directBatchItems} batch item{directBatchItems === 1 ? "" : "s"} ·{" "}
+            {legacyRequestItems} legacy request{legacyRequestItems === 1 ? "" : "s"}
+            {unresolvedOwnerItems > 0 && (
+              <span className="block text-xs font-normal text-amber-700 dark:text-amber-300">
+                {unresolvedOwnerItems} item{unresolvedOwnerItems === 1 ? " needs" : "s need"} owner review
+              </span>
+            )}
           </dd>
         </div>
       </dl>

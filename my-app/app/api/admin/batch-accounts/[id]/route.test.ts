@@ -55,7 +55,8 @@ function batchFixture() {
         ldapUsername: 'adperson',
         vpnUsername: null,
         password: 'encrypted-ad-password',
-        accessRequestId: 'request-1',
+        accessRequestId: null,
+        lifecycleOwnerKind: 'batch_item',
         accountExpiresAt: null,
         isInternal: true,
         status: 'completed',
@@ -79,6 +80,7 @@ function batchFixture() {
         vpnUsername: 'vpnperson',
         password: 'encrypted-vpn-password',
         accessRequestId: null,
+        lifecycleOwnerKind: 'batch_item',
         accountExpiresAt: new Date('2027-01-01T00:00:00.000Z'),
         isInternal: false,
         status: 'completed',
@@ -128,11 +130,12 @@ describe('batch detail response contract', () => {
     expect(mocks.audit).not.toHaveBeenCalled();
   });
 
-  it('returns operator concepts without persistence or lease internals', async () => {
+  it('returns standalone batch ownership tracking without persistence or lease internals', async () => {
     const response = await GET(request, params);
     const body = await response.json();
 
     expect(response.status).toBe(200);
+    expect(body.batch.canExport).toBe(true);
     expect(body.batch).not.toHaveProperty('submissionKey');
     expect(body.batch).not.toHaveProperty('submissionFingerprint');
     expect(body.batch).not.toHaveProperty('processingClaimId');
@@ -144,20 +147,51 @@ describe('batch detail response contract', () => {
         accountSystem: 'AD',
         accountSystemLabel: 'Active Directory',
         username: 'adperson',
-        accessRequestId: 'request-1',
+        batchId: 'batch-1',
+        lifecycleOwnerKind: 'batch_item',
+        accessRequestId: null,
+        issues: [],
       }),
       expect.objectContaining({
         id: 'vpn-item',
         accountSystem: 'VPN',
         accountSystemLabel: 'VPN',
         username: 'vpnperson',
+        batchId: 'batch-1',
+        lifecycleOwnerKind: 'batch_item',
       }),
     ]));
     for (const account of body.batch.accounts) {
       expect(account).not.toHaveProperty('ldapUsername');
       expect(account).not.toHaveProperty('vpnUsername');
       expect(account).not.toHaveProperty('password');
-      expect(account).not.toHaveProperty('batchId');
     }
+  });
+
+  it('limits credential export to its completed or failed batch creator', async () => {
+    mocks.auth.mockResolvedValue({
+      admin: { username: 'another-admin', permissions: new Set(['batch.manage']) },
+      response: null,
+    });
+
+    const response = await GET(request, params);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.batch.canExport).toBe(false);
+  });
+
+  it('does not allow export before the creator batch reaches a terminal outcome', async () => {
+    mocks.findUnique.mockResolvedValue({
+      ...batchFixture(),
+      status: 'processing',
+      completedAt: null,
+    });
+
+    const response = await GET(request, params);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.batch.canExport).toBe(false);
   });
 });

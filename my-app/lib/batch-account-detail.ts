@@ -1,5 +1,6 @@
 export type BatchAccountSystem = 'AD' | 'VPN' | 'UNKNOWN';
 export type BatchAccountIssueSeverity = 'warning' | 'error';
+export type BatchAccountLifecycleOwnerKind = 'batch_item' | 'access_request_legacy' | 'unresolved';
 
 export interface BatchAccountDetailIssue {
   code: string;
@@ -16,7 +17,9 @@ export interface BatchAccountDetailSource {
   email: string | null;
   ldapUsername: string;
   vpnUsername: string | null;
+  batchId: string;
   accessRequestId: string | null;
+  lifecycleOwnerKind: string | null | undefined;
   accountExpiresAt: Date | string | null;
   isInternal: boolean;
   status: string;
@@ -38,7 +41,9 @@ export interface BatchAccountDetailView {
   username: string;
   name: string;
   email: string | null;
+  batchId: string;
   accessRequestId: string | null;
+  lifecycleOwnerKind: BatchAccountLifecycleOwnerKind;
   accountExpiresAt: Date | string | null;
   isInternal: boolean;
   status: string;
@@ -63,6 +68,7 @@ export interface BatchAccountStateCounts {
 
 interface BatchAccountProjectionContext {
   batchStatus?: string;
+  batchId?: string;
 }
 
 const STAGE_LABELS: Record<string, string> = {
@@ -88,6 +94,12 @@ const KNOWN_ITEM_STATUSES = new Set([
   'skipped',
 ]);
 
+const LIFECYCLE_OWNER_KINDS = new Set<BatchAccountLifecycleOwnerKind>([
+  'batch_item',
+  'access_request_legacy',
+  'unresolved',
+]);
+
 const AMBIGUOUS_STARTED_STAGES = new Set([
   'ldap_create_started',
   'ldap_password_started',
@@ -110,6 +122,14 @@ function fallbackLabel(value: string | null): string {
   return value.replaceAll('_', ' ').replace(/\b\w/g, character => character.toUpperCase());
 }
 
+function lifecycleOwnerKind(
+  value: string | null | undefined
+): BatchAccountLifecycleOwnerKind {
+  return LIFECYCLE_OWNER_KINDS.has(value as BatchAccountLifecycleOwnerKind)
+    ? value as BatchAccountLifecycleOwnerKind
+    : 'unresolved';
+}
+
 export function projectBatchAccountDetail(
   source: BatchAccountDetailSource,
   context: BatchAccountProjectionContext = {}
@@ -118,6 +138,7 @@ export function projectBatchAccountDetail(
   const directoryUsername = normalized(source.ldapUsername);
   const vpnUsername = normalized(source.vpnUsername);
   const username = system === 'VPN' ? (vpnUsername || directoryUsername) : directoryUsername;
+  const ownerKind = lifecycleOwnerKind(source.lifecycleOwnerKind);
   const issues: BatchAccountDetailIssue[] = [];
 
   if (system === 'UNKNOWN') {
@@ -140,6 +161,44 @@ export function projectBatchAccountDetail(
       message: `Unrecognized account status "${source.status || 'blank'}".`,
     });
   }
+  if (!normalized(source.batchId)) {
+    issues.push({
+      code: 'missing_batch_tracking',
+      severity: 'error',
+      message: 'No creation batch run is recorded for this account item.',
+    });
+  } else if (context.batchId && source.batchId !== context.batchId) {
+    issues.push({
+      code: 'batch_tracking_mismatch',
+      severity: 'error',
+      message: 'The account item belongs to a different batch run than this detail view.',
+    });
+  }
+  if (!LIFECYCLE_OWNER_KINDS.has(source.lifecycleOwnerKind as BatchAccountLifecycleOwnerKind)) {
+    issues.push({
+      code: 'unresolved_lifecycle_owner',
+      severity: 'warning',
+      message: 'No recognized lifecycle owner is recorded. Review the batch item tracking before later account changes.',
+    });
+  } else if (ownerKind === 'batch_item' && source.accessRequestId) {
+    issues.push({
+      code: 'conflicting_lifecycle_owner',
+      severity: 'error',
+      message: 'This item claims standalone batch ownership but also links an access request. Review the conflicting ownership records.',
+    });
+  } else if (ownerKind === 'access_request_legacy' && !source.accessRequestId) {
+    issues.push({
+      code: 'missing_legacy_access_request',
+      severity: 'warning',
+      message: 'This historical item is request-owned, but its access request link is missing.',
+    });
+  } else if (ownerKind === 'unresolved') {
+    issues.push({
+      code: 'unresolved_lifecycle_owner',
+      severity: 'warning',
+      message: 'This account item has unresolved lifecycle ownership and must be reviewed before later account changes.',
+    });
+  }
 
   if (system === 'AD') {
     if (vpnUsername || source.vpnCreatedAt) {
@@ -151,13 +210,6 @@ export function projectBatchAccountDetail(
     }
     if (!normalized(source.email)) {
       issues.push({ code: 'missing_ad_email', severity: 'warning', message: 'The AD account has no email address.' });
-    }
-    if (!source.accessRequestId) {
-      issues.push({
-        code: 'missing_access_request',
-        severity: 'warning',
-        message: 'No access request is linked. This is legacy or incomplete tracking and should be reviewed before later account changes.',
-      });
     }
     if (source.status === 'completed' && !source.ldapCreatedAt) {
       issues.push({
@@ -245,7 +297,9 @@ export function projectBatchAccountDetail(
     username,
     name: source.name,
     email: source.email,
+    batchId: source.batchId,
     accessRequestId: system === 'AD' ? source.accessRequestId : null,
+    lifecycleOwnerKind: ownerKind,
     accountExpiresAt: source.accountExpiresAt,
     isInternal: source.isInternal,
     status: source.status,
