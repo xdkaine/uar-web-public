@@ -37,7 +37,7 @@ function makeActions(overrides: Partial<Parameters<typeof createAccountSetupActi
     vpnUsername: 'taylor-vpn',
     password: 'operator-password',
     usernameCheckMessage: 'Username is available',
-    expirationDateTime: '2026-09-10T17:04',
+    expirationDateTime: '2026-09-10T17:04:00-07:00',
     showToast,
     openConfirmation: (next) => { confirmation = next; },
     closeConfirmation,
@@ -101,7 +101,7 @@ it('captures create inputs, saves credentials before account creation, and redir
     body: JSON.stringify({
       ldapUsername: 'taylor-ad',
       password: 'operator-password',
-      expirationDate: '2026-09-10T17:04:00',
+      expirationDate: '2026-09-11T00:04:00.000Z',
       vpnUsername: 'taylor-vpn',
     }),
   });
@@ -146,7 +146,7 @@ it('updates with a disabled VPN module as null and refreshes after a successful 
       newLdapUsername: 'taylor-ad',
       newVpnUsername: null,
       newPassword: 'operator-password',
-      newExpirationDate: '2026-09-10T17:04:00',
+      newExpirationDate: '2026-09-11T00:04:00.000Z',
     }),
   });
   expect(fixture.refreshRequest).toHaveBeenCalledOnce();

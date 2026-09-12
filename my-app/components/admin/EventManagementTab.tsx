@@ -66,10 +66,7 @@ export default function EventManagementTab({
 
   const handleEditEvent = (event: ManagedEvent) => {
     setEditingEvent(event);
-    const date = event.endDate ? new Date(event.endDate) : null;
-    const endDate = date
-      ? `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}T${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`
-      : "";
+    const endDate = event.endDate || "";
     setEventFormData({
       name: event.name,
       description: event.description || "",
@@ -92,11 +89,7 @@ export default function EventManagementTab({
             name: eventFormData.name,
             description: eventFormData.description,
             endDate: eventFormData.endDate
-              ? new Date(
-                  eventFormData.endDate.includes(":00")
-                    ? eventFormData.endDate
-                    : `${eventFormData.endDate}:00`,
-                ).toISOString()
+              ? new Date(eventFormData.endDate).toISOString()
               : null,
             isActive: eventFormData.isActive,
           }),

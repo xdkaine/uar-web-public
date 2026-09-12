@@ -6,14 +6,6 @@ import {
   type AccountDraftRequest,
 } from './accountDraftState';
 
-function formatLocalDateTime(value: Date) {
-  const year = value.getFullYear();
-  const month = String(value.getMonth() + 1).padStart(2, '0');
-  const day = String(value.getDate()).padStart(2, '0');
-  const hours = String(value.getHours()).padStart(2, '0');
-  const minutes = String(value.getMinutes()).padStart(2, '0');
-  return `${year}-${month}-${day}T${hours}:${minutes}`;
-}
 
 const externalRequest: AccountDraftRequest = {
   name: 'Taylor Example',
@@ -42,7 +34,7 @@ it('hydrates saved account fields while preserving the operator password, visibi
   expect(hydrated).toMatchObject({
     ldapUsername: 'saved-ad',
     vpnUsername: 'saved-vpn',
-    expirationDateTime: formatLocalDateTime(new Date(accountExpiresAt)),
+    expirationDateTime: new Date(accountExpiresAt).toISOString(),
     password: 'operator-password',
     showPassword: true,
     usernameCheckMessage: 'Username is available',
@@ -61,7 +53,7 @@ it('hydrates external defaults with local-time expiry formatting and gives accou
 
   expect(hydrated.ldapUsername).toBe('taylorexample');
   expect(hydrated.vpnUsername).toBe('taylorexample');
-  expect(hydrated.expirationDateTime).toBe(formatLocalDateTime(new Date(accountExpiresAt)));
+  expect(hydrated.expirationDateTime).toBe(new Date(accountExpiresAt).toISOString());
 });
 
 it('hydrates an external access end time or injected same-day 23:59 default in the local timezone', () => {
@@ -71,7 +63,7 @@ it('hydrates an external access end time or injected same-day 23:59 default in t
   expect(hydrateAccountDraft(initialAccountDraftState, {
     ...externalRequest,
     accessEndTime,
-  }, now).expirationDateTime).toBe(formatLocalDateTime(new Date(accessEndTime)));
+  }, now).expirationDateTime).toBe(new Date(accessEndTime).toISOString());
   expect(hydrateAccountDraft(initialAccountDraftState, externalRequest, now).expirationDateTime).toBe('2026-09-04T23:59');
 });
 

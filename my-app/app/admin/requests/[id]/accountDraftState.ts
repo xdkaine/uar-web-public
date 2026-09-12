@@ -58,9 +58,9 @@ export function hydrateAccountDraft(
 
   let expirationDateTime = state.expirationDateTime;
   if (request.accountExpiresAt) {
-    expirationDateTime = formatLocalDateTime(new Date(request.accountExpiresAt));
+    expirationDateTime = new Date(request.accountExpiresAt).toISOString();
   } else if (!request.isInternal && request.accessEndTime) {
-    expirationDateTime = formatLocalDateTime(new Date(request.accessEndTime));
+    expirationDateTime = new Date(request.accessEndTime).toISOString();
   } else if (!request.isInternal) {
     expirationDateTime = `${formatLocalDateTime(now).slice(0, 10)}T23:59`;
   }

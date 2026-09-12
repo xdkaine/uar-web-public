@@ -103,6 +103,7 @@ function formatDateTimeForDisplay(value: string) {
     hour: 'numeric',
     minute: '2-digit',
     hour12: true,
+    timeZoneName: 'short',
   });
 }
 
@@ -173,10 +174,10 @@ function DateTimeCalendar({ calendarMonth, isDateDisabled, onSelectDate, onShift
 function DateTimeFields({ selectedTime, onChange }: { selectedTime: string; onChange: (value: string) => void }) {
   const timeParts = getTimeParts(selectedTime);
   return <div className="space-y-2"><Label className="flex items-center gap-2"><Clock3 className="size-4" />Time</Label><div className="grid grid-cols-[1fr_auto_1fr_1fr] items-center gap-2">
-    <Select value={timeParts.hour} onValueChange={hour => onChange(composeTime(hour, timeParts.minute, timeParts.period))}><SelectTrigger className="w-full" aria-label="Hour"><SelectValue /></SelectTrigger><SelectContent position="item-aligned" className="z-[80] max-h-72">{HOURS.map(hour => <SelectItem key={hour} value={hour}>{hour}</SelectItem>)}</SelectContent></Select>
+    <Select value={timeParts.hour} onValueChange={hour => onChange(composeTime(hour, timeParts.minute, timeParts.period))}><SelectTrigger className="w-full" aria-label="Hour"><SelectValue /></SelectTrigger><SelectContent position="popper" collisionPadding={12} className="z-[80] max-h-[min(18rem,var(--radix-select-content-available-height))]">{HOURS.map(hour => <SelectItem key={hour} value={hour}>{hour}</SelectItem>)}</SelectContent></Select>
     <span className="font-semibold text-muted-foreground">:</span>
-    <Select value={timeParts.minute} onValueChange={minute => onChange(composeTime(timeParts.hour, minute, timeParts.period))}><SelectTrigger className="w-full" aria-label="Minute"><SelectValue /></SelectTrigger><SelectContent position="item-aligned" className="z-[80] max-h-72">{MINUTES.map(minute => <SelectItem key={minute} value={minute}>{minute}</SelectItem>)}</SelectContent></Select>
-    <Select value={timeParts.period} onValueChange={period => onChange(composeTime(timeParts.hour, timeParts.minute, period))}><SelectTrigger className="w-full" aria-label="AM or PM"><SelectValue /></SelectTrigger><SelectContent position="item-aligned" className="z-[80] max-h-72"><SelectItem value="AM">AM</SelectItem><SelectItem value="PM">PM</SelectItem></SelectContent></Select>
+    <Select value={timeParts.minute} onValueChange={minute => onChange(composeTime(timeParts.hour, minute, timeParts.period))}><SelectTrigger className="w-full" aria-label="Minute"><SelectValue /></SelectTrigger><SelectContent position="popper" collisionPadding={12} className="z-[80] max-h-[min(18rem,var(--radix-select-content-available-height))]">{MINUTES.map(minute => <SelectItem key={minute} value={minute}>{minute}</SelectItem>)}</SelectContent></Select>
+    <Select value={timeParts.period} onValueChange={period => onChange(composeTime(timeParts.hour, timeParts.minute, period))}><SelectTrigger className="w-full" aria-label="AM or PM"><SelectValue /></SelectTrigger><SelectContent position="popper" collisionPadding={12} className="z-[80] max-h-[min(18rem,var(--radix-select-content-available-height))]"><SelectItem value="AM">AM</SelectItem><SelectItem value="PM">PM</SelectItem></SelectContent></Select>
   </div></div>;
 }
 
@@ -189,9 +190,12 @@ function useDateTimePickerState({ value, onChange, required, minDate, maxDate }:
   const todayKey = useSyncExternalStore(subscribeToLocaleChanges, () => formatLocalDate(new Date()), emptyServerSnapshot);
   const selectedDateTime = useMemo(() => {
     if (!selectedDate || !selectedTime) return null;
+    const original = parseValue(value);
+    // Preserve the selected occurrence of a repeated DST hour when editing.
+    if (original.parsed && original.date === selectedDate && original.time === selectedTime) return original.parsed;
     const parsed = new Date(`${selectedDate}T${selectedTime}`);
-    return Number.isNaN(parsed.getTime()) ? null : parsed;
-  }, [selectedDate, selectedTime]);
+    return Number.isNaN(parsed.getTime()) || formatLocalDate(parsed) !== selectedDate || formatLocalTime(parsed) !== selectedTime ? null : parsed;
+  }, [selectedDate, selectedTime, value]);
   const selectionError = useMemo(() => {
     if (!selectedDateTime) return null;
     if (minDate && selectedDateTime < minDate) return 'min' as const;
@@ -221,7 +225,7 @@ function useDateTimePickerState({ value, onChange, required, minDate, maxDate }:
   const navigateMonth = (direction: number) => setCalendarMonth(previous => new Date(previous.getFullYear(), previous.getMonth() + direction, 1));
   const handleConfirm = () => {
     if (!selectedDateTime || selectionError) return;
-    onChange(`${selectedDate}T${selectedTime}`);
+    onChange(selectedDateTime.toISOString());
     setShowCalendar(false);
   };
   const handleClear = () => {
@@ -254,12 +258,14 @@ function DateTimeDialog({ calendarMonth, handleConfirm, isDateDisabled, maxDate,
     ? <>Choose a time on or after <LocalDateTimeText value={minDate!.toISOString()} placeholder="the configured minimum" />.</>
     : selectionError === 'max'
       ? <>Choose a time on or before <LocalDateTimeText value={maxDate!.toISOString()} placeholder="the configured maximum" />.</>
-      : selectedDateTime?.toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
+      : selectedDateTime?.toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true, timeZoneName: 'longOffset' });
 
   return <Dialog open={showCalendar} onOpenChange={setCalendarOpen}>
     <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-md">
-      <DialogHeader><DialogTitle>Select date and time</DialogTitle><DialogDescription>Choose the calendar date, then set an exact local time.</DialogDescription></DialogHeader>
+      <DialogHeader><DialogTitle>Select date and time</DialogTitle><DialogDescription>Time zone: {Intl.DateTimeFormat().resolvedOptions().timeZone}. The UTC equivalent is shown below.</DialogDescription></DialogHeader>
       <div className="space-y-5"><DateTimeCalendar calendarMonth={calendarMonth} isDateDisabled={isDateDisabled} onSelectDate={selectDate} onShiftMonth={navigateMonth} selectedDate={selectedDate} todayKey={todayKey} /><DateTimeFields selectedTime={selectedTime} onChange={setSelectedTime} />{selectedDateTime && <div className={cn('rounded-lg border px-3 py-2 text-sm', selectionError ? 'border-destructive/40 bg-destructive/5 text-destructive' : 'bg-muted/40 text-foreground')}>{selectionMessage}</div>}</div>
+      {selectedDateTime && <p className="text-sm text-muted-foreground">UTC: {selectedDateTime.toISOString().replace('T', ' ').replace('.000Z', ' UTC')}</p>}
+      {selectedDate && !selectedDateTime && <p role="alert" className="text-sm text-destructive">This local time does not exist because the clock changes. Choose another time.</p>}
       <DialogFooter><Button type="button" variant="outline" onClick={() => setCalendarOpen(false)}>Cancel</Button><Button type="button" onClick={handleConfirm} disabled={!selectedDateTime || Boolean(selectionError)}>Confirm date and time</Button></DialogFooter>
     </DialogContent>
   </Dialog>;

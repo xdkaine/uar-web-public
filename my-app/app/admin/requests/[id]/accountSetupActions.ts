@@ -113,7 +113,7 @@ export function createAccountSetupActions(options: AccountSetupActionsOptions) {
           const requestBody: Record<string, string | null> = {
             ldapUsername,
             password,
-            expirationDate: !request?.isInternal ? `${expirationDateTime}:00` : null,
+            expirationDate: !request?.isInternal ? new Date(expirationDateTime).toISOString() : null,
           };
           if (!request?.isInternal && vpnModuleEnabled) requestBody.vpnUsername = vpnUsername;
 
@@ -177,7 +177,7 @@ export function createAccountSetupActions(options: AccountSetupActionsOptions) {
               newLdapUsername: ldapUsername,
               newVpnUsername: vpnModuleEnabled ? vpnUsername : null,
               newPassword: password,
-              newExpirationDate: !request?.isInternal ? `${expirationDateTime}:00` : null,
+              newExpirationDate: !request?.isInternal ? new Date(expirationDateTime).toISOString() : null,
             }),
           });
 

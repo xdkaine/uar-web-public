@@ -21,7 +21,7 @@ interface EventModalProps {
   formData: {
     name: string;
     description: string;
-    endDate: string; // ISO datetime string (YYYY-MM-DDTHH:mm) or empty
+    endDate: string; // ISO timestamp with timezone, or empty
     isActive: boolean;
   };
   setFormData: (data: { name: string; description: string; endDate: string; isActive: boolean }) => void;
