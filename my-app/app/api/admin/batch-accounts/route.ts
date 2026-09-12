@@ -541,8 +541,8 @@ export async function POST(request: NextRequest) {
           });
           await renewProcessingLease();
 
-          // Set expiration for external users
-          if (!accountInput.isInternal && accountInput.accountExpiresAt) {
+          // Honor any supplied expiration, including optional dates for internal users.
+          if (accountInput.accountExpiresAt) {
             await verifyDirectoryIdentity(
               accountInput.ldapUsername,
               directoryDn,

@@ -395,6 +395,7 @@ describe('batch account lifecycle tracking', () => {
     const response = await POST(request(validAccount));
 
     expect(response.status).toBe(200);
+    expect(mocks.setExpiration).not.toHaveBeenCalled();
     expect(mocks.accessRequestCreate).not.toHaveBeenCalled();
     expect(mocks.accessRequestFindFirst).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({ status: { not: 'rejected' } }),
@@ -439,6 +440,69 @@ describe('batch account lifecycle tracking', () => {
     const body = await response.json();
     expect(body.batch.accounts[0]).toMatchObject({ accessRequestId: null });
     expect(body.batch.accounts[0]).not.toHaveProperty('password');
+  });
+
+  it.each([
+    { isInternal: true, accountExpiresAt: '2026-09-10T00:00:00.000Z' },
+    { isInternal: true, accountExpiresAt: '2026-09-12T00:00:00.000Z' },
+    { isInternal: false, accountExpiresAt: '2026-09-12T00:00:00.000Z' },
+  ])('writes the supplied AD expiration for $isInternal internal / $accountExpiresAt', async (expiration) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-11T12:00:00.000Z'));
+    try {
+      const response = await POST(request({ ...validAccount, ...expiration }));
+
+      expect(response.status).toBe(200);
+      expect(mocks.setExpiration).toHaveBeenCalledExactlyOnceWith(
+        validAccount.ldapUsername,
+        new Date(expiration.accountExpiresAt),
+        createdDirectoryUser.objectName
+      );
+      expect(mocks.batchItemCreate).toHaveBeenCalledWith({
+        data: expect.objectContaining({ accountExpiresAt: new Date(expiration.accountExpiresAt) }),
+      });
+      expect(mocks.batchItemUpdate).toHaveBeenCalledWith({
+        where: { id: 'item-1' },
+        data: { mutationStage: 'ldap_expiration_set' },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['ldap', 'projection'])('recovers an internal expiration %s failure without completing the account', async (failure) => {
+    if (failure === 'ldap') {
+      mocks.setExpiration.mockRejectedValueOnce(new Error('expiration write outcome unknown'));
+    } else {
+      mocks.batchItemUpdate.mockImplementation(async (args: { data: { mutationStage?: string } }) => {
+        if (args.data.mutationStage === 'ldap_expiration_set') {
+          throw new Error('expiration projection failed');
+        }
+        return {};
+      });
+    }
+    try {
+      const response = await POST(request({ ...validAccount, accountExpiresAt: '2026-09-12T12:00' }));
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(mocks.setExpiration).toHaveBeenCalledTimes(1);
+      expect(mocks.rollback).toHaveBeenCalledWith([{
+        username: validAccount.ldapUsername,
+        accessRequestId: null,
+        targetDirectoryDn: createdDirectoryUser.objectName,
+        targetDirectoryObjectGuid: 'guid-batchperson',
+      }], 'batch-1');
+      expect(mocks.batchItemUpdate).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ status: 'reconciliation_required', adAccountStatus: null }),
+      }));
+      expect(mocks.batchItemUpdate).not.toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({ status: 'completed' }),
+      }));
+      expect(JSON.stringify(body)).not.toContain(validAccount.password);
+    } finally {
+      mocks.batchItemUpdate.mockReset().mockResolvedValue({});
+    }
   });
 
   it('projects advisory locks as a Prisma-supported scalar', async () => {
